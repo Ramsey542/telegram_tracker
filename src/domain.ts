@@ -121,7 +121,9 @@ export const chainSettingsSchema = z.object({
   buySlippagePercent: positivePercent.max(50).nullable().default(null),
   sellSlippagePercent: positivePercent.max(50).nullable().default(null),
   maxNetworkFeeNative: amount.nullable().default(null),
+  // Retained for compatibility with saved settings; Solana no longer adds Jito tips.
   jitoTipNative: amount.nullable().default(null),
+  // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
   mevProtection: z.boolean().default(true),
   consistency: z
     .object({
@@ -239,6 +241,7 @@ export interface SolanaStep {
   serialized: string;
   lastValidBlockHeight: number;
   submittedAt: number | null;
+  // Legacy fields allow saved Jito transactions to be reconciled without rerouting them.
   bundleId: string | null;
   jito: boolean;
 }

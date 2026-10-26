@@ -9,9 +9,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "check:runtime": "node scripts/check-runtime.mjs",
     "test": "node --import tsx --test tests/*.test.ts",
-    "format": "prettier --write src tests *.json .prettierrc.json",
-    "format:check": "prettier --check src tests *.json .prettierrc.json",
+    "format": "prettier --write src tests scripts *.json .prettierrc.json",
+    "format:check": "prettier --check src tests scripts *.json .prettierrc.json",
     "start": "node --disable-warning=ExperimentalWarning dist/main.js",
     "dev": "tsx src/main.ts"
   },

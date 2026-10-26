@@ -5,7 +5,6 @@ import {
   ComputeBudgetProgram,
   Connection,
   PublicKey,
-  SystemProgram,
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
@@ -127,12 +126,10 @@ export class SolanaAdapter implements ChainAdapter {
     if (!this.connection) throw new Error('QUICKNODE_SOLANA_RPC_URL is missing');
     return this.connection;
   }
-  readiness(settings: ChainSettings): string[] {
+  readiness(_settings: ChainSettings): string[] {
     const missing: string[] = [];
     if (!this.config.solanaRpc) missing.push('QUICKNODE_SOLANA_RPC_URL');
     if (!this.config.jupiterKey) missing.push('JUPITER_API_KEY');
-    if (settings.mevProtection && !settings.jitoTipNative)
-      missing.push('Jito tip in Solana settings');
     return missing;
   }
   async verifyNetwork(): Promise<void> {
@@ -275,19 +272,16 @@ export class SolanaAdapter implements ChainAdapter {
       if (height > step.lastValidBlockHeight)
         throw new PendingTrade('Waiting for expired Solana transaction reconciliation');
       if (step.jito) {
-        const bundleId = await this.http.rpc(
-          'QuickNode Lil JIT',
-          this.config.solanaJitoRpc,
-          'sendBundle',
-          [[bs58.encode(Buffer.from(step.serialized, 'base64'))]],
-          z.string(),
+        throw new ReviewRequired(
+          'Saved Solana transaction uses legacy Jito routing; review its signature before retrying',
         );
-        step.bundleId = bundleId;
-      } else
-        await this.rpc().sendRawTransaction(Buffer.from(step.serialized, 'base64'), {
-          skipPreflight: false,
-          maxRetries: 0,
-        });
+      }
+      // QuickNode applies endpoint-level MEV protection to sendTransaction.
+      // Keep its dashboard toggle enabled; use this endpoint for every retry.
+      await this.rpc().sendRawTransaction(Buffer.from(step.serialized, 'base64'), {
+        skipPreflight: false,
+        maxRetries: 0,
+      });
       step.submittedAt = Date.now();
       persist();
     }
@@ -309,7 +303,7 @@ export class SolanaAdapter implements ChainAdapter {
       slippageBps: String(Math.round(slippage * 100)),
       transactionVersion: '0',
       wrapAndUnwrapSol: 'true',
-      forJitoBundle: String(settings.mevProtection),
+      forJitoBundle: 'false',
     });
     const built = await this.http.json(
       'Jupiter build',
@@ -338,9 +332,6 @@ export class SolanaAdapter implements ChainAdapter {
         impact > settings.filters.maxPriceImpactPercent)
     )
       throw new TradeRejected('Price impact is unknown or exceeds the configured limit');
-    const tip = settings.mevProtection ? parseAmount(settings.jitoTipNative ?? '0', 9) : 0n;
-    if (settings.mevProtection && tip < 1000n)
-      throw new TradeRejected('Jito requires a tip of at least 0.000001 SOL');
     const maximumFee = parseAmount(settings.maxNetworkFeeNative, 9);
     if (
       operation.kind === 'sell' &&
@@ -348,7 +339,6 @@ export class SolanaAdapter implements ChainAdapter {
       BigInt(built.outAmount) < BigInt(operation.minimumNativeRaw)
     )
       throw new TradeRejected('Exit price changed; waiting for the configured profit');
-    if (tip >= maximumFee) throw new TradeRejected('Jito tip exceeds the network fee limit');
     const instructions = [
       ...built.computeBudgetInstructions.map(makeInstruction),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
@@ -358,28 +348,6 @@ export class SolanaAdapter implements ChainAdapter {
       ...(built.cleanupInstruction ? [makeInstruction(built.cleanupInstruction)] : []),
     ];
     if (built.tipInstruction) throw new TradeRejected('Unexpected Jupiter tip instruction');
-    if (settings.mevProtection) {
-      const accounts = await this.http.rpc(
-        'QuickNode Lil JIT',
-        this.config.solanaJitoRpc,
-        'getTipAccounts',
-        [],
-        z.array(z.string()).min(1),
-      );
-      const destination = accounts[0];
-      if (!destination) throw new TradeRejected('Jito tip accounts are unavailable');
-      const transfer = SystemProgram.transfer({
-        fromPubkey: this.wallets.solana.publicKey,
-        toPubkey: new PublicKey(destination),
-        lamports: tip,
-      });
-      transfer.keys.push({
-        pubkey: new PublicKey('jitodontfront111111111111111111111111111111'),
-        isSigner: false,
-        isWritable: false,
-      });
-      instructions.push(transfer);
-    }
     for (const instruction of instructions)
       for (const account of instruction.keys)
         if (account.isSigner && !account.pubkey.equals(this.wallets.solana.publicKey))
@@ -397,7 +365,7 @@ export class SolanaAdapter implements ChainAdapter {
       instructions,
     }).compileToV0Message(lookupTables);
     const fee = (await this.rpc().getFeeForMessage(message, 'confirmed')).value;
-    if (fee === null || BigInt(fee) + tip > maximumFee)
+    if (fee === null || BigInt(fee) > maximumFee)
       throw new TradeRejected('Solana network fee exceeds your limit');
     const transaction = new VersionedTransaction(message);
     beforeSpend();
@@ -430,7 +398,7 @@ export class SolanaAdapter implements ChainAdapter {
       lastValidBlockHeight: lifetime.lastValidBlockHeight,
       submittedAt: null,
       bundleId: null,
-      jito: settings.mevProtection,
+      jito: false,
     };
   }
 }

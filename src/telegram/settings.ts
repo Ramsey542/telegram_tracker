@@ -89,21 +89,11 @@ export const editableFields: Record<string, EditableField> = {
   },
   maxFee: {
     label: 'Maximum network fee',
-    hint: 'Enter the total native coin fee budget per trade, including approvals, wrapping and tips.',
+    hint: 'Enter the total native coin fee budget per trade, including transaction fees, approvals and wrapping.',
     group: 'execution',
     value: (s) => s.maxNetworkFeeNative,
     set: (s, v) => {
       s.maxNetworkFeeNative = amount(v);
-    },
-  },
-  jitoTip: {
-    label: 'Jito tip (SOL)',
-    hint: 'Enter the Solana Jito tip. The minimum is 0.000001 SOL. QuickNode Lil JIT must be enabled.',
-    group: 'execution',
-    chains: ['solana'],
-    value: (s) => s.jitoTipNative,
-    set: (s, v) => {
-      s.jitoTipNative = amount(v);
     },
   },
   minMc: {
@@ -250,7 +240,7 @@ export function applyField(
     throw new Error('Unknown setting');
   const updated = structuredClone(settings);
   definition.set(updated, value.trim());
-  for (const native of [updated.buySizeNative, updated.maxNetworkFeeNative, updated.jitoTipNative])
+  for (const native of [updated.buySizeNative, updated.maxNetworkFeeNative])
     if (native !== null) parseAmount(native, nativeDecimals[chain]);
   return chainSettingsSchema.parse(updated);
 }
@@ -344,8 +334,9 @@ export const toggles: Record<
     },
   },
   mev: {
-    label: 'Require MEV protection',
+    label: 'Require UniswapX protection',
     group: 'execution',
+    chains: ['robinhood'],
     value: (s) => s.mevProtection,
     change: (s) => {
       s.mevProtection = !s.mevProtection;

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createRequire } from 'node:module';
 import {
   createPublicClient,
   defineChain,
@@ -13,18 +14,6 @@ import {
   type TransactionReceipt,
   type TypedData,
 } from 'viem';
-import {
-  CommandParser,
-  UniversalRouterVersion,
-  UNIVERSAL_ROUTER_ADDRESS,
-  WETH_ADDRESS,
-} from '@uniswap/universal-router-sdk';
-import {
-  UnsignedV3DutchOrder,
-  REACTOR_ADDRESS_MAPPING,
-  OrderType,
-  PERMIT2_MAPPING,
-} from '@uniswap/uniswapx-sdk';
 import type { Config } from '../config.js';
 import type { Wallets } from '../wallets.js';
 import { HttpClient, HttpError } from '../infra/http.js';
@@ -43,6 +32,13 @@ import {
   type TokenInfo,
 } from '../domain.js';
 import type { ChainAdapter } from './types.js';
+
+// The router SDK's ESM build uses extensionless imports that native Node cannot resolve.
+const require = createRequire(import.meta.url);
+const { CommandParser, UniversalRouterVersion, UNIVERSAL_ROUTER_ADDRESS, WETH_ADDRESS } =
+  require('@uniswap/universal-router-sdk') as typeof import('@uniswap/universal-router-sdk');
+const { UnsignedV3DutchOrder, REACTOR_ADDRESS_MAPPING, OrderType, PERMIT2_MAPPING } =
+  require('@uniswap/uniswapx-sdk') as typeof import('@uniswap/uniswapx-sdk');
 
 export const ROBINHOOD_CHAIN_ID = 4663;
 export const ROBINHOOD_WETH = WETH_ADDRESS(ROBINHOOD_CHAIN_ID) as Address;

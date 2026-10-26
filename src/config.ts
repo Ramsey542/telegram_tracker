@@ -30,7 +30,6 @@ export interface Config {
   maxSignalAgeMs: number;
   httpTimeoutMs: number;
   solanaRpc: string;
-  solanaJitoRpc: string;
   robinhoodRpc: string;
   jupiterKey: string;
   uniswapKey: string;
@@ -65,7 +64,6 @@ export function loadConfig(): Config {
     maxSignalAgeMs: value.MAX_SIGNAL_AGE_SECONDS * 1000,
     httpTimeoutMs: value.HTTP_TIMEOUT_SECONDS * 1000,
     solanaRpc,
-    solanaJitoRpc: url('QUICKNODE_SOLANA_JITO_RPC_URL') || solanaRpc,
     robinhoodRpc: url('QUICKNODE_ROBINHOOD_RPC_URL'),
     jupiterKey: process.env.JUPITER_API_KEY?.trim() ?? '',
     uniswapKey: process.env.UNISWAP_API_KEY?.trim() ?? '',

@@ -204,7 +204,7 @@ export class ControlBot {
       lines.push(
         '',
         chain === 'solana'
-          ? 'Protected swaps use QuickNode Lil JIT. Set a Jito tip and enable the add-on on your endpoint.'
+          ? 'All Solana swaps use your configured QuickNode RPC. MEV protection is controlled in the QuickNode dashboard; keep it enabled for this endpoint. This applies to buys and sells.'
           : 'Protected swaps require a UniswapX route. ETH is wrapped for the buy, and sale proceeds are unwrapped back to ETH. No public AMM fallback while protection is on.',
       );
     await this.display(ctx, lines.join('\n'), keyboard.text('Back', `chain:${chain}`));
