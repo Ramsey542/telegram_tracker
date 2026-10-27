@@ -115,30 +115,47 @@ export const filterSchema = z
       context.addIssue({ code: 'custom', message: 'Set the maximum Rugcheck score first' });
   });
 
-export const chainSettingsSchema = z.object({
-  enabled: z.boolean().default(false),
-  buySizeNative: amount.nullable().default(null),
-  buySlippagePercent: positivePercent.max(50).nullable().default(null),
-  sellSlippagePercent: positivePercent.max(50).nullable().default(null),
-  priorityFee: z
-    .string()
-    .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/)
-    .nullable()
-    .default(null),
-  // Retained for compatibility with saved settings; Solana no longer adds Jito tips.
-  jitoTipNative: amount.nullable().default(null),
-  // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
-  mevProtection: z.boolean().default(true),
-  consistency: z
-    .object({
-      overall: percent.default(30),
-      recent: percent.default(30),
-      chain: percent.default(30),
-    })
-    .default(() => ({ overall: 30, recent: 30, chain: 30 })),
-  filters: filterSchema.default(() => filterSchema.parse({})),
-  exits: exitSchema.default(() => exitSchema.parse({})),
-});
+export const chainSettingsSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    buySizeNative: amount.nullable().default(null),
+    slippagePercent: positivePercent.max(50).nullable().optional(),
+    // Unify saved slippage values using the lower configured percentage.
+    buySlippagePercent: positivePercent.max(50).nullable().optional(),
+    sellSlippagePercent: positivePercent.max(50).nullable().optional(),
+    priorityFee: z
+      .string()
+      .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/)
+      .nullable()
+      .default(null),
+    // Retained for compatibility with saved settings; Solana no longer adds Jito tips.
+    jitoTipNative: amount.nullable().default(null),
+    // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
+    mevProtection: z.boolean().default(true),
+    consistency: z
+      .object({
+        overall: percent.default(30),
+        recent: percent.default(30),
+        chain: percent.default(30),
+      })
+      .default(() => ({ overall: 30, recent: 30, chain: 30 })),
+    filters: filterSchema.default(() => filterSchema.parse({})),
+    exits: exitSchema.default(() => exitSchema.parse({})),
+  })
+  .transform(({ buySlippagePercent, sellSlippagePercent, ...settings }) => {
+    const legacy = [buySlippagePercent, sellSlippagePercent].filter(
+      (value): value is number => typeof value === 'number',
+    );
+    return {
+      ...settings,
+      slippagePercent:
+        settings.slippagePercent !== undefined
+          ? settings.slippagePercent
+          : legacy.length
+            ? Math.min(...legacy)
+            : null,
+    };
+  });
 
 export const settingsSchema = z.object({
   blockedCallers: z.array(z.string()).default(() => []),
@@ -165,6 +182,8 @@ export interface CallSignal {
   channelId: string;
   messageId: number;
   date: number;
+  // First local detection time, independent of Telegram's publication time.
+  detectedAt?: number;
   chain: Chain;
   address: string;
   caller: string;

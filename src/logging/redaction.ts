@@ -76,13 +76,13 @@ export function safeEndpoint(value: string): string {
   }
 }
 
-export function redactText(value: string): string {
+export function redactText(value: string, publicSignalId = false): string {
   let result = value;
   for (const secret of secrets) result = result.split(secret).join('[redacted]');
   result = result
     .replace(/https?:\/\/[^\s"'<>]+/gi, safeEndpoint)
     .replace(/\b(?:jup_|sk-)[A-Za-z0-9_-]+/g, '[redacted]')
-    .replace(/\b\d{6,}:[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(/\b\d{6,}:[A-Za-z0-9_-]+/g, (match) => (publicSignalId ? match : '[redacted]'))
     .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+/gi, '$1[redacted]')
     .replace(
       /((?:api[_-]?key|api[_-]?hash|app[_-]?key|app[_-]?secret|access[_-]?token|refresh[_-]?token|sign|password|private[_-]?key|secret[_-]?key|signedTransaction|serialized|authorization)["']?\s*[:=]\s*["']?)[^\s,"'\]}]+/gi,
@@ -114,7 +114,8 @@ export function redact(value: unknown, key = '', seen = new WeakSet<object>(), d
         return redactText(value);
       }
     }
-    return redactText(value);
+    const publicSignalId = (key === 'signalId' || key === 'id') && /^-\d+:\d+$/.test(value);
+    return redactText(value, publicSignalId);
   }
   if (value === undefined || typeof value === 'function' || typeof value === 'symbol')
     return undefined;

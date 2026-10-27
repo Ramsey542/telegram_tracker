@@ -312,9 +312,8 @@ export class RobinhoodAdapter implements ChainAdapter {
     output: string,
     amountRaw: string,
     settings: ChainSettings,
-    buy: boolean,
   ): Promise<ApiQuote> {
-    const slippage = buy ? settings.buySlippagePercent : settings.sellSlippagePercent;
+    const slippage = settings.slippagePercent;
     if (slippage === null) throw new TradeRejected('Configure slippage first');
     const response = await this.http.json(
       'Uniswap quote',
@@ -426,13 +425,13 @@ export class RobinhoodAdapter implements ChainAdapter {
     return { outputRaw, minimumRaw, impact: null };
   }
   async quoteSell(address: string, amountRaw: string, settings: ChainSettings): Promise<Quote> {
-    const response = await this.fetchQuote(address, ROBINHOOD_WETH, amountRaw, settings, false);
+    const response = await this.fetchQuote(address, ROBINHOOD_WETH, amountRaw, settings);
     const quote = this.validateQuote(
       response,
       address,
       ROBINHOOD_WETH,
       amountRaw,
-      settings.sellSlippagePercent!,
+      settings.slippagePercent!,
     );
     return {
       inputRaw: amountRaw,
@@ -485,13 +484,7 @@ export class RobinhoodAdapter implements ChainAdapter {
       else if (pending?.type === 'order')
         swapReceipt = await this.orderStep(operation, pending, persist);
       else {
-        await this.fetchQuote(
-          input,
-          output,
-          operation.amountRaw,
-          operation.settings,
-          operation.kind === 'buy',
-        );
+        await this.fetchQuote(input, output, operation.amountRaw, operation.settings);
         if (operation.kind === 'buy')
           await this.evmStep(
             operation,
@@ -509,16 +502,13 @@ export class RobinhoodAdapter implements ChainAdapter {
           output,
           operation.amountRaw,
           operation.settings,
-          operation.kind === 'buy',
         );
         const quote = this.validateQuote(
           response,
           input,
           output,
           operation.amountRaw,
-          (operation.kind === 'buy'
-            ? operation.settings.buySlippagePercent
-            : operation.settings.sellSlippagePercent)!,
+          operation.settings.slippagePercent!,
         );
         const limit = operation.settings.filters.maxPriceImpactPercent;
         if (

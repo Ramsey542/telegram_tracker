@@ -257,13 +257,9 @@ export class ChannelReader {
     }
   }
   private record(message: Api.Message, channelId: string): void {
+    const detectedAt = Date.now();
     const post = this.sourcePost(message, channelId);
     const parsed = parseCall(post);
-    const changed = this.store.recordPost(
-      post,
-      parsed.ok ? parsed.signal : null,
-      parsed.ok ? null : parsed.reason,
-    );
     withLogContext(
       {
         source: this.config.sourceChannel,
@@ -272,6 +268,12 @@ export class ChannelReader {
         signalId: `${channelId}:${message.id}`,
       },
       () => {
+        const changed = this.store.recordPost(
+          post,
+          parsed.ok ? parsed.signal : null,
+          parsed.ok ? null : parsed.reason,
+          detectedAt,
+        );
         if (!changed) {
           log.debug('reader.message_duplicate', { revision: post.revision });
           return;

@@ -2,7 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { logger } from '../logging/logger.js';
+import { logSignalDetected, logSignalSkipped, logTradeOutcome } from '../logging/trades.js';
 import {
+  chainSettingsSchema,
   settingsSchema,
   normalizeAddress,
   type CallSignal,
@@ -19,6 +21,11 @@ import {
 type Row = Record<string, unknown>;
 const decode = <T>(row: Row | undefined, key = 'payload'): T | null =>
   row && typeof row[key] === 'string' ? (JSON.parse(row[key]) as T) : null;
+const decodeOperation = (row: Row | undefined, key = 'payload'): Operation | null => {
+  const operation = decode<Operation>(row, key);
+  if (operation) operation.settings = chainSettingsSchema.parse(operation.settings);
+  return operation;
+};
 export class Store {
   private readonly db: DatabaseSync;
   constructor(directory: string) {
@@ -103,8 +110,22 @@ export class Store {
       )
       .run(key, value);
   }
-  recordPost(post: ChannelPost, signal: CallSignal | null, reason: string | null): boolean {
+  recordPost(
+    post: ChannelPost,
+    signal: CallSignal | null,
+    reason: string | null,
+    receivedAt = Date.now(),
+  ): boolean {
     const id = `${post.channelId}:${post.messageId}`;
+    const previous = this.db
+      .prepare('SELECT payload,chain,received_at FROM signals WHERE id = ?')
+      .get(id);
+    const previousPayload = decode<Partial<CallSignal>>(previous);
+    const previousDetection =
+      previousPayload?.detectedAt ?? (previous?.chain ? Number(previous.received_at) : undefined);
+    const detectedAt = previousDetection ?? (signal ? receivedAt : undefined);
+    if (signal) signal.detectedAt = detectedAt;
+    const payload = detectedAt === undefined ? post : { ...(signal ?? post), detectedAt };
     const result = this.db
       .prepare(
         `INSERT INTO signals (id,channel_id,message_id,revision,chain,state,reason,payload,received_at,source_post) VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -119,11 +140,13 @@ export class Store {
         signal?.chain ?? null,
         signal ? 'pending' : 'skipped',
         reason,
-        JSON.stringify(signal ?? post),
-        Date.now(),
+        JSON.stringify(payload),
+        receivedAt,
         JSON.stringify(post),
       );
-    return Number(result.changes) > 0;
+    const changed = Number(result.changes) > 0;
+    if (changed && signal && previousDetection === undefined) logSignalDetected(signal, post);
+    return changed;
   }
   nextSignal(chain: Chain): CallSignal | null {
     return decode(
@@ -135,10 +158,16 @@ export class Store {
     );
   }
   skipSignal(id: string, reason: string): void {
-    this.db
-      .prepare("UPDATE signals SET state = 'skipped', reason = ? WHERE id = ?")
+    const signal = decode<CallSignal>(
+      this.db.prepare('SELECT payload FROM signals WHERE id = ?').get(id),
+    );
+    const result = this.db
+      .prepare(
+        "UPDATE signals SET state = 'skipped', reason = ? WHERE id = ? AND state = 'pending'",
+      )
       .run(reason, id);
     logger.child({ component: 'trading.entries' }).info('entry.skipped', { signalId: id, reason });
+    if (Number(result.changes) > 0 && signal) logSignalSkipped(signal, reason);
   }
   recordObservation(id: string, observation: CallObservation): void {
     this.db
@@ -162,7 +191,7 @@ export class Store {
       .all()
       .map((row) => {
         const payload = decode<CallSignal | ChannelPost>(row);
-        const operation = decode<Operation>(row, 'operation');
+        const operation = decodeOperation(row, 'operation');
         return {
           id: String(row.id),
           channelId: String(row.channel_id),
@@ -193,7 +222,7 @@ export class Store {
     );
   }
   activeOperation(chain: Chain): Operation | null {
-    return decode(
+    return decodeOperation(
       this.db
         .prepare(
           "SELECT payload FROM operations WHERE chain = ? AND status IN ('active','review') LIMIT 1",
@@ -202,7 +231,7 @@ export class Store {
     );
   }
   operation(id: string): Operation | null {
-    return decode(this.db.prepare('SELECT payload FROM operations WHERE id = ?').get(id));
+    return decodeOperation(this.db.prepare('SELECT payload FROM operations WHERE id = ?').get(id));
   }
   saveOperation(operation: Operation): void {
     this.db
@@ -305,6 +334,12 @@ export class Store {
         `Bought ${position.symbol.replace(/[\x00-\x1f]/g, ' ').slice(0, 60)} on ${position.chain}.\nTransaction: ${operation.swapHash ?? ''}`,
       );
     });
+    logTradeOutcome(operation, {
+      positionId: position.id,
+      tokenRaw: position.originalTokenRaw,
+      nativeRaw: position.entryNativeRaw,
+      feeNativeRaw: position.entryFeeNativeRaw,
+    });
   }
   completeSell(operation: Operation, position: Position, result: SwapResult): void {
     this.transaction(() => {
@@ -337,6 +372,7 @@ export class Store {
         `Sold ${position.symbol} on ${position.chain}.\nReason: ${operation.exitKey ?? 'manual'}\nTransaction: ${result.signature}`,
       );
     });
+    logTradeOutcome(operation, { ...result, positionId: position.id, exitKey: operation.exitKey });
   }
   failOperation(operation: Operation, reason: string, review: boolean): void {
     this.transaction(() => {
@@ -354,6 +390,7 @@ export class Store {
         `${review ? 'Review required' : 'Trade failed'} on ${operation.chain}: ${reason}\nOperation: ${operation.id}`,
       );
     });
+    logTradeOutcome(operation);
   }
   positions(chain?: Chain): Position[] {
     return (
@@ -384,7 +421,7 @@ export class Store {
     return this.db
       .prepare('SELECT payload FROM operations ORDER BY created_at DESC LIMIT 10')
       .all()
-      .map((row) => decode<Operation>(row)!)
+      .map((row) => decodeOperation(row)!)
       .filter(Boolean);
   }
   notify(eventKey: string, text: string): void {

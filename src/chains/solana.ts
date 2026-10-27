@@ -168,12 +168,12 @@ export class SolanaAdapter implements ChainAdapter {
     };
   }
   async quoteSell(address: string, amountRaw: string, settings: ChainSettings): Promise<Quote> {
-    if (settings.sellSlippagePercent === null) throw new Error('Sell slippage is not configured');
+    if (settings.slippagePercent === null) throw new Error('Slippage is not configured');
     const query = new URLSearchParams({
       inputMint: address,
       outputMint: SOL_MINT,
       amount: amountRaw,
-      slippageBps: String(Math.round(settings.sellSlippagePercent * 100)),
+      slippageBps: String(Math.round(settings.slippagePercent * 100)),
       maxSupportedTransactionVersion: '0',
     });
     const order = await this.http.json('Jupiter quote', `${baseUrl}/order?${query}`, orderSchema, {
@@ -311,10 +311,7 @@ export class SolanaAdapter implements ChainAdapter {
     beforeSwap: () => Promise<void>,
     beforeSpend: () => void,
   ): Promise<JupiterStep> {
-    const slippage =
-      operation.kind === 'buy'
-        ? operation.settings.buySlippagePercent
-        : operation.settings.sellSlippagePercent;
+    const slippage = operation.settings.slippagePercent;
     if (slippage === null) throw new TradeRejected('Set slippage before trading');
     new PublicKey(operation.address);
     const inputMint = operation.kind === 'buy' ? SOL_MINT : operation.address;

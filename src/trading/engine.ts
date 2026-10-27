@@ -23,6 +23,7 @@ import { safeError } from '../infra/http.js';
 import { RiskFilters } from '../providers/risk.js';
 import { evaluateExits } from './exits.js';
 import { logger, withLogContext } from '../logging/logger.js';
+import { logTradeOutcome } from '../logging/trades.js';
 
 const log = logger.child({ component: 'trading.engine' });
 
@@ -62,8 +63,7 @@ export class TradeEngine {
     const settings = this.store.settings().chains[chain];
     const missing = this.adapters[chain].readiness(settings);
     if (buying && !settings.buySizeNative) missing.push('buy size');
-    if (buying && settings.buySlippagePercent === null) missing.push('buy slippage');
-    if (settings.sellSlippagePercent === null) missing.push('sell slippage');
+    if (settings.slippagePercent === null) missing.push('slippage');
     if (settings.buySizeNative) parseAmount(settings.buySizeNative, nativeDecimals[chain]);
     return missing;
   }
@@ -441,6 +441,7 @@ export class TradeEngine {
       } else {
         operation.status = 'confirmed';
         this.store.saveOperation(operation);
+        logTradeOutcome(operation, { ...result });
         this.store.notify(
           `unwrap:${operation.id}`,
           `Unwrapped ${formatAmount(operation.amountRaw, 18)} WETH to ETH.`,

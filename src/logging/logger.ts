@@ -14,6 +14,12 @@ export interface LogOptions {
   maxFiles: number;
 }
 const ranks: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+const tradeEvents = new Set([
+  'signal.detected',
+  'trade.confirmed',
+  'trade.failed',
+  'trade.skipped',
+]);
 const context = new AsyncLocalStorage<LogFields>();
 const runId = randomUUID();
 let options: LogOptions | null = null;
@@ -61,7 +67,9 @@ export class Logger {
     this.write('error', event, { ...fields, error });
   }
   private write(level: LogLevel, event: string, fields: LogFields): void {
-    if (ranks[level] < ranks[options?.level ?? 'info']) return;
+    const diagnostic = ranks[level] >= ranks[options?.level ?? 'info'];
+    const trade = tradeEvents.has(event);
+    if (!diagnostic && !trade) return;
     const merged = { ...this.fields, ...context.getStore(), ...fields };
     const record = redact({
       ...merged,
@@ -73,24 +81,20 @@ export class Logger {
     });
     const line = `${JSON.stringify(record)}\n`;
     try {
-      append('app', line);
-      if (level === 'warn' || level === 'error') append('errors', line);
-      const component = String(merged.component ?? 'app');
-      if (component.startsWith('api')) append('api', line);
-      if (
-        component.startsWith('trading') ||
-        component.startsWith('risk') ||
-        (component.startsWith('api') && !component.startsWith('api.telegram')) ||
-        (component === 'telegram.reader' && (level === 'warn' || level === 'error'))
-      )
-        append('trades', line);
-      if (component.startsWith('telegram')) append('telegram', line);
+      if (trade) append('trades', line);
+      if (diagnostic) {
+        append('app', line);
+        if (level === 'warn' || level === 'error') append('errors', line);
+        const component = String(merged.component ?? 'app');
+        if (component.startsWith('api')) append('api', line);
+        if (component.startsWith('telegram')) append('telegram', line);
+      }
     } catch (error) {
       process.stderr.write(
         `${JSON.stringify(redact({ timestamp: new Date().toISOString(), level: 'error', event: 'logging.write_failed', error }))}\n`,
       );
     }
-    if (!options || options.console || level === 'error')
+    if (diagnostic && (!options || options.console || level === 'error'))
       (level === 'error' ? process.stderr : process.stdout).write(line);
   }
 }

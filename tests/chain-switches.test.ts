@@ -27,8 +27,7 @@ function fixture(enabled: Chain) {
         {
           enabled: chain === enabled,
           buySizeNative: '0.1',
-          buySlippagePercent: 1,
-          sellSlippagePercent: 1,
+          slippagePercent: 1,
         },
       ]),
     ),
@@ -167,6 +166,26 @@ test('chain switches are independent and a disabled chain does not enter', async
     assert.equal(value.store.hasEntry('solana', solana.address), false);
   } finally {
     value.close();
+  }
+});
+
+test('one slippage setting gates both entry and exit readiness on either chain', () => {
+  for (const chain of chains) {
+    const value = fixture(chain);
+    try {
+      value.store.updateSettings((settings) => {
+        settings.chains[chain].slippagePercent = null;
+      });
+      assert.deepEqual(value.engine.readiness(chain), ['slippage']);
+      assert.deepEqual(value.engine.readiness(chain, false), ['slippage']);
+      value.store.updateSettings((settings) => {
+        settings.chains[chain].slippagePercent = 2.5;
+      });
+      assert.deepEqual(value.engine.readiness(chain), []);
+      assert.deepEqual(value.engine.readiness(chain, false), []);
+    } finally {
+      value.close();
+    }
   }
 });
 

@@ -58,7 +58,7 @@ function operation(kind: 'buy' | 'sell' = 'buy'): Operation {
       usdPrice: null,
       fetchedAt: Date.now(),
     },
-    settings: chainSettingsSchema.parse({ buySlippagePercent: 0.5, sellSlippagePercent: 0.5 }),
+    settings: chainSettingsSchema.parse({ slippagePercent: 0.5 }),
     steps: [],
     quote: null,
     swapHash: null,
@@ -241,6 +241,8 @@ for (const kind of ['buy', 'sell'] as const) {
   test(`${kind} orders, signs and executes before any RPC reads`, async (t) => {
     const value = harness(t);
     const trade = operation(kind);
+    trade.settings.slippagePercent = 1.25;
+    value.setOrder({ slippageBps: 125 });
     value.setReceipt(receipt(kind));
     const result = await advance(value, trade);
     assert.equal(result.signature, signature);
@@ -249,6 +251,7 @@ for (const kind of ['buy', 'sell'] as const) {
     assert.equal(trade.token.decimals, 6);
     assert.deepEqual(value.events, ['order', 'execute', 'getGenesisHash', 'getTransaction']);
     assert.equal(value.orders[0]!.searchParams.get('taker'), owner.toBase58());
+    assert.equal(value.orders[0]!.searchParams.get('slippageBps'), '125');
     assert.equal(value.orders[0]!.searchParams.get('excludeRouters'), null);
     assert.equal(value.signing.mock.callCount(), 1);
     assert.equal((trade.steps[0] as JupiterStep).status, 'confirmed');

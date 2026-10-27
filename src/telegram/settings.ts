@@ -70,22 +70,13 @@ export const editableFields: Record<string, EditableField> = {
       s.consistency.chain = numeric(v, 0, 100) ?? 30;
     },
   },
-  buySlippage: {
-    label: '🛒 Buy slippage (%)',
-    hint: 'Enter buy slippage in percent, greater than 0 and at most 50.',
+  slippage: {
+    label: '↔️ Slippage (%)',
+    hint: 'Enter slippage in percent for both buys and sells, greater than 0 and at most 50.',
     group: 'execution',
-    value: (s) => s.buySlippagePercent,
+    value: (s) => s.slippagePercent,
     set: (s, v) => {
-      s.buySlippagePercent = numeric(v, 0.01, 50);
-    },
-  },
-  sellSlippage: {
-    label: '💸 Sell slippage (%)',
-    hint: 'Enter sell slippage in percent, greater than 0 and at most 50.',
-    group: 'execution',
-    value: (s) => s.sellSlippagePercent,
-    set: (s, v) => {
-      s.sellSlippagePercent = numeric(v, 0.01, 50);
+      s.slippagePercent = numeric(v, 0.01, 50);
     },
   },
   solPriorityFee: {

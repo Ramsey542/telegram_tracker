@@ -19,7 +19,10 @@ function capture(level: LogLevel = 'debug') {
   });
   return {
     directory,
-    read: (name: string) => readFileSync(join(directory, `${name}.jsonl`), 'utf8'),
+    read: (name: string) => {
+      const path = join(directory, `${name}.jsonl`);
+      return existsSync(path) ? readFileSync(path, 'utf8') : '';
+    },
     close: () => {
       restore();
       rmSync(directory, { recursive: true, force: true });
@@ -60,6 +63,18 @@ test('redaction preserves API diagnostics and public identifiers while removing 
   assert.ok(!output.includes(payload));
 });
 
+test('Telegram signal IDs remain usable for correlation without exposing bot tokens', () => {
+  const signalId = '-1001551999484:12345';
+  const token = '123456789:example-private-bot-token';
+  const record = redact({ signalId, signal: { id: signalId }, botToken: token, message: token });
+  assert.deepEqual(record, {
+    signalId,
+    signal: { id: signalId },
+    botToken: '[redacted]',
+    message: '[redacted]',
+  });
+});
+
 test('JSON logs retain asynchronous correlation, error causes and category files', async () => {
   const logs = capture();
   try {
@@ -69,7 +84,7 @@ test('JSON logs retain asynchronous correlation, error causes and category files
           await Promise.resolve();
           logger
             .child({ component: 'trading.entries' })
-            .info('entry.observed', { token: signalId });
+            .info('signal.detected', { token: signalId });
         }),
       ),
     );
@@ -84,20 +99,20 @@ test('JSON logs retain asynchronous correlation, error causes and category files
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    assert.equal(trades.length, 3);
-    const entries = trades.filter((record) => record.event === 'entry.observed');
+    assert.equal(trades.length, 2);
+    const entries = trades.filter((record) => record.event === 'signal.detected');
     assert.equal(entries.length, 2);
     for (const record of entries) assert.equal(record.signalId, record.token);
-    assert.match(logs.read('trades'), /quota exceeded/);
+    assert.doesNotMatch(logs.read('trades'), /quota exceeded/);
     assert.match(logs.read('errors'), /quota exceeded/);
     assert.match(logs.read('api'), /HTTP 429 rate limit/);
-    assert.match(logs.read('app'), /entry.observed/);
+    assert.match(logs.read('app'), /signal.detected/);
   } finally {
     logs.close();
   }
 });
 
-test('info logging keeps successful provider requests quiet and retains exact provider failures in trade logs', async (context) => {
+test('info logging keeps provider failures in diagnostic files and out of the trade journal', async (context) => {
   const logs = capture('info');
   let requests = 0;
   context.mock.method(globalThis, 'fetch', async () =>
@@ -121,12 +136,49 @@ test('info logging keeps successful provider requests quiet and retains exact pr
       ),
       HttpError,
     );
-    const trades = logs.read('trades');
-    assert.match(trades, /Jupiter quote/);
-    assert.match(trades, /INVALID_KEY/);
-    assert.match(trades, /401/);
-    assert.ok(!trades.includes('"event":"api.request"'));
-    assert.ok(!trades.includes('"event":"api.response"'));
+    assert.equal(logs.read('trades'), '');
+    assert.match(logs.read('errors'), /Jupiter quote/);
+    assert.match(logs.read('errors'), /INVALID_KEY/);
+    assert.match(logs.read('api'), /401/);
+  } finally {
+    logs.close();
+  }
+});
+
+test('trade journal excludes reader errors, risk details, API traffic and intermediate trade events', () => {
+  const logs = capture();
+  try {
+    const transportError =
+      'Error resolving event builder: Error: Cannot find any entity corresponding to "[object Object]"';
+    logger.child({ component: 'telegram.reader' }).error('reader.transport_error', transportError);
+    logger.child({ component: 'telegram.reader' }).warn('reader.reconnecting');
+    logger.child({ component: 'risk.filters' }).info('risk.checked');
+    logger.child({ component: 'trading.engine' }).info('entry.observed');
+    logger.child({ component: 'trading.solana' }).info('transaction.execute_started');
+    logger.child({ component: 'trading.signals' }).info('signal.detected', { signalId: 'test' });
+    logger.child({ component: 'trading.journal' }).info('trade.confirmed', { signalId: 'test' });
+    const events = logs
+      .read('trades')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line).event);
+    assert.deepEqual(events, ['signal.detected', 'trade.confirmed']);
+    assert.match(logs.read('errors'), /reader.transport_error/);
+    assert.match(logs.read('telegram'), /object Object/);
+    assert.match(logs.read('app'), /transaction.execute_started/);
+  } finally {
+    logs.close();
+  }
+});
+
+test('diagnostic severity does not hide signal and outcome records from the trade journal', () => {
+  const logs = capture('error');
+  try {
+    logger.info('signal.detected', { signalId: 'test' });
+    logger.info('trade.failed', { signalId: 'test', reason: 'Offline test failure' });
+    assert.equal(logs.read('app'), '');
+    assert.match(logs.read('trades'), /signal.detected/);
+    assert.match(logs.read('trades'), /trade.failed/);
   } finally {
     logs.close();
   }
