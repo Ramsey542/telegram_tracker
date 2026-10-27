@@ -10,11 +10,12 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "check:runtime": "node scripts/check-runtime.mjs",
+    "check:goplus": "node scripts/check-goplus.mjs",
     "test": "node --import tsx --test tests/*.test.ts",
     "format": "prettier --write src tests scripts *.json .prettierrc.json",
     "format:check": "prettier --check src tests scripts *.json .prettierrc.json",
-    "start": "node --disable-warning=ExperimentalWarning dist/main.js",
-    "dev": "tsx src/main.ts"
+    "start": "node --disable-warning=ExperimentalWarning --import ./scripts/preload-optional-bindings.mjs dist/main.js",
+    "dev": "node --import ./scripts/preload-optional-bindings.mjs --import tsx src/main.ts"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.14",

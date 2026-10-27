@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { resolve } from 'node:path';
 import { z } from 'zod';
+import type { LogLevel } from './logging/logger.js';
 
 const envSchema = z.object({
   TELEGRAM_API_ID: z.coerce.number().int().positive(),
@@ -17,6 +18,12 @@ const envSchema = z.object({
   MAX_SIGNAL_AGE_SECONDS: z.coerce.number().min(10).max(3600).default(120),
   HTTP_TIMEOUT_SECONDS: z.coerce.number().min(3).max(120).default(15),
   JUPITER_REQUESTS_PER_SECOND: z.coerce.number().min(0.5).max(150).default(1),
+  LISTEN_ONLY: z.enum(['true', 'false']).default('false'),
+  LOG_DIRECTORY: z.string().min(1).default('logs'),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  LOG_CONSOLE: z.enum(['true', 'false']).default('true'),
+  LOG_MAX_FILE_MB: z.coerce.number().int().min(1).max(1024).default(10),
+  LOG_MAX_FILES: z.coerce.number().int().min(1).max(100).default(5),
 });
 export interface Config {
   telegramApiId: number;
@@ -35,8 +42,16 @@ export interface Config {
   uniswapKey: string;
   rugcheckKey: string;
   goplusToken: string;
+  goplusAppKey: string;
+  goplusAppSecret: string;
   walletEncryptionKey: string;
   jupiterRps: number;
+  listenOnly: boolean;
+  logDirectory: string;
+  logLevel: LogLevel;
+  logConsole: boolean;
+  logMaxFileBytes: number;
+  logMaxFiles: number;
 }
 export function loadConfig(): Config {
   const clean = Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== ''));
@@ -52,6 +67,10 @@ export function loadConfig(): Config {
     return raw;
   };
   const solanaRpc = url('QUICKNODE_SOLANA_RPC_URL');
+  const goplusAppKey = process.env.GOPLUS_APP_KEY?.trim() ?? '';
+  const goplusAppSecret = process.env.GOPLUS_APP_SECRET?.trim() ?? '';
+  if (Boolean(goplusAppKey) !== Boolean(goplusAppSecret))
+    throw new Error('Set both GOPLUS_APP_KEY and GOPLUS_APP_SECRET, or leave both empty');
   return {
     telegramApiId: value.TELEGRAM_API_ID,
     telegramApiHash: value.TELEGRAM_API_HASH,
@@ -69,7 +88,15 @@ export function loadConfig(): Config {
     uniswapKey: process.env.UNISWAP_API_KEY?.trim() ?? '',
     rugcheckKey: process.env.RUGCHECK_API_KEY?.trim() ?? '',
     goplusToken: process.env.GOPLUS_ACCESS_TOKEN?.trim() ?? '',
+    goplusAppKey,
+    goplusAppSecret,
     walletEncryptionKey: process.env.WALLET_ENCRYPTION_KEY?.trim() ?? '',
     jupiterRps: value.JUPITER_REQUESTS_PER_SECOND,
+    listenOnly: value.LISTEN_ONLY === 'true',
+    logDirectory: resolve(value.LOG_DIRECTORY),
+    logLevel: value.LOG_LEVEL,
+    logConsole: value.LOG_CONSOLE === 'true',
+    logMaxFileBytes: value.LOG_MAX_FILE_MB * 1024 * 1024,
+    logMaxFiles: value.LOG_MAX_FILES,
   };
 }

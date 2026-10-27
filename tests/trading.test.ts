@@ -74,6 +74,7 @@ test('consistency extraction uses the labeled section instead of the banner', ()
   if (!parsed.ok) return;
   assert.deepEqual(parsed.signal.consistency, { overall: 44, recent: 35, chain: 43 });
   assert.equal(parsed.signal.callerId, '-1001551999484');
+  assert.equal(parsed.signal.tokenName, 'Example');
 });
 test('an EVM address and a footer cannot imply Robinhood', () => {
   const value = post();

@@ -13,6 +13,7 @@ export interface EditableField {
   value: (settings: ChainSettings) => string | number | null;
   set: (settings: ChainSettings, value: string) => void;
   chains?: Chain[];
+  emptyLabel?: string;
 }
 const numeric = (
   value: string,
@@ -34,7 +35,7 @@ const amount = (value: string): string | null => {
 };
 export const editableFields: Record<string, EditableField> = {
   buySize: {
-    label: 'Buy size',
+    label: '💰 Buy size',
     hint: 'Enter the native coin amount to spend per new token.',
     group: 'buy',
     value: (s) => s.buySizeNative,
@@ -43,7 +44,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   overall: {
-    label: 'Overall consistency',
+    label: '📊 Overall consistency',
     hint: 'Enter the minimum overall consistency from 0 to 100.',
     group: 'consistency',
     value: (s) => s.consistency.overall,
@@ -52,7 +53,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   recent: {
-    label: 'Recent consistency',
+    label: '🕒 Recent consistency',
     hint: 'Enter the minimum recent consistency from 0 to 100.',
     group: 'consistency',
     value: (s) => s.consistency.recent,
@@ -61,7 +62,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   chainRate: {
-    label: 'Chain consistency',
+    label: '⛓️ Chain consistency',
     hint: 'Enter the minimum chain consistency from 0 to 100.',
     group: 'consistency',
     value: (s) => s.consistency.chain,
@@ -70,7 +71,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   buySlippage: {
-    label: 'Buy slippage (%)',
+    label: '🛒 Buy slippage (%)',
     hint: 'Enter buy slippage in percent, greater than 0 and at most 50.',
     group: 'execution',
     value: (s) => s.buySlippagePercent,
@@ -79,7 +80,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   sellSlippage: {
-    label: 'Sell slippage (%)',
+    label: '💸 Sell slippage (%)',
     hint: 'Enter sell slippage in percent, greater than 0 and at most 50.',
     group: 'execution',
     value: (s) => s.sellSlippagePercent,
@@ -87,17 +88,30 @@ export const editableFields: Record<string, EditableField> = {
       s.sellSlippagePercent = numeric(v, 0.01, 50);
     },
   },
-  maxFee: {
-    label: 'Maximum network fee',
-    hint: 'Enter the total native coin fee budget per trade, including transaction fees, approvals and wrapping.',
+  solPriorityFee: {
+    label: '⚡ Priority fee (SOL)',
+    hint: 'Optional SOL priority fee per buy or sell, in addition to the base network fee. Enter 0 for no priority fee, or auto/off to use Jupiter estimates. The override is sent to Jupiter with the order.',
     group: 'execution',
-    value: (s) => s.maxNetworkFeeNative,
+    chains: ['solana'],
+    emptyLabel: 'Auto (Jupiter)',
+    value: (s) => s.priorityFee,
     set: (s, v) => {
-      s.maxNetworkFeeNative = amount(v);
+      s.priorityFee = ['auto', 'off'].includes(v.toLowerCase()) ? null : v;
+    },
+  },
+  evmPriorityFee: {
+    label: '⚡ Priority tip (gwei)',
+    hint: 'Optional priority tip in gwei per gas for wallet-sent transactions. Enter 0 for no tip, or auto/off to use QuickNode estimates. UniswapX fillers choose the gas for their fill transaction; this setting applies to your approvals, wrapping, direct swaps and unwrapping.',
+    group: 'execution',
+    chains: ['robinhood'],
+    emptyLabel: 'Auto (QuickNode)',
+    value: (s) => s.priorityFee,
+    set: (s, v) => {
+      s.priorityFee = ['auto', 'off'].includes(v.toLowerCase()) ? null : v;
     },
   },
   minMc: {
-    label: 'Minimum current MC ($)',
+    label: '⬇️ Minimum current MC ($)',
     hint: 'Enter a minimum current market cap in USD, or off. Enable the market cap filter after setting the range.',
     group: 'filters',
     value: (s) => s.filters.minMarketCapUsd,
@@ -108,7 +122,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   maxMc: {
-    label: 'Maximum current MC ($)',
+    label: '⬆️ Maximum current MC ($)',
     hint: 'Enter a maximum current market cap in USD, or off.',
     group: 'filters',
     value: (s) => s.filters.maxMarketCapUsd,
@@ -119,7 +133,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   rugScore: {
-    label: 'Maximum Rugcheck score',
+    label: '🛡️ Maximum Rugcheck score',
     hint: 'Enter the maximum normalized risk score from 0 to 100. Lower scores are stricter. Then enable Rugcheck.',
     group: 'filters',
     chains: ['solana'],
@@ -130,7 +144,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   liquidity: {
-    label: 'Minimum liquidity ($)',
+    label: '💧 Minimum liquidity ($)',
     hint: 'Enter minimum liquidity in USD. This limit becomes active when set; send off to disable it.',
     group: 'filters',
     value: (s) => s.filters.minLiquidityUsd,
@@ -139,7 +153,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   holders: {
-    label: 'Maximum top holder concentration (%)',
+    label: '👥 Max top holders (%)',
     hint: 'Enter the maximum aggregate top holder percentage, or off.',
     group: 'filters',
     chains: ['solana'],
@@ -149,7 +163,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   tax: {
-    label: 'Maximum token tax (%)',
+    label: '🧾 Maximum token tax (%)',
     hint: 'Enter the maximum buy and sell tax percentage, or off.',
     group: 'filters',
     chains: ['robinhood'],
@@ -159,7 +173,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   impact: {
-    label: 'Maximum buy price impact (%)',
+    label: '📉 Max buy price impact (%)',
     hint: 'Enter the maximum buy price impact percentage, or off. Unknown impact is rejected while enabled.',
     group: 'filters',
     value: (s) => s.filters.maxPriceImpactPercent,
@@ -168,7 +182,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   sl: {
-    label: 'Stop loss (%)',
+    label: '🛑 Stop loss (%)',
     hint: 'Enter the loss percentage from entry. It sells all remaining tokens when enabled. Send off to remove it.',
     group: 'exits',
     value: (s) => s.exits.stopLoss.lossPercent,
@@ -178,7 +192,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   tslActivation: {
-    label: 'Trailing SL activation (%)',
+    label: '⚡ Trailing SL activation (%)',
     hint: 'Enter the profit percentage that activates the trailing stop, including 0 to start at entry.',
     group: 'exits',
     value: (s) => s.exits.trailingSl.activationPercent,
@@ -188,7 +202,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   tslDrawdown: {
-    label: 'Trailing SL distance (%)',
+    label: '📏 Trailing SL distance (%)',
     hint: 'Enter the percentage retreat from the highest observed value. Trailing SL sells all remaining tokens.',
     group: 'exits',
     value: (s) => s.exits.trailingSl.drawdownPercent,
@@ -199,7 +213,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   ttpActivation: {
-    label: 'Trailing TP activation (%)',
+    label: '⚡ Trailing TP activation (%)',
     hint: 'Enter the profit percentage that activates trailing take profit.',
     group: 'exits',
     value: (s) => s.exits.trailingTp.activationPercent,
@@ -209,7 +223,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   ttpDrawdown: {
-    label: 'Trailing TP distance (%)',
+    label: '📏 Trailing TP distance (%)',
     hint: 'Enter the percentage retreat from the highest value after activation.',
     group: 'exits',
     value: (s) => s.exits.trailingTp.drawdownPercent,
@@ -219,7 +233,7 @@ export const editableFields: Record<string, EditableField> = {
     },
   },
   ttpSell: {
-    label: 'Trailing TP sell (%)',
+    label: '💸 Trailing TP sell (%)',
     hint: 'Enter the percentage of the remaining balance to sell when trailing TP triggers.',
     group: 'exits',
     value: (s) => s.exits.trailingTp.sellPercent,
@@ -240,8 +254,8 @@ export function applyField(
     throw new Error('Unknown setting');
   const updated = structuredClone(settings);
   definition.set(updated, value.trim());
-  for (const native of [updated.buySizeNative, updated.maxNetworkFeeNative])
-    if (native !== null) parseAmount(native, nativeDecimals[chain]);
+  if (updated.buySizeNative !== null) parseAmount(updated.buySizeNative, nativeDecimals[chain]);
+  if (updated.priorityFee !== null) parseAmount(updated.priorityFee, 9);
   return chainSettingsSchema.parse(updated);
 }
 export const toggles: Record<
@@ -255,7 +269,7 @@ export const toggles: Record<
   }
 > = {
   mc: {
-    label: 'Market cap filter',
+    label: '📊 Market cap filter',
     group: 'filters',
     value: (s) => s.filters.marketCapEnabled,
     change: (s) => {
@@ -263,7 +277,7 @@ export const toggles: Record<
     },
   },
   rug: {
-    label: 'Rugcheck',
+    label: '🛡️ Rugcheck',
     group: 'filters',
     chains: ['solana'],
     value: (s) => s.filters.rugcheckEnabled,
@@ -272,7 +286,7 @@ export const toggles: Record<
     },
   },
   mint: {
-    label: 'Reject mint authority',
+    label: '🪙 Reject mint authority',
     group: 'filters',
     value: (s) => s.filters.rejectMintAuthority,
     change: (s) => {
@@ -280,7 +294,7 @@ export const toggles: Record<
     },
   },
   freeze: {
-    label: 'Reject freeze authority',
+    label: '❄️ Reject freeze authority',
     group: 'filters',
     chains: ['solana'],
     value: (s) => s.filters.rejectFreezeAuthority,
@@ -289,7 +303,7 @@ export const toggles: Record<
     },
   },
   extensions: {
-    label: 'Reject privileged token extensions',
+    label: '🧩 Reject privileged extensions',
     group: 'filters',
     chains: ['solana'],
     value: (s) => s.filters.rejectTokenExtensions,
@@ -298,7 +312,7 @@ export const toggles: Record<
     },
   },
   honeypot: {
-    label: 'Reject honeypots',
+    label: '🍯 Reject honeypots',
     group: 'filters',
     chains: ['robinhood'],
     value: (s) => s.filters.rejectHoneypot,
@@ -307,7 +321,7 @@ export const toggles: Record<
     },
   },
   blacklist: {
-    label: 'Reject blacklist capability',
+    label: '🚫 Reject blacklist capability',
     group: 'filters',
     chains: ['robinhood'],
     value: (s) => s.filters.rejectBlacklist,
@@ -316,7 +330,7 @@ export const toggles: Record<
     },
   },
   pausable: {
-    label: 'Reject pausable transfers',
+    label: '⏸️ Reject pausable transfers',
     group: 'filters',
     chains: ['robinhood'],
     value: (s) => s.filters.rejectPausable,
@@ -325,7 +339,7 @@ export const toggles: Record<
     },
   },
   proxy: {
-    label: 'Reject upgradeable contracts',
+    label: '🔧 Reject upgradeable contracts',
     group: 'filters',
     chains: ['robinhood'],
     value: (s) => s.filters.rejectProxy,
@@ -334,7 +348,7 @@ export const toggles: Record<
     },
   },
   mev: {
-    label: 'Require UniswapX protection',
+    label: '🛡️ Require UniswapX protection',
     group: 'execution',
     chains: ['robinhood'],
     value: (s) => s.mevProtection,
@@ -343,7 +357,7 @@ export const toggles: Record<
     },
   },
   sl: {
-    label: 'Fixed stop loss',
+    label: '🛑 Fixed stop loss',
     group: 'exits',
     value: (s) => s.exits.stopLoss.enabled,
     change: (s) => {
@@ -351,7 +365,7 @@ export const toggles: Record<
     },
   },
   tp: {
-    label: 'Take profit stages',
+    label: '🎯 Take profit stages',
     group: 'exits',
     value: (s) => s.exits.takeProfitEnabled,
     change: (s) => {
@@ -359,7 +373,7 @@ export const toggles: Record<
     },
   },
   tsl: {
-    label: 'Trailing stop loss',
+    label: '📉 Trailing stop loss',
     group: 'exits',
     value: (s) => s.exits.trailingSl.enabled,
     change: (s) => {
@@ -367,7 +381,7 @@ export const toggles: Record<
     },
   },
   ttp: {
-    label: 'Trailing take profit',
+    label: '📈 Trailing take profit',
     group: 'exits',
     value: (s) => s.exits.trailingTp.enabled,
     change: (s) => {

@@ -19,6 +19,9 @@ run.lock
 *.key
 *.pem
 *.log
+logs/
+*.jsonl
+*.jsonl.*
 *.tsbuildinfo
 .DS_Store
 Thumbs.db

@@ -1,10 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { logger } from '../logging/logger.js';
 import {
   settingsSchema,
   normalizeAddress,
   type CallSignal,
+  type CallObservation,
+  type CallHistoryItem,
   type Chain,
   type ChannelPost,
   type Operation,
@@ -21,7 +24,7 @@ export class Store {
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 1)
+    if (Number(version?.user_version ?? 0) > 2)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -38,8 +41,18 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations (chain) WHERE status IN ('active', 'review');
       CREATE TABLE IF NOT EXISTS token_entries (chain TEXT NOT NULL, address TEXT NOT NULL, operation_id TEXT NOT NULL, bought INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chain, address));
       CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE NOT NULL, text TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
-      PRAGMA user_version = 1;
     `);
+    this.transaction(() => {
+      const columns = this.db.prepare('PRAGMA table_info(signals)').all();
+      if (!columns.some((column) => column.name === 'source_post'))
+        this.db.exec('ALTER TABLE signals ADD COLUMN source_post TEXT');
+      if (!columns.some((column) => column.name === 'observation'))
+        this.db.exec('ALTER TABLE signals ADD COLUMN observation TEXT');
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS operations_by_signal ON operations (json_extract(payload, '$.signal.id'), created_at DESC)",
+      );
+      this.db.exec('PRAGMA user_version = 2');
+    });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));
   }
@@ -51,6 +64,7 @@ export class Store {
       return result;
     } catch (error) {
       this.db.exec('ROLLBACK');
+      logger.child({ component: 'storage' }).error('storage.transaction_failed', error);
       throw error;
     }
   }
@@ -67,12 +81,16 @@ export class Store {
       .run(JSON.stringify(settingsSchema.parse(settings)));
   }
   updateSettings(action: (settings: Settings) => void): Settings {
-    return this.transaction(() => {
+    const updated = this.transaction(() => {
       const settings = this.settings();
       action(settings);
       this.saveSettings(settings);
       return settings;
     });
+    logger
+      .child({ component: 'trading.settings' })
+      .debug('settings.updated', { settings: updated });
+    return updated;
   }
   metadata(key: string): string | null {
     const row = this.db.prepare('SELECT value FROM metadata WHERE key = ?').get(key);
@@ -85,12 +103,12 @@ export class Store {
       )
       .run(key, value);
   }
-  recordPost(post: ChannelPost, signal: CallSignal | null, reason: string | null): void {
+  recordPost(post: ChannelPost, signal: CallSignal | null, reason: string | null): boolean {
     const id = `${post.channelId}:${post.messageId}`;
-    this.db
+    const result = this.db
       .prepare(
-        `INSERT INTO signals (id,channel_id,message_id,revision,chain,state,reason,payload,received_at) VALUES (?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,chain=excluded.chain,state=excluded.state,reason=excluded.reason,payload=excluded.payload,received_at=excluded.received_at
+        `INSERT INTO signals (id,channel_id,message_id,revision,chain,state,reason,payload,received_at,source_post) VALUES (?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,chain=excluded.chain,state=excluded.state,reason=excluded.reason,payload=excluded.payload,received_at=excluded.received_at,source_post=excluded.source_post,observation=NULL
       WHERE signals.state != 'claimed' AND excluded.revision >= signals.revision AND excluded.payload != signals.payload`,
       )
       .run(
@@ -103,7 +121,9 @@ export class Store {
         reason,
         JSON.stringify(signal ?? post),
         Date.now(),
+        JSON.stringify(post),
       );
+    return Number(result.changes) > 0;
   }
   nextSignal(chain: Chain): CallSignal | null {
     return decode(
@@ -118,16 +138,52 @@ export class Store {
     this.db
       .prepare("UPDATE signals SET state = 'skipped', reason = ? WHERE id = ?")
       .run(reason, id);
+    logger.child({ component: 'trading.entries' }).info('entry.skipped', { signalId: id, reason });
   }
-  signalHistory(): { id: string; state: string; reason: string | null }[] {
+  recordObservation(id: string, observation: CallObservation): void {
+    this.db
+      .prepare("UPDATE signals SET observation = ? WHERE id = ? AND state = 'pending'")
+      .run(JSON.stringify(observation), id);
+  }
+  saveSourcePost(post: ChannelPost): void {
+    this.db
+      .prepare(
+        'UPDATE signals SET source_post = ? WHERE id = ? AND revision = ? AND source_post IS NULL',
+      )
+      .run(JSON.stringify(post), `${post.channelId}:${post.messageId}`, post.revision);
+  }
+  signalHistory(): CallHistoryItem[] {
     return this.db
-      .prepare('SELECT id,state,reason FROM signals ORDER BY received_at DESC LIMIT 10')
+      .prepare(
+        `SELECT signals.*,
+        (SELECT payload FROM operations WHERE json_extract(payload, '$.signal.id') = signals.id ORDER BY created_at DESC LIMIT 1) AS operation
+        FROM signals ORDER BY received_at DESC, message_id DESC LIMIT 10`,
+      )
       .all()
-      .map((row) => ({
-        id: String(row.id),
-        state: String(row.state),
-        reason: row.reason === null ? null : String(row.reason),
-      }));
+      .map((row) => {
+        const payload = decode<CallSignal | ChannelPost>(row);
+        const operation = decode<Operation>(row, 'operation');
+        return {
+          id: String(row.id),
+          channelId: String(row.channel_id),
+          messageId: Number(row.message_id),
+          state: String(row.state),
+          reason: row.reason === null ? null : String(row.reason),
+          signal: payload && 'caller' in payload ? payload : null,
+          post:
+            decode<ChannelPost>(row, 'source_post') ??
+            (payload && 'text' in payload ? payload : null),
+          observation: decode<CallObservation>(row, 'observation'),
+          operation: operation
+            ? {
+                status: operation.status,
+                error: operation.error,
+                hash: operation.swapHash,
+                symbol: operation.token.symbol,
+              }
+            : null,
+        };
+      });
   }
   hasEntry(chain: Chain, address: string): boolean {
     return Boolean(
@@ -161,6 +217,58 @@ export class Store {
         operation.createdAt,
         JSON.stringify(operation),
       );
+    logger.child({ component: 'trading.operations' }).info('operation.saved', {
+      operationId: operation.id,
+      chain: operation.chain,
+      token: operation.address,
+      kind: operation.kind,
+      status: operation.status,
+      positionId: operation.positionId,
+      signalId: operation.signal?.id,
+      amountRaw: operation.amountRaw,
+      exitKey: operation.exitKey,
+      swapHash: operation.swapHash,
+      quote: operation.quote,
+      reason: operation.error,
+      steps: operation.steps.map((step) => {
+        if (step.type === 'jupiter')
+          return {
+            type: step.type,
+            key: step.key,
+            jupiterRequestId: step.requestId,
+            router: step.router,
+            signature: step.signature,
+            submittedAt: step.submittedAt,
+            status: step.status,
+            executionCode: step.executionCode,
+            executionError: step.executionError,
+          };
+        if (step.type === 'solana')
+          return {
+            type: step.type,
+            key: step.key,
+            signature: step.signature,
+            submittedAt: step.submittedAt,
+            lastValidBlockHeight: step.lastValidBlockHeight,
+          };
+        if (step.type === 'evm')
+          return {
+            type: step.type,
+            key: step.key,
+            hash: step.hash,
+            submittedAt: step.submittedAt,
+            gasPaidRaw: step.gasPaidRaw,
+          };
+        return {
+          type: step.type,
+          key: step.key,
+          orderId: step.orderId,
+          txHash: step.txHash,
+          deadline: step.deadline,
+          submittedAt: step.submittedAt,
+        };
+      }),
+    });
   }
   claim(operation: Operation): boolean {
     return this.transaction(() => {

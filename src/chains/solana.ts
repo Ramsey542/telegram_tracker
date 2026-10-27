@@ -1,86 +1,85 @@
 import { z } from 'zod';
 import bs58 from 'bs58';
 import {
-  AddressLookupTableAccount,
-  ComputeBudgetProgram,
   Connection,
   PublicKey,
-  TransactionInstruction,
-  TransactionMessage,
   VersionedTransaction,
   type VersionedTransactionResponse,
 } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, unpackMint } from '@solana/spl-token';
 import type { Config } from '../config.js';
 import type { Wallets } from '../wallets.js';
 import {
   PendingTrade,
   ReviewRequired,
   TradeRejected,
-  parseAmount,
   type ChainSettings,
+  type JupiterStep,
   type Operation,
   type Quote,
   type SolanaStep,
   type SwapResult,
   type TokenInfo,
 } from '../domain.js';
-import { HttpClient } from '../infra/http.js';
+import { ApiError, HttpClient } from '../infra/http.js';
 import { MarketData } from '../providers/market.js';
 import type { ChainAdapter } from './types.js';
+import { solanaPriorityLamports } from './fees.js';
+import { logger } from '../logging/logger.js';
 
+const log = logger.child({ component: 'trading.solana', chain: 'solana' });
+const baseUrl = 'https://api.jup.ag/swap/v2';
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const unsignedRaw = z.string().regex(/^\d+$/);
-const instructionSchema = z.object({
-  programId: z.string(),
-  accounts: z.array(
-    z.object({ pubkey: z.string(), isSigner: z.boolean(), isWritable: z.boolean() }),
-  ),
-  data: z.string(),
-});
-const buildSchema = z.object({
-  inputMint: z.string(),
-  outputMint: z.string(),
-  inAmount: unsignedRaw,
-  outAmount: unsignedRaw,
-  otherAmountThreshold: unsignedRaw,
-  slippageBps: z.number(),
-  transactionVersion: z.number().optional(),
-  computeBudgetInstructions: z.array(instructionSchema),
-  setupInstructions: z.array(instructionSchema),
-  swapInstruction: instructionSchema,
-  cleanupInstruction: instructionSchema.nullable(),
-  otherInstructions: z.array(instructionSchema).default([]),
-  tipInstruction: instructionSchema.nullable().optional(),
-  addressesByLookupTableAddress: z.record(z.string(), z.array(z.string())).nullable(),
-  blockhashWithMetadata: z.object({
-    blockhash: z.array(z.number()),
-    lastValidBlockHeight: z.number(),
-  }),
-  priceImpactPct: z.string().optional(),
-});
 const orderSchema = z.object({
   inputMint: z.string(),
   outputMint: z.string(),
   inAmount: unsignedRaw,
   outAmount: unsignedRaw,
   otherAmountThreshold: unsignedRaw,
-  inUsdValue: z.number().nullable().optional(),
-  outUsdValue: z.number().nullable().optional(),
-  priceImpact: z.number().optional(),
-  priceImpactPct: z.string().optional(),
+  inUsdValue: z.number().finite().nullish(),
+  outUsdValue: z.number().finite().nullish(),
+  swapUsdValue: z.number().finite().nullish(),
+  priceImpact: z.number().finite().nullish(),
+  priceImpactPct: z.string().nullish(),
   router: z.string().optional(),
 });
-const makeInstruction = (value: z.infer<typeof instructionSchema>): TransactionInstruction =>
-  new TransactionInstruction({
-    programId: new PublicKey(value.programId),
-    keys: value.accounts.map((account) => ({
-      pubkey: new PublicKey(account.pubkey),
-      isSigner: account.isSigner,
-      isWritable: account.isWritable,
-    })),
-    data: Buffer.from(value.data, 'base64'),
-  });
+const executableOrderSchema = orderSchema.extend({
+  transaction: z.string().nullable(),
+  requestId: z.string().min(1),
+  slippageBps: z.number().int().min(0).max(10_000),
+  transactionVersion: z.number().optional(),
+  taker: z.string().nullish(),
+  lastValidBlockHeight: z.coerce.number().int().positive().safe().nullish(),
+  expireAt: z.string().nullish(),
+  errorCode: z.number().nullish(),
+  errorMessage: z.string().nullish(),
+  error: z.string().nullish(),
+  prioritizationFeeLamports: z.number().int().nonnegative().safe().nullish(),
+  signatureFeeLamports: z.number().int().nonnegative().safe().nullish(),
+  rentFeeLamports: z.number().int().nonnegative().safe().nullish(),
+  feeBps: z.number().nullish(),
+  feeMint: z.string().nullish(),
+});
+const executionSchema = z.object({
+  status: z.enum(['Success', 'Failed']).optional(),
+  signature: z.string().nullish(),
+  code: z.number().int().optional(),
+  error: z.string().nullish(),
+});
+
+function priceImpact(order: z.infer<typeof orderSchema>): number | null {
+  const value =
+    order.priceImpact ?? (order.priceImpactPct == null ? null : Number(order.priceImpactPct) * 100);
+  return value !== null && Number.isFinite(value) ? Math.abs(value) : null;
+}
+function validSignature(value: string): boolean {
+  try {
+    const bytes = bs58.decode(value);
+    return bytes.length === 64 && bytes.some((byte) => byte !== 0);
+  } catch {
+    return false;
+  }
+}
 
 export function solanaTokenDelta(
   receipt: VersionedTransactionResponse,
@@ -105,6 +104,7 @@ export class SolanaAdapter implements ChainAdapter {
   readonly chain = 'solana' as const;
   readonly address: string;
   private readonly connection: Connection | null;
+  private networkVerification: Promise<void> | null = null;
   constructor(
     private readonly config: Config,
     private readonly wallets: Wallets,
@@ -117,8 +117,7 @@ export class SolanaAdapter implements ChainAdapter {
           commitment: 'confirmed',
           disableRetryOnRateLimit: true,
           confirmTransactionInitialTimeout: config.httpTimeoutMs,
-          fetch: (input, init) =>
-            fetch(input, { ...init, signal: AbortSignal.timeout(config.httpTimeoutMs) }),
+          fetch: (input, init) => this.http.fetch('QuickNode Solana RPC', input, init),
         })
       : null;
   }
@@ -133,8 +132,17 @@ export class SolanaAdapter implements ChainAdapter {
     return missing;
   }
   async verifyNetwork(): Promise<void> {
-    if ((await this.rpc().getGenesisHash()) !== '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d')
-      throw new Error('QuickNode endpoint is not Solana mainnet');
+    this.networkVerification ??= this.rpc()
+      .getGenesisHash()
+      .then((hash) => {
+        if (hash !== '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d')
+          throw new Error('QuickNode endpoint is not Solana mainnet');
+      })
+      .catch((error: unknown) => {
+        this.networkVerification = null;
+        throw error;
+      });
+    await this.networkVerification;
   }
   async balance(): Promise<{ nativeRaw: string; wrappedRaw: null }> {
     return {
@@ -145,25 +153,17 @@ export class SolanaAdapter implements ChainAdapter {
     };
   }
   async tokenInfo(address: string): Promise<TokenInfo> {
-    const publicKey = new PublicKey(address);
-    const account = await this.rpc().getAccountInfo(publicKey, 'confirmed');
-    if (
-      !account ||
-      (!account.owner.equals(TOKEN_PROGRAM_ID) && !account.owner.equals(TOKEN_2022_PROGRAM_ID))
-    )
-      throw new TradeRejected('Address is not a supported Solana token mint');
-    const mint = unpackMint(publicKey, account, account.owner);
-    if (!mint.isInitialized || mint.decimals > 36)
-      throw new TradeRejected('Unsupported token mint precision or state');
+    new PublicKey(address);
     const data = await this.market.solana(address);
     return {
       chain: this.chain,
       address,
       symbol: data?.symbol ?? address.slice(0, 8),
-      decimals: mint.decimals,
+      decimals: data?.decimals ?? null,
       marketCapUsd: data?.mcap ?? null,
       liquidityUsd: data?.liquidity ?? null,
       usdPrice: data?.usdPrice ?? null,
+      topHoldersPercent: data?.audit?.topHoldersPercentage ?? null,
       fetchedAt: Date.now(),
     };
   }
@@ -174,15 +174,11 @@ export class SolanaAdapter implements ChainAdapter {
       outputMint: SOL_MINT,
       amount: amountRaw,
       slippageBps: String(Math.round(settings.sellSlippagePercent * 100)),
-      excludeRouters: 'jupiterz,dflow,okx',
       maxSupportedTransactionVersion: '0',
     });
-    const order = await this.http.json(
-      'Jupiter quote',
-      `https://api.jup.ag/swap/v2/order?${query}`,
-      orderSchema,
-      { headers: { 'x-api-key': this.config.jupiterKey } },
-    );
+    const order = await this.http.json('Jupiter quote', `${baseUrl}/order?${query}`, orderSchema, {
+      headers: { 'x-api-key': this.config.jupiterKey },
+    });
     if (
       order.inputMint !== address ||
       order.outputMint !== SOL_MINT ||
@@ -190,17 +186,16 @@ export class SolanaAdapter implements ChainAdapter {
       BigInt(order.outAmount) <= 0n
     )
       throw new Error('Jupiter quote does not match the requested sale');
+    const nativeUsdValue = order.outUsdValue ?? order.swapUsdValue;
     return {
       inputRaw: amountRaw,
       outputRaw: order.outAmount,
       minOutputRaw: order.otherAmountThreshold,
       nativeUsd:
-        typeof order.outUsdValue === 'number' && BigInt(order.outAmount) > 0n
-          ? order.outUsdValue / (Number(order.outAmount) / 1e9)
+        typeof nativeUsdValue === 'number' && nativeUsdValue > 0
+          ? nativeUsdValue / (Number(order.outAmount) / 1e9)
           : null,
-      priceImpactPercent:
-        order.priceImpact ??
-        (order.priceImpactPct === undefined ? null : Math.abs(Number(order.priceImpactPct) * 100)),
+      priceImpactPercent: priceImpact(order),
       receivedAt: Date.now(),
     };
   }
@@ -210,52 +205,395 @@ export class SolanaAdapter implements ChainAdapter {
     beforeSwap: () => Promise<void>,
     beforeSpend: () => void,
   ): Promise<SwapResult> {
-    await this.verifyNetwork();
+    if (this.config.listenOnly)
+      throw new TradeRejected('LISTEN_ONLY=true: Solana execution is blocked');
+    const legacy = operation.steps.find((step): step is SolanaStep => step.type === 'solana');
+    if (legacy) return this.advanceLegacy(operation, legacy, persist);
     let step = operation.steps.find(
-      (candidate): candidate is SolanaStep => candidate.type === 'solana',
+      (candidate): candidate is JupiterStep => candidate.type === 'jupiter',
     );
     if (!step) {
-      await beforeSwap();
-      step = await this.prepare(operation, beforeSpend);
+      step = await this.prepare(operation, beforeSwap, beforeSpend);
       operation.steps.push(step);
       persist();
+    } else {
+      const result = await this.reconcile(operation, step);
+      if (result) return result;
+      if (step.status === 'prepared') await beforeSwap();
     }
+    if (step.status === 'confirmed')
+      throw new PendingTrade('Jupiter confirmed the swap; waiting for its QuickNode receipt');
+    if (step.status === 'failed')
+      throw new PendingTrade(
+        `Jupiter execution failed (${step.executionCode}): ${step.executionError}; reconciling the saved transaction`,
+      );
+    if (step.lastAttemptAt !== null && Date.now() - step.lastAttemptAt < 15_000)
+      throw new PendingTrade('Waiting before checking the same Jupiter execution again');
+    const savedStep = step;
+    const result = await this.http.json('Jupiter execute', `${baseUrl}/execute`, executionSchema, {
+      method: 'POST',
+      body: {
+        signedTransaction: step.serialized,
+        requestId: step.requestId,
+        ...(step.lastValidBlockHeight === null
+          ? {}
+          : { lastValidBlockHeight: String(step.lastValidBlockHeight) }),
+      },
+      headers: { 'x-api-key': this.config.jupiterKey },
+      retry: false,
+      timeoutMs: Math.max(60_000, this.config.httpTimeoutMs),
+      beforeRequest: () => {
+        if (savedStep.submittedAt === null) {
+          if (
+            Date.now() - savedStep.createdAt > 30_000 ||
+            (savedStep.expiresAt !== null && Date.now() >= savedStep.expiresAt) ||
+            (operation.kind === 'buy' && Date.now() - operation.token.fetchedAt > 30_000)
+          )
+            throw new TradeRejected('Jupiter order or entry filter data expired before submission');
+          beforeSpend();
+        }
+        savedStep.submittedAt ??= Date.now();
+        savedStep.lastAttemptAt = Date.now();
+        savedStep.status = 'submitted';
+        persist();
+        log.info('transaction.execute_started', {
+          operationId: operation.id,
+          service: 'Jupiter execute',
+          jupiterRequestId: savedStep.requestId,
+          router: savedStep.router,
+          signature: savedStep.signature,
+          elapsedMs: Date.now() - savedStep.createdAt,
+        });
+      },
+    });
+    if (result.signature) {
+      if (
+        !validSignature(result.signature) ||
+        (step.signature !== null && step.signature !== result.signature)
+      )
+        throw new ReviewRequired('Jupiter returned an unexpected transaction signature');
+      step.signature = result.signature;
+    }
+    step.executionCode = result.code ?? null;
+    step.executionError = result.error ?? null;
+    step.status = result.status === 'Success' && result.code === 0 ? 'confirmed' : 'failed';
+    persist();
+    if (step.status === 'confirmed') {
+      log.info('transaction.execute_confirmed', {
+        operationId: operation.id,
+        jupiterRequestId: step.requestId,
+        signature: step.signature,
+        durationMs: Date.now() - (step.lastAttemptAt ?? step.createdAt),
+      });
+      if (step.signature === null)
+        throw new ReviewRequired('Jupiter reported success without a transaction signature');
+    } else {
+      log.error(
+        'transaction.execute_failed',
+        new ApiError(
+          `Jupiter execute failed (${step.executionCode}): ${step.executionError ?? 'Unknown execution result'}`,
+          {
+            service: 'Jupiter execute',
+            endpoint: `${baseUrl}/execute`,
+            responseBody: result,
+            jupiterRequestId: step.requestId,
+            router: step.router,
+          },
+        ),
+      );
+    }
+    const receipt = await this.reconcile(operation, step);
+    if (receipt) return receipt;
+    throw new PendingTrade('Waiting for the saved Jupiter transaction to be reconciled');
+  }
+  private async prepare(
+    operation: Operation,
+    beforeSwap: () => Promise<void>,
+    beforeSpend: () => void,
+  ): Promise<JupiterStep> {
+    const slippage =
+      operation.kind === 'buy'
+        ? operation.settings.buySlippagePercent
+        : operation.settings.sellSlippagePercent;
+    if (slippage === null) throw new TradeRejected('Set slippage before trading');
+    new PublicKey(operation.address);
+    const inputMint = operation.kind === 'buy' ? SOL_MINT : operation.address;
+    const outputMint = operation.kind === 'buy' ? operation.address : SOL_MINT;
+    const slippageBps = Math.round(slippage * 100);
+    const query = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount: operation.amountRaw,
+      taker: this.address,
+      slippageBps: String(slippageBps),
+      maxSupportedTransactionVersion: '0',
+    });
+    const priority = operation.settings.priorityFee;
+    if (priority !== null) {
+      query.set('priorityFeeLamports', String(solanaPriorityLamports(priority)));
+      query.set('broadcastFeeType', 'exactFee');
+    }
+    const started = Date.now();
+    log.info('transaction.order_requested', {
+      service: 'Jupiter order',
+      operationId: operation.id,
+      inputMint,
+      outputMint,
+      amountRaw: operation.amountRaw,
+      slippageBps,
+      requestedPriorityFeeSol: priority,
+    });
+    const [orderResult, filterResult] = await Promise.allSettled([
+      this.http
+        .json('Jupiter order', `${baseUrl}/order?${query}`, executableOrderSchema, {
+          headers: { 'x-api-key': this.config.jupiterKey },
+        })
+        .then((order) => ({ order, receivedAt: Date.now() })),
+      beforeSwap(),
+    ]);
+    if (filterResult.status === 'rejected') throw filterResult.reason;
+    if (orderResult.status === 'rejected') throw orderResult.reason;
+    const { order, receivedAt } = orderResult.value;
+    if (
+      order.error ||
+      order.errorMessage ||
+      (order.errorCode != null && order.errorCode !== 0) ||
+      !order.transaction
+    ) {
+      const error = new TradeRejected(
+        `Jupiter order rejected (${order.router ?? 'unknown'} / ${order.errorCode ?? 'unknown'}): ${order.errorMessage ?? order.error ?? 'No executable transaction'}`,
+      );
+      log.error('transaction.order_rejected', error, {
+        service: 'Jupiter order',
+        jupiterRequestId: order.requestId,
+        responseBody: order,
+      });
+      throw error;
+    }
+    if (
+      order.inputMint !== inputMint ||
+      order.outputMint !== outputMint ||
+      order.inAmount !== operation.amountRaw ||
+      order.transactionVersion === 1 ||
+      (order.taker != null && order.taker !== this.address) ||
+      order.slippageBps > slippageBps ||
+      BigInt(order.outAmount) <= 0n ||
+      BigInt(order.otherAmountThreshold) <= 0n ||
+      BigInt(order.otherAmountThreshold) <
+        (BigInt(order.outAmount) * BigInt(10_000 - slippageBps)) / 10_000n
+    )
+      throw new TradeRejected('Jupiter order does not match the configured trade');
+    const impact = priceImpact(order);
+    const maximumImpact = operation.settings.filters.maxPriceImpactPercent;
+    if (
+      operation.kind === 'buy' &&
+      maximumImpact !== null &&
+      (impact === null || impact > maximumImpact)
+    )
+      throw new TradeRejected('Price impact is unknown or exceeds the configured limit');
+    if (
+      operation.kind === 'sell' &&
+      operation.minimumNativeRaw !== null &&
+      BigInt(order.outAmount) < BigInt(operation.minimumNativeRaw)
+    )
+      throw new TradeRejected('Exit price changed; waiting for the configured profit');
+    const expiresAt = order.expireAt == null ? null : Date.parse(order.expireAt);
+    if (
+      (expiresAt !== null && (!Number.isFinite(expiresAt) || Date.now() >= expiresAt)) ||
+      Date.now() - receivedAt > 30_000 ||
+      Date.now() - operation.token.fetchedAt > 30_000
+    )
+      throw new TradeRejected('Jupiter order or entry filter data expired before signing');
+    const transaction = VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
+    if (transaction.version !== 0 || transaction.serialize().length > 1232)
+      throw new TradeRejected('Unsupported Jupiter transaction version or size');
+    const signers = transaction.message.staticAccountKeys.slice(
+      0,
+      transaction.message.header.numRequiredSignatures,
+    );
+    if (
+      !signers.some((key) => key.equals(this.wallets.solana.publicKey)) ||
+      transaction.signatures.length !== signers.length
+    )
+      throw new TradeRejected('Wallet is not a valid required signer in the Jupiter transaction');
+    beforeSpend();
+    transaction.sign([this.wallets.solana]);
+    const firstSignature = transaction.signatures[0];
+    const signature = firstSignature?.some((byte) => byte !== 0)
+      ? bs58.encode(firstSignature)
+      : null;
+    const nativeValue =
+      (operation.kind === 'buy' ? order.inUsdValue : order.outUsdValue) ?? order.swapUsdValue;
+    const nativeRaw = operation.kind === 'buy' ? order.inAmount : order.outAmount;
+    operation.quote = {
+      inputRaw: order.inAmount,
+      outputRaw: order.outAmount,
+      minOutputRaw: order.otherAmountThreshold,
+      nativeUsd:
+        typeof nativeValue === 'number' && nativeValue > 0 && BigInt(nativeRaw) > 0n
+          ? nativeValue / (Number(nativeRaw) / 1e9)
+          : (operation.quote?.nativeUsd ?? null),
+      priceImpactPercent: impact,
+      receivedAt,
+    };
+    log.info('transaction.order_prepared', {
+      operationId: operation.id,
+      service: 'Jupiter order',
+      jupiterRequestId: order.requestId,
+      router: order.router,
+      durationMs: Date.now() - started,
+      quote: operation.quote,
+      priorityFeeLamports: order.prioritizationFeeLamports,
+      signatureFeeLamports: order.signatureFeeLamports,
+      rentFeeLamports: order.rentFeeLamports,
+      feeBps: order.feeBps,
+      feeMint: order.feeMint,
+    });
+    return {
+      type: 'jupiter',
+      key: 'swap',
+      requestId: order.requestId,
+      router: order.router ?? 'unknown',
+      serialized: Buffer.from(transaction.serialize()).toString('base64'),
+      signature,
+      lastValidBlockHeight: order.lastValidBlockHeight ?? null,
+      expiresAt,
+      createdAt: receivedAt,
+      submittedAt: null,
+      lastAttemptAt: null,
+      status: 'prepared',
+      executionCode: null,
+      executionError: null,
+    };
+  }
+  private async reconcile(operation: Operation, step: JupiterStep): Promise<SwapResult | null> {
+    if (step.signature !== null) {
+      await this.verifyNetwork();
+      const receipt = await this.rpc().getTransaction(step.signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      });
+      if (receipt?.meta) return this.accountReceipt(operation, step.signature, receipt);
+      if (
+        step.submittedAt !== null &&
+        (Date.now() - step.submittedAt > 30_000 || step.status === 'failed')
+      ) {
+        const status = (
+          await this.rpc().getSignatureStatuses([step.signature], {
+            searchTransactionHistory: true,
+          })
+        ).value[0];
+        if (status?.err) throw new TradeRejected('Solana swap failed on chain');
+        if (!status && step.status !== 'confirmed' && step.lastValidBlockHeight !== null) {
+          const height = await this.rpc().getBlockHeight('finalized');
+          if (height > step.lastValidBlockHeight + 32)
+            throw new TradeRejected('Jupiter transaction expired without an on-chain execution');
+        }
+        log.info('transaction.confirmation_check', {
+          operationId: operation.id,
+          signature: step.signature,
+          status,
+          jupiterRequestId: step.requestId,
+          executionStatus: step.status,
+        });
+        if (status && Date.now() - step.submittedAt > 120_000)
+          throw new ReviewRequired(
+            'Solana signature exists but transaction accounting is unavailable',
+          );
+      }
+    }
+    if (
+      step.status === 'confirmed' &&
+      step.lastAttemptAt !== null &&
+      Date.now() - step.lastAttemptAt > 120_000
+    )
+      throw new ReviewRequired(
+        'Jupiter confirmed the swap but its QuickNode receipt is still unavailable',
+      );
+    if (step.status === 'failed' && step.signature === null)
+      throw new ReviewRequired(
+        `Jupiter execution failed (${step.executionCode}): ${step.executionError ?? 'No transaction signature was returned'}; verify before retrying`,
+      );
+    if (
+      step.submittedAt !== null &&
+      step.lastValidBlockHeight === null &&
+      Date.now() - step.submittedAt > 120_000
+    )
+      throw new ReviewRequired(
+        'Jupiter execution outcome is unresolved; no new order will be created',
+      );
+    return null;
+  }
+  private accountReceipt(
+    operation: Operation,
+    signature: string,
+    receipt: VersionedTransactionResponse,
+  ): SwapResult {
+    const meta = receipt.meta!;
+    if (meta.err) {
+      log.error('transaction.reverted', meta.err, {
+        operationId: operation.id,
+        signature,
+        logs: meta.logMessages,
+      });
+      throw new TradeRejected('Solana swap reverted on chain');
+    }
+    const tokenDelta = solanaTokenDelta(receipt, operation.address, this.address);
+    const keys = receipt.transaction.message.getAccountKeys({
+      accountKeysFromLookups: meta.loadedAddresses,
+    });
+    let walletIndex = -1;
+    for (let index = 0; index < keys.length; index++)
+      if (keys.get(index)?.toBase58() === this.address) walletIndex = index;
+    const before = meta.preBalances[walletIndex];
+    const after = meta.postBalances[walletIndex];
+    if (
+      before === undefined ||
+      after === undefined ||
+      !Number.isSafeInteger(before) ||
+      !Number.isSafeInteger(after)
+    )
+      throw new ReviewRequired('Could not reconcile the confirmed Solana balance change');
+    const decimals = new Set(
+      [...(meta.preTokenBalances ?? []), ...(meta.postTokenBalances ?? [])]
+        .filter((balance) => balance.mint === operation.address && balance.owner === this.address)
+        .map((balance) => balance.uiTokenAmount.decimals),
+    );
+    const precision = [...decimals][0];
+    if (
+      decimals.size !== 1 ||
+      precision === undefined ||
+      !Number.isInteger(precision) ||
+      precision < 0 ||
+      precision > 36
+    )
+      throw new ReviewRequired('Could not reconcile the confirmed token decimals');
+    operation.token.decimals = precision;
+    const nativeDelta = BigInt(after) - BigInt(before);
+    const tokenRaw = operation.kind === 'buy' ? tokenDelta : -tokenDelta;
+    const nativeRaw = operation.kind === 'buy' ? -nativeDelta : nativeDelta;
+    if (tokenRaw <= 0n || (operation.kind === 'buy' && nativeRaw <= 0n))
+      throw new ReviewRequired('Confirmed Solana swap has unexpected balance changes');
+    operation.swapHash = signature;
+    return {
+      tokenRaw: tokenRaw.toString(),
+      nativeRaw: nativeRaw.toString(),
+      feeNativeRaw: keys.get(0)?.toBase58() === this.address ? meta.fee.toString() : '0',
+      signature,
+      nativeUsd: operation.quote?.nativeUsd ?? null,
+    };
+  }
+  private async advanceLegacy(
+    operation: Operation,
+    step: SolanaStep,
+    persist: () => void,
+  ): Promise<SwapResult> {
+    await this.verifyNetwork();
     const receipt = await this.rpc().getTransaction(step.signature, {
       commitment: 'confirmed',
       maxSupportedTransactionVersion: 0,
     });
-    if (receipt?.meta) {
-      if (receipt.meta.err) throw new TradeRejected('Solana swap reverted on chain');
-      const tokenDelta = solanaTokenDelta(receipt, operation.address, this.address);
-      const keys = receipt.transaction.message.getAccountKeys({
-        accountKeysFromLookups: receipt.meta.loadedAddresses,
-      });
-      let walletIndex = -1;
-      for (let index = 0; index < keys.length; index++)
-        if (keys.get(index)?.toBase58() === this.address) walletIndex = index;
-      const before = receipt.meta.preBalances[walletIndex];
-      const after = receipt.meta.postBalances[walletIndex];
-      if (
-        before === undefined ||
-        after === undefined ||
-        !Number.isSafeInteger(before) ||
-        !Number.isSafeInteger(after)
-      )
-        throw new ReviewRequired('Could not reconcile the confirmed Solana balance change');
-      const nativeDelta = BigInt(after) - BigInt(before);
-      const tokenRaw = operation.kind === 'buy' ? tokenDelta : -tokenDelta;
-      const nativeRaw = operation.kind === 'buy' ? -nativeDelta : nativeDelta;
-      if (tokenRaw <= 0n || (operation.kind === 'buy' && nativeRaw <= 0n))
-        throw new ReviewRequired('Confirmed Solana swap has unexpected balance changes');
-      operation.swapHash = step.signature;
-      return {
-        tokenRaw: tokenRaw.toString(),
-        nativeRaw: nativeRaw.toString(),
-        feeNativeRaw: receipt.meta.fee.toString(),
-        signature: step.signature,
-        nativeUsd: operation.quote?.nativeUsd ?? null,
-      };
-    }
+    if (receipt?.meta) return this.accountReceipt(operation, step.signature, receipt);
     const status = (
       await this.rpc().getSignatureStatuses([step.signature], { searchTransactionHistory: true })
     ).value[0];
@@ -271,13 +609,10 @@ export class SolanaAdapter implements ChainAdapter {
     if (step.submittedAt === null || Date.now() - step.submittedAt > 15_000) {
       if (height > step.lastValidBlockHeight)
         throw new PendingTrade('Waiting for expired Solana transaction reconciliation');
-      if (step.jito) {
+      if (step.jito)
         throw new ReviewRequired(
           'Saved Solana transaction uses legacy Jito routing; review its signature before retrying',
         );
-      }
-      // QuickNode applies endpoint-level MEV protection to sendTransaction.
-      // Keep its dashboard toggle enabled; use this endpoint for every retry.
       await this.rpc().sendRawTransaction(Buffer.from(step.serialized, 'base64'), {
         skipPreflight: false,
         maxRetries: 0,
@@ -285,120 +620,6 @@ export class SolanaAdapter implements ChainAdapter {
       step.submittedAt = Date.now();
       persist();
     }
-    throw new PendingTrade('Waiting for Solana confirmation');
-  }
-  private async prepare(operation: Operation, beforeSpend: () => void): Promise<SolanaStep> {
-    const settings = operation.settings;
-    const slippage =
-      operation.kind === 'buy' ? settings.buySlippagePercent : settings.sellSlippagePercent;
-    if (slippage === null || settings.maxNetworkFeeNative === null)
-      throw new TradeRejected('Set slippage and the maximum network fee');
-    const inputMint = operation.kind === 'buy' ? SOL_MINT : operation.address;
-    const outputMint = operation.kind === 'buy' ? operation.address : SOL_MINT;
-    const query = new URLSearchParams({
-      inputMint,
-      outputMint,
-      amount: operation.amountRaw,
-      taker: this.address,
-      slippageBps: String(Math.round(slippage * 100)),
-      transactionVersion: '0',
-      wrapAndUnwrapSol: 'true',
-      forJitoBundle: 'false',
-    });
-    const built = await this.http.json(
-      'Jupiter build',
-      `https://api.jup.ag/swap/v2/build?${query}`,
-      buildSchema,
-      { headers: { 'x-api-key': this.config.jupiterKey } },
-    );
-    if (built.swapInstruction.programId !== 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4')
-      throw new TradeRejected('Unexpected Jupiter swap program');
-    if (
-      built.inputMint !== inputMint ||
-      built.outputMint !== outputMint ||
-      built.inAmount !== operation.amountRaw ||
-      built.transactionVersion === 1 ||
-      BigInt(built.otherAmountThreshold) <= 0n ||
-      built.slippageBps > Math.round(slippage * 100)
-    )
-      throw new TradeRejected('Jupiter build does not match the configured trade');
-    const impact =
-      built.priceImpactPct === undefined ? null : Math.abs(Number(built.priceImpactPct) * 100);
-    if (
-      operation.kind === 'buy' &&
-      settings.filters.maxPriceImpactPercent !== null &&
-      (impact === null ||
-        !Number.isFinite(impact) ||
-        impact > settings.filters.maxPriceImpactPercent)
-    )
-      throw new TradeRejected('Price impact is unknown or exceeds the configured limit');
-    const maximumFee = parseAmount(settings.maxNetworkFeeNative, 9);
-    if (
-      operation.kind === 'sell' &&
-      operation.minimumNativeRaw !== null &&
-      BigInt(built.outAmount) < BigInt(operation.minimumNativeRaw)
-    )
-      throw new TradeRejected('Exit price changed; waiting for the configured profit');
-    const instructions = [
-      ...built.computeBudgetInstructions.map(makeInstruction),
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-      ...built.setupInstructions.map(makeInstruction),
-      ...built.otherInstructions.map(makeInstruction),
-      makeInstruction(built.swapInstruction),
-      ...(built.cleanupInstruction ? [makeInstruction(built.cleanupInstruction)] : []),
-    ];
-    if (built.tipInstruction) throw new TradeRejected('Unexpected Jupiter tip instruction');
-    for (const instruction of instructions)
-      for (const account of instruction.keys)
-        if (account.isSigner && !account.pubkey.equals(this.wallets.solana.publicKey))
-          throw new TradeRejected('Jupiter build requires an unexpected signer');
-    const lookupTables: AddressLookupTableAccount[] = [];
-    for (const address of Object.keys(built.addressesByLookupTableAddress ?? {})) {
-      const table = (await this.rpc().getAddressLookupTable(new PublicKey(address))).value;
-      if (!table) throw new TradeRejected('Swap lookup table is unavailable');
-      lookupTables.push(table);
-    }
-    const lifetime = await this.rpc().getLatestBlockhash('confirmed');
-    const message = new TransactionMessage({
-      payerKey: this.wallets.solana.publicKey,
-      recentBlockhash: lifetime.blockhash,
-      instructions,
-    }).compileToV0Message(lookupTables);
-    const fee = (await this.rpc().getFeeForMessage(message, 'confirmed')).value;
-    if (fee === null || BigInt(fee) > maximumFee)
-      throw new TradeRejected('Solana network fee exceeds your limit');
-    const transaction = new VersionedTransaction(message);
-    beforeSpend();
-    transaction.sign([this.wallets.solana]);
-    if (transaction.serialize().length > 1232)
-      throw new TradeRejected('Swap transaction exceeds the Solana size limit');
-    const simulation = await this.rpc().simulateTransaction(transaction, {
-      sigVerify: true,
-      commitment: 'confirmed',
-    });
-    if (simulation.value.err)
-      throw new TradeRejected('QuickNode simulation rejected the Solana swap');
-    const balance = await this.rpc().getBalance(this.wallets.solana.publicKey, 'confirmed');
-    if (operation.kind === 'buy' && BigInt(balance) <= BigInt(operation.amountRaw) + maximumFee)
-      throw new TradeRejected('Insufficient SOL for the buy and network fee reserve');
-    operation.quote = {
-      inputRaw: built.inAmount,
-      outputRaw: built.outAmount,
-      minOutputRaw: built.otherAmountThreshold,
-      nativeUsd: operation.quote?.nativeUsd ?? null,
-      priceImpactPercent: impact,
-      receivedAt: Date.now(),
-    };
-    beforeSpend();
-    return {
-      type: 'solana',
-      key: 'swap',
-      signature: bs58.encode(transaction.signatures[0]!),
-      serialized: Buffer.from(transaction.serialize()).toString('base64'),
-      lastValidBlockHeight: lifetime.lastValidBlockHeight,
-      submittedAt: null,
-      bundleId: null,
-      jito: false,
-    };
+    throw new PendingTrade('Waiting for legacy Solana confirmation');
   }
 }

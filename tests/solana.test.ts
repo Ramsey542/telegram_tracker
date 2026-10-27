@@ -2,9 +2,9 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import bs58 from 'bs58';
 import {
-  ComputeBudgetProgram,
   Connection,
   PublicKey,
+  TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
   type VersionedTransactionResponse,
@@ -16,6 +16,7 @@ import {
   PendingTrade,
   ReviewRequired,
   TradeRejected,
+  type JupiterStep,
   type Operation,
   type SolanaStep,
 } from '../src/domain.js';
@@ -23,12 +24,12 @@ import { HttpClient } from '../src/infra/http.js';
 import { MarketData } from '../src/providers/market.js';
 import { SOL_MINT, SolanaAdapter } from '../src/chains/solana.js';
 
-// Offline fixtures only: no private keys, .env loading, real signatures, or network requests.
 const rpcUrl = 'https://protected.solana.test.invalid/';
 const owner = new PublicKey('11111111111111111111111111111111');
+const marketMaker = new PublicKey(new Uint8Array(32).fill(2));
 const mint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const signature = bs58.encode(Buffer.alloc(64));
-const jupiterProgram = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+const signature = bs58.encode(new Uint8Array(64).fill(7));
+const makerSignature = bs58.encode(new Uint8Array(64).fill(3));
 const config = {
   solanaRpc: rpcUrl,
   jupiterKey: 'offline-test-key',
@@ -36,7 +37,7 @@ const config = {
 } as Config;
 const wallets = { solana: { publicKey: owner } } as Wallets;
 
-function operation(kind: 'buy' | 'sell', mevProtection = true): Operation {
+function operation(kind: 'buy' | 'sell' = 'buy'): Operation {
   return {
     id: 'offline-operation',
     chain: 'solana',
@@ -51,20 +52,13 @@ function operation(kind: 'buy' | 'sell', mevProtection = true): Operation {
       chain: 'solana',
       address: mint,
       symbol: 'TEST',
-      decimals: 6,
+      decimals: null,
       marketCapUsd: null,
       liquidityUsd: null,
       usdPrice: null,
       fetchedAt: Date.now(),
     },
-    settings: chainSettingsSchema.parse({
-      buySlippagePercent: 0.5,
-      sellSlippagePercent: 0.5,
-      maxNetworkFeeNative: '0.000005',
-      mevProtection,
-      // A saved Jito tip must not be added or reserved on the QuickNode route.
-      jitoTipNative: '1',
-    }),
+    settings: chainSettingsSchema.parse({ buySlippagePercent: 0.5, sellSlippagePercent: 0.5 }),
     steps: [],
     quote: null,
     swapHash: null,
@@ -74,26 +68,68 @@ function operation(kind: 'buy' | 'sell', mevProtection = true): Operation {
     error: null,
   };
 }
-
-function savedStep(jito: boolean): SolanaStep {
+function fixtureTransaction(sponsored = false): VersionedTransaction {
+  return new VersionedTransaction(
+    new TransactionMessage({
+      payerKey: sponsored ? marketMaker : owner,
+      recentBlockhash: owner.toBase58(),
+      instructions: [
+        new TransactionInstruction({
+          programId: new PublicKey('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'),
+          keys: [{ pubkey: owner, isSigner: true, isWritable: true }],
+          data: Buffer.alloc(0),
+        }),
+      ],
+    }).compileToV0Message(),
+  );
+}
+function receipt(kind: 'buy' | 'sell' = 'buy'): VersionedTransactionResponse {
+  const balance = (amount: string) => ({
+    accountIndex: 1,
+    mint,
+    owner: owner.toBase58(),
+    uiTokenAmount: { amount, decimals: 6, uiAmount: Number(amount) / 1e6 },
+  });
   return {
-    type: 'solana',
-    key: 'swap',
-    signature,
-    serialized: Buffer.from('offline unsigned fixture').toString('base64'),
-    lastValidBlockHeight: 1000,
-    submittedAt: null,
-    bundleId: null,
-    jito,
+    slot: 1,
+    version: 0,
+    transaction: { signatures: [signature], message: fixtureTransaction().message },
+    meta: {
+      err: null,
+      fee: 5000,
+      preBalances: [1_000_000_000, 0],
+      postBalances: [kind === 'buy' ? 899_995_000 : 1_099_995_000, 0],
+      preTokenBalances: [balance(kind === 'buy' ? '0' : '1000000')],
+      postTokenBalances: [balance(kind === 'buy' ? '1000000' : '0')],
+    },
   };
 }
-
 function harness(t: TestContext) {
-  const calls: { url: string; method: string; params: unknown[] }[] = [];
-  const builds: URL[] = [];
-  let rejectSubmission = false;
-  // Keep the production assembly path, but replace signing with a no-op.
-  const signing = t.mock.method(VersionedTransaction.prototype, 'sign', () => {});
+  const events: string[] = [];
+  const orders: URL[] = [];
+  const executions: { requestId: string; signedTransaction: string }[] = [];
+  const snapshots: Operation[] = [];
+  let tradeReceipt: VersionedTransactionResponse | null = null;
+  let sponsored = false;
+  let retainMakerSignature = false;
+  let rejectExecution = false;
+  let height = 100;
+  let orderOverride: Record<string, unknown> = {};
+  let executionOverride: Record<string, unknown> = {};
+  const signing = t.mock.method(
+    VersionedTransaction.prototype,
+    'sign',
+    function (this: VersionedTransaction) {
+      const index = this.message.staticAccountKeys
+        .slice(0, this.message.header.numRequiredSignatures)
+        .findIndex((key) => key.equals(owner));
+      this.signatures[index] = new Uint8Array(64).fill(7);
+    },
+  );
+  t.mock.method(Connection.prototype, 'getTransaction', async () => {
+    events.push('getTransaction');
+    return tradeReceipt;
+  });
   t.mock.method(
     globalThis,
     'fetch',
@@ -101,70 +137,57 @@ function harness(t: TestContext) {
       const url = new URL(
         typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
       );
-      if (url.hostname === 'api.jup.ag' && url.pathname === '/swap/v2/build') {
-        builds.push(url);
-        const query = url.searchParams;
+      if (url.hostname === 'api.jup.ag' && url.pathname === '/swap/v2/order') {
+        events.push('order');
+        orders.push(url);
+        const tx = fixtureTransaction(sponsored);
+        if (sponsored && retainMakerSignature) tx.signatures[0] = new Uint8Array(64).fill(3);
+        const output = url.searchParams.get('inputMint') === SOL_MINT ? '1000000' : '100000000';
         return Response.json({
-          inputMint: query.get('inputMint'),
-          outputMint: query.get('outputMint'),
-          inAmount: query.get('amount'),
-          outAmount: '1000000',
-          otherAmountThreshold: '995000',
+          inputMint: url.searchParams.get('inputMint'),
+          outputMint: url.searchParams.get('outputMint'),
+          inAmount: url.searchParams.get('amount'),
+          outAmount: output,
+          otherAmountThreshold: String((BigInt(output) * 995n) / 1000n),
           slippageBps: 50,
+          transaction: Buffer.from(tx.serialize()).toString('base64'),
           transactionVersion: 0,
-          computeBudgetInstructions: [],
-          setupInstructions: [],
-          otherInstructions: [],
-          swapInstruction: { programId: jupiterProgram, accounts: [], data: '' },
-          cleanupInstruction: null,
-          tipInstruction: null,
-          addressesByLookupTableAddress: null,
-          blockhashWithMetadata: { blockhash: Array(32).fill(0), lastValidBlockHeight: 1000 },
-          priceImpactPct: '0',
+          requestId: 'offline-order',
+          router: sponsored ? 'jupiterz' : 'metis',
+          taker: owner.toBase58(),
+          lastValidBlockHeight: '1000',
+          inUsdValue: 20,
+          outUsdValue: 20,
+          priceImpact: -0.1,
+          ...orderOverride,
         });
       }
-      assert.equal(url.href, rpcUrl, 'All RPC requests must use the configured endpoint');
-      const request = JSON.parse(String(options?.body)) as {
-        id: string | number;
-        method: string;
-        params: unknown[];
-      };
-      calls.push({ url: url.href, method: request.method, params: request.params });
-      if (request.method === 'sendTransaction' && rejectSubmission)
+      if (url.hostname === 'api.jup.ag' && url.pathname === '/swap/v2/execute') {
+        events.push('execute');
+        assert.equal(snapshots.at(-1)?.steps[0]?.type, 'jupiter');
+        assert.equal((snapshots.at(-1)?.steps[0] as JupiterStep).status, 'submitted');
+        executions.push(JSON.parse(String(options?.body)));
+        if (rejectExecution) throw new Error('Offline Jupiter timeout');
         return Response.json({
-          jsonrpc: '2.0',
-          id: request.id,
-          error: { code: -32000, message: 'Protected RPC unavailable' },
+          status: 'Success',
+          code: 0,
+          signature: sponsored ? makerSignature : signature,
+          ...executionOverride,
         });
-      const context = { slot: 1 };
+      }
+      assert.equal(url.href, rpcUrl, 'Only the configured QuickNode RPC may be read');
+      const request = JSON.parse(String(options?.body)) as { id: number; method: string };
+      events.push(request.method);
       let result: unknown;
       switch (request.method) {
         case 'getGenesisHash':
           result = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
           break;
-        case 'getLatestBlockhash':
-          result = { context, value: { blockhash: owner.toBase58(), lastValidBlockHeight: 1000 } };
-          break;
-        case 'getFeeForMessage':
-          result = { context, value: 5000 };
-          break;
-        case 'simulateTransaction':
-          result = { context, value: { err: null, logs: [], unitsConsumed: 100000 } };
-          break;
-        case 'getBalance':
-          result = { context, value: 1_000_000_000_000 };
-          break;
-        case 'getTransaction':
-          result = null;
-          break;
         case 'getSignatureStatuses':
-          result = { context, value: [null] };
+          result = { context: { slot: 1 }, value: [null] };
           break;
         case 'getBlockHeight':
-          result = 100;
-          break;
-        case 'sendTransaction':
-          result = signature;
+          result = height;
           break;
         default:
           assert.fail(`Unexpected RPC method: ${request.method}`);
@@ -172,178 +195,271 @@ function harness(t: TestContext) {
       return Response.json({ jsonrpc: '2.0', id: request.id, result });
     },
   );
-  const http = new HttpClient(1000);
+  const http = new HttpClient(1000, 150);
   const adapter = new SolanaAdapter(config, wallets, http, new MarketData(config, http));
   return {
     adapter,
-    calls,
-    builds,
+    events,
+    orders,
+    executions,
+    snapshots,
     signing,
-    setRejectSubmission(value: boolean) {
-      rejectSubmission = value;
+    persist(trade: Operation) {
+      snapshots.push(structuredClone(trade));
+    },
+    setReceipt(value: VersionedTransactionResponse | null) {
+      tradeReceipt = value;
+    },
+    setSponsored(value: boolean, keepSignature = false) {
+      sponsored = value;
+      retainMakerSignature = keepSignature;
+    },
+    setRejectExecution(value: boolean) {
+      rejectExecution = value;
+    },
+    setHeight(value: number) {
+      height = value;
+    },
+    setOrder(value: Record<string, unknown>) {
+      orderOverride = value;
+    },
+    setExecution(value: Record<string, unknown>) {
+      executionOverride = value;
     },
   };
 }
-
-test('default Solana readiness does not require a Jito tip or separate endpoint', (t) => {
-  const { adapter } = harness(t);
-  assert.deepEqual(adapter.readiness(chainSettingsSchema.parse({})), []);
-});
+async function advance(
+  value: ReturnType<typeof harness>,
+  trade: Operation,
+  beforeSwap = async () => {},
+  beforeSpend = () => {},
+) {
+  return value.adapter.advance(trade, () => value.persist(trade), beforeSwap, beforeSpend);
+}
 
 for (const kind of ['buy', 'sell'] as const) {
-  for (const mevProtection of [true, false]) {
-    test(`${kind} uses the QuickNode RPC with saved MEV setting ${mevProtection}`, async (t) => {
-      const { adapter, calls, builds, signing } = harness(t);
-      const trade = operation(kind, mevProtection);
-      let persisted = 0;
-      await assert.rejects(
-        adapter.advance(
-          trade,
-          () => persisted++,
-          async () => {},
-          () => {},
-        ),
-        PendingTrade,
-      );
-      assert.equal(builds.length, 1);
-      assert.equal(builds[0]!.searchParams.get('forJitoBundle'), 'false');
-      assert.equal(builds[0]!.searchParams.get('inputMint'), kind === 'buy' ? SOL_MINT : mint);
-      assert.equal(builds[0]!.searchParams.get('outputMint'), kind === 'buy' ? mint : SOL_MINT);
-      assert.equal(signing.mock.callCount(), 1, 'Signing was intercepted by the offline stub');
-      const step = trade.steps[0] as SolanaStep;
-      assert.equal(step.jito, false);
-      assert.equal(step.bundleId, null);
-      assert.equal(typeof step.submittedAt, 'number');
-      assert.equal(persisted, 2);
-      const sends = calls.filter((call) => call.method === 'sendTransaction');
-      assert.equal(sends.length, 1);
-      assert.equal(sends[0]!.params[0], step.serialized);
-      const submission = sends[0]!.params[1] as Record<string, unknown>;
-      assert.equal(submission.encoding, 'base64');
-      assert.equal(submission.maxRetries, 0);
-      assert.equal(submission.preflightCommitment, 'confirmed');
-      assert.notEqual(submission.skipPreflight, true);
-      const transaction = VersionedTransaction.deserialize(Buffer.from(step.serialized, 'base64'));
-      assert.ok(transaction.signatures.every((value) => value.every((byte) => byte === 0)));
-      const programs = transaction.message.compiledInstructions.map((instruction) =>
-        transaction.message.staticAccountKeys[instruction.programIdIndex]!.toBase58(),
-      );
-      assert.deepEqual(programs, [ComputeBudgetProgram.programId.toBase58(), jupiterProgram]);
-      assert.ok(!calls.some((call) => ['sendBundle', 'getTipAccounts'].includes(call.method)));
-    });
-  }
+  test(`${kind} orders, signs and executes before any RPC reads`, async (t) => {
+    const value = harness(t);
+    const trade = operation(kind);
+    value.setReceipt(receipt(kind));
+    const result = await advance(value, trade);
+    assert.equal(result.signature, signature);
+    assert.equal(result.tokenRaw, '1000000');
+    assert.equal(result.nativeRaw, kind === 'buy' ? '100005000' : '99995000');
+    assert.equal(trade.token.decimals, 6);
+    assert.deepEqual(value.events, ['order', 'execute', 'getGenesisHash', 'getTransaction']);
+    assert.equal(value.orders[0]!.searchParams.get('taker'), owner.toBase58());
+    assert.equal(value.orders[0]!.searchParams.get('excludeRouters'), null);
+    assert.equal(value.signing.mock.callCount(), 1);
+    assert.equal((trade.steps[0] as JupiterStep).status, 'confirmed');
+  });
 }
-
-test('RPC failure keeps the same saved transaction and endpoint for retry', async (t) => {
-  const { adapter, calls, builds, signing, setRejectSubmission } = harness(t);
-  const trade = operation('sell');
-  setRejectSubmission(true);
-  await assert.rejects(
-    adapter.advance(
-      trade,
-      () => {},
-      async () => {},
-      () => {},
-    ),
-    /Protected RPC unavailable/,
+for (const priority of [null, '0', '0.00001'] as const) {
+  test(`priority override ${priority ?? 'auto'} is passed in the Jupiter order`, async (t) => {
+    const value = harness(t);
+    const trade = operation();
+    trade.settings.priorityFee = priority;
+    await assert.rejects(advance(value, trade), PendingTrade);
+    assert.equal(
+      value.orders[0]!.searchParams.get('priorityFeeLamports'),
+      priority === null ? null : priority === '0' ? '0' : '10000',
+    );
+    assert.equal(
+      value.orders[0]!.searchParams.get('broadcastFeeType'),
+      priority === null ? null : 'exactFee',
+    );
+  });
+}
+test('JupiterZ keeps the other signature slot and only signs the wallet slot', async (t) => {
+  const value = harness(t);
+  value.setSponsored(true, true);
+  const trade = operation();
+  await assert.rejects(advance(value, trade), PendingTrade);
+  const tx = VersionedTransaction.deserialize(
+    Buffer.from(value.executions[0]!.signedTransaction, 'base64'),
   );
-  const step = trade.steps[0] as SolanaStep;
-  assert.equal(step.submittedAt, null);
-  const serialized = step.serialized;
-  setRejectSubmission(false);
-  await assert.rejects(
-    adapter.advance(
-      trade,
-      () => {},
-      async () => {},
-      () => {},
-    ),
-    PendingTrade,
-  );
-  const sends = calls.filter((call) => call.method === 'sendTransaction');
-  assert.equal(sends.length, 2);
-  assert.ok(sends.every((call) => call.url === rpcUrl && call.params[0] === serialized));
-  assert.equal(builds.length, 1);
-  assert.equal(signing.mock.callCount(), 1);
+  assert.deepEqual([...tx.signatures[0]!], Array(64).fill(3));
+  assert.deepEqual([...tx.signatures[1]!], Array(64).fill(7));
 });
-
-test('Solana network fee cap still rejects an over-budget transaction before signing', async (t) => {
-  const { adapter, calls, signing } = harness(t);
-  const trade = operation('buy');
-  trade.settings.maxNetworkFeeNative = '0.000004999';
-  await assert.rejects(
-    adapter.advance(
-      trade,
-      () => {},
-      async () => {},
-      () => {},
-    ),
-    (error: unknown) => error instanceof TradeRejected && /fee exceeds/.test(error.message),
+test('a missing market-maker signature is preserved until Jupiter execute fills it', async (t) => {
+  const value = harness(t);
+  value.setSponsored(true);
+  const trade = operation();
+  await assert.rejects(advance(value, trade), PendingTrade);
+  assert.equal((value.snapshots[0]!.steps[0] as JupiterStep).signature, null);
+  assert.equal((trade.steps[0] as JupiterStep).signature, makerSignature);
+  const tx = VersionedTransaction.deserialize(
+    Buffer.from(value.executions[0]!.signedTransaction, 'base64'),
   );
-  assert.equal(signing.mock.callCount(), 0);
+  assert.ok(tx.signatures[0]!.every((byte) => byte === 0));
+});
+test('filter failures prevent signing and submission while the order is requested immediately', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  let checked = false;
+  await assert.rejects(
+    advance(value, trade, async () => {
+      checked = true;
+      throw new TradeRejected('Current market cap is too high');
+    }),
+    /Current market cap is too high/,
+  );
+  assert.equal(checked, true);
+  assert.equal(value.orders.length, 1);
+  assert.equal(value.executions.length, 0);
+  assert.equal(value.signing.mock.callCount(), 0);
   assert.equal(trade.steps.length, 0);
-  assert.ok(!calls.some((call) => call.method === 'sendTransaction'));
 });
-
-test('a saved Jito transaction is not silently rerouted through normal RPC', async (t) => {
-  const { adapter, calls, builds, signing } = harness(t);
-  const trade = operation('buy');
-  trade.steps.push(savedStep(true));
+test('an interrupted execution resumes with the same durable order and signed bytes', async (t) => {
+  const value = harness(t);
+  value.setRejectExecution(true);
+  const trade = operation();
+  await assert.rejects(advance(value, trade), /Offline Jupiter timeout/);
+  const step = trade.steps[0] as JupiterStep;
+  assert.equal(step.status, 'submitted');
+  assert.notEqual(step.submittedAt, null);
+  step.lastAttemptAt = Date.now() - 16_000;
+  const restored = structuredClone(trade);
+  value.setRejectExecution(false);
+  await assert.rejects(advance(value, restored), PendingTrade);
+  assert.equal(value.orders.length, 1);
+  assert.equal(value.signing.mock.callCount(), 1);
+  assert.equal(value.executions.length, 2);
+  assert.deepEqual(value.executions[0], value.executions[1]);
+});
+test('a confirmed receipt after a lost execute response prevents resubmission', async (t) => {
+  const value = harness(t);
+  value.setRejectExecution(true);
+  const trade = operation();
+  await assert.rejects(advance(value, trade));
+  value.setReceipt(receipt());
+  const result = await advance(value, structuredClone(trade));
+  assert.equal(result.tokenRaw, '1000000');
+  assert.equal(value.executions.length, 1);
+  assert.equal(value.orders.length, 1);
+});
+test('Jupiter success waits for the real receipt without creating another order', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  await assert.rejects(advance(value, trade), PendingTrade);
+  await assert.rejects(advance(value, trade), PendingTrade);
+  assert.equal(value.executions.length, 1);
+  assert.equal(value.events.filter((event) => event === 'getGenesisHash').length, 1);
+  value.setReceipt(receipt());
+  const result = await advance(value, trade);
+  assert.equal(result.nativeRaw, '100005000');
+  assert.equal(value.orders.length, 1);
+});
+test('Jupiter-confirmed execution cannot be treated as an expired unexecuted buy', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  await assert.rejects(advance(value, trade), PendingTrade);
+  const step = trade.steps[0] as JupiterStep;
+  step.submittedAt = Date.now() - 130_000;
+  step.lastAttemptAt = Date.now() - 130_000;
+  value.setHeight(1100);
+  await assert.rejects(advance(value, trade), ReviewRequired);
+  assert.equal(step.status, 'confirmed');
+  assert.equal(value.events.includes('getBlockHeight'), false);
+  assert.equal(value.orders.length, 1);
+});
+test('price impact and take-profit bounds prevent signing an unsuitable order', async (t) => {
+  const value = harness(t);
+  const buy = operation();
+  buy.settings.filters.maxPriceImpactPercent = 0.05;
+  await assert.rejects(advance(value, buy), /Price impact/);
+  const sell = operation('sell');
+  sell.minimumNativeRaw = '100000001';
+  await assert.rejects(advance(value, sell), /Exit price changed/);
+  assert.equal(value.signing.mock.callCount(), 0);
+  assert.equal(value.executions.length, 0);
+});
+for (const mismatch of [
+  { inputMint: mint },
+  { inAmount: '999' },
+  { slippageBps: 100 },
+  { otherAmountThreshold: '1' },
+  { transaction: '' },
+  { errorCode: 2, errorMessage: 'Insufficient SOL for gas' },
+]) {
+  test(`invalid order is rejected before signing: ${JSON.stringify(mismatch)}`, async (t) => {
+    const value = harness(t);
+    value.setOrder(mismatch);
+    await assert.rejects(advance(value, operation()), TradeRejected);
+    assert.equal(value.signing.mock.callCount(), 0);
+    assert.equal(value.executions.length, 0);
+  });
+}
+test('failed Jupiter execution with no usable signature stays reserved for review', async (t) => {
+  const value = harness(t);
+  value.setSponsored(true);
+  value.setExecution({ status: 'Failed', code: -1, signature: null, error: 'Order expired' });
+  const trade = operation();
+  await assert.rejects(advance(value, trade), ReviewRequired);
+  assert.equal((trade.steps[0] as JupiterStep).executionCode, -1);
+  assert.equal(value.orders.length, 1);
+});
+test('a failed execution with a known signature is rejected only after chain expiry is established', async (t) => {
+  const value = harness(t);
+  value.setExecution({ status: 'Failed', code: -1000, error: 'Failed to land' });
+  value.setHeight(1100);
+  await assert.rejects(advance(value, operation()), /expired without an on-chain execution/);
+});
+test('a disabling guard is checked again immediately before execution', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  let checks = 0;
+  await assert.rejects(
+    advance(
+      value,
+      trade,
+      async () => {},
+      () => {
+        if (++checks === 2) throw new TradeRejected('Chain entries were disabled before signing');
+      },
+    ),
+    /Chain entries were disabled/,
+  );
+  assert.equal(value.executions.length, 0);
+  assert.equal((trade.steps[0] as JupiterStep).submittedAt, null);
+});
+test('listen-only blocks orders, signing and all RPC access', async (t) => {
+  const value = harness(t);
+  const http = new HttpClient(1000, 150);
+  const adapter = new SolanaAdapter(
+    { ...config, listenOnly: true },
+    wallets,
+    http,
+    new MarketData(config, http),
+  );
   await assert.rejects(
     adapter.advance(
-      trade,
+      operation(),
       () => {},
       async () => {},
       () => {},
     ),
-    ReviewRequired,
+    /LISTEN_ONLY/,
   );
-  assert.equal(builds.length, 0);
-  assert.equal(signing.mock.callCount(), 0);
-  assert.ok(!calls.some((call) => ['sendTransaction', 'sendBundle'].includes(call.method)));
+  assert.deepEqual(value.events, []);
 });
-
-test('a confirmed legacy Jito transaction can still be reconciled', async (t) => {
-  const { adapter, calls, signing } = harness(t);
-  const receipt: VersionedTransactionResponse = {
-    slot: 1,
-    version: 0,
-    transaction: {
-      signatures: [signature],
-      message: new TransactionMessage({
-        payerKey: owner,
-        recentBlockhash: owner.toBase58(),
-        instructions: [],
-      }).compileToV0Message(),
-    },
-    meta: {
-      err: null,
-      fee: 5000,
-      preBalances: [100_000_000],
-      postBalances: [90_000_000],
-      preTokenBalances: [],
-      postTokenBalances: [
-        {
-          accountIndex: 0,
-          mint,
-          owner: owner.toBase58(),
-          uiTokenAmount: { amount: '1000000', decimals: 6, uiAmount: 1 },
-        },
-      ],
-    },
+test('legacy saved Jito trades can reconcile and cannot become Jupiter orders', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  const step: SolanaStep = {
+    type: 'solana',
+    key: 'swap',
+    signature,
+    serialized: 'offline-legacy',
+    lastValidBlockHeight: 1000,
+    submittedAt: null,
+    bundleId: null,
+    jito: true,
   };
-  t.mock.method(Connection.prototype, 'getTransaction', async () => receipt);
-  const trade = operation('buy');
-  trade.steps.push(savedStep(true));
-  const result = await adapter.advance(
-    trade,
-    () => {},
-    async () => {},
-    () => {},
-  );
-  assert.equal(result.tokenRaw, '1000000');
-  assert.equal(result.nativeRaw, '10000000');
-  assert.equal(result.signature, signature);
-  assert.equal(signing.mock.callCount(), 0);
-  assert.ok(!calls.some((call) => ['sendTransaction', 'sendBundle'].includes(call.method)));
+  trade.steps.push(step);
+  await assert.rejects(advance(value, trade), ReviewRequired);
+  assert.equal(value.orders.length, 0);
+  value.setReceipt(receipt());
+  assert.equal((await advance(value, trade)).tokenRaw, '1000000');
+  assert.equal(value.executions.length, 0);
 });

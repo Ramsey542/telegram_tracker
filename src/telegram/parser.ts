@@ -93,6 +93,11 @@ export function parseCall(post: ChannelPost): ParsedCall {
       callerId,
       consistency: { overall, recent, chain: chainRate },
       advertisedMarketCapUsd,
+      tokenName: /\bjust\s+posted\s+([\s\S]+?)\s+at\s*\$/i
+        .exec(post.text)?.[1]
+        ?.replace(/[\x00-\x1f\x7f]/g, ' ')
+        .trim()
+        .slice(0, 64),
     },
   };
 }

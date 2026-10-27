@@ -120,7 +120,11 @@ export const chainSettingsSchema = z.object({
   buySizeNative: amount.nullable().default(null),
   buySlippagePercent: positivePercent.max(50).nullable().default(null),
   sellSlippagePercent: positivePercent.max(50).nullable().default(null),
-  maxNetworkFeeNative: amount.nullable().default(null),
+  priorityFee: z
+    .string()
+    .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/)
+    .nullable()
+    .default(null),
   // Retained for compatibility with saved settings; Solana no longer adds Jito tips.
   jitoTipNative: amount.nullable().default(null),
   // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
@@ -137,7 +141,6 @@ export const chainSettingsSchema = z.object({
 });
 
 export const settingsSchema = z.object({
-  tradingEnabled: z.boolean().default(false),
   blockedCallers: z.array(z.string()).default(() => []),
   chains: z.object({ solana: chainSettingsSchema, robinhood: chainSettingsSchema }).default(() => ({
     solana: chainSettingsSchema.parse({}),
@@ -168,16 +171,40 @@ export interface CallSignal {
   callerId: string | null;
   consistency: { overall: number; recent: number; chain: number };
   advertisedMarketCapUsd: number | null;
+  tokenName?: string;
+}
+export interface CallObservation {
+  decision: 'pending' | 'skipped';
+  reason: string;
+  observedAt: number;
+  thresholds: CallSignal['consistency'];
+}
+export interface CallHistoryItem {
+  id: string;
+  channelId: string;
+  messageId: number;
+  state: string;
+  reason: string | null;
+  signal: CallSignal | null;
+  post: ChannelPost | null;
+  observation: CallObservation | null;
+  operation: {
+    status: OperationStatus;
+    error: string | null;
+    hash: string | null;
+    symbol: string;
+  } | null;
 }
 export interface TokenInfo {
   chain: Chain;
   address: string;
   symbol: string;
-  decimals: number;
+  decimals: number | null;
   marketCapUsd: number | null;
   liquidityUsd: number | null;
   usdPrice: number | null;
   fetchedAt: number;
+  topHoldersPercent?: number | null;
 }
 export interface Quote {
   inputRaw: string;
@@ -254,7 +281,23 @@ export interface OrderStep {
   submittedAt: number | null;
   txHash: string | null;
 }
-export type TradeStep = EvmStep | SolanaStep | OrderStep;
+export interface JupiterStep {
+  type: 'jupiter';
+  key: string;
+  requestId: string;
+  router: string;
+  serialized: string;
+  signature: string | null;
+  lastValidBlockHeight: number | null;
+  expiresAt: number | null;
+  createdAt: number;
+  submittedAt: number | null;
+  lastAttemptAt: number | null;
+  status: 'prepared' | 'submitted' | 'confirmed' | 'failed';
+  executionCode: number | null;
+  executionError: string | null;
+}
+export type TradeStep = EvmStep | SolanaStep | OrderStep | JupiterStep;
 export interface Operation {
   id: string;
   chain: Chain;

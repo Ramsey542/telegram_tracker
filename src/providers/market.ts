@@ -1,12 +1,15 @@
 import { z } from 'zod';
 import type { Config } from '../config.js';
 import { HttpClient } from '../infra/http.js';
+import { logger } from '../logging/logger.js';
+
+const log = logger.child({ component: 'trading.market' });
 
 const nullableNumber = z.number().finite().nullable().optional();
 const tokenSchema = z.object({
   id: z.string(),
   symbol: z.string(),
-  decimals: z.number().int(),
+  decimals: z.number().int().min(0).max(36),
   mcap: nullableNumber,
   usdPrice: nullableNumber,
   liquidity: nullableNumber,
@@ -35,7 +38,15 @@ export class MarketData {
       z.array(tokenSchema),
       { headers: { 'x-api-key': this.config.jupiterKey } },
     );
-    return tokens.find((token) => token.id === mint) ?? null;
+    const token = tokens.find((token) => token.id === mint) ?? null;
+    log.info('market.token_result', {
+      service: 'Jupiter token data',
+      chain: 'solana',
+      token: mint,
+      matched: token !== null,
+      data: token,
+    });
+    return token;
   }
   async robinhood(address: string) {
     const pairs = await this.http.json(
@@ -49,6 +60,15 @@ export class MarketData {
         pair.baseToken.address.toLowerCase() === address.toLowerCase(),
     );
     matching.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+    log.info('market.token_result', {
+      service: 'DEX Screener',
+      chain: 'robinhood',
+      token: address,
+      matched: matching.length > 0,
+      pairCount: pairs.length,
+      matchingPairs: matching.length,
+      selectedPair: matching[0] ?? null,
+    });
     return matching[0] ?? null;
   }
 }

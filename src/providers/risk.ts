@@ -1,28 +1,57 @@
 import { z } from 'zod';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { unpackMint, getExtensionTypes, ExtensionType } from '@solana/spl-token';
+import {
+  unpackMint,
+  getExtensionTypes,
+  ExtensionType,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+} from '@solana/spl-token';
 import type { Config } from '../config.js';
 import type { ChainSettings, TokenInfo } from '../domain.js';
 import { HttpClient } from '../infra/http.js';
-import { MarketData } from './market.js';
+import { logger } from '../logging/logger.js';
+import { GoPlusClient } from './goplus.js';
 
-const riskFlag = z.string().optional();
-const securitySchema = z.object({
-  is_honeypot: riskFlag,
-  is_mintable: riskFlag,
-  is_blacklisted: riskFlag,
-  transfer_pausable: riskFlag,
-  is_proxy: riskFlag,
-  buy_tax: riskFlag,
-  sell_tax: riskFlag,
-});
+const log = logger.child({ component: 'risk.filters' });
+
 export class RiskFilters {
+  private readonly goplus: GoPlusClient;
   constructor(
     private readonly config: Config,
     private readonly http: HttpClient,
-    private readonly market: MarketData,
-  ) {}
+  ) {
+    this.goplus = new GoPlusClient(config, http);
+  }
   async check(token: TokenInfo, settings: ChainSettings): Promise<void> {
+    log.info('risk.check_started', {
+      chain: token.chain,
+      token: token.address,
+      marketCapUsd: token.marketCapUsd,
+      liquidityUsd: token.liquidityUsd,
+      dataAgeMs: Date.now() - token.fetchedAt,
+      filters: settings.filters,
+    });
+    try {
+      await this.checkCurrent(token, settings);
+      log.info('risk.check_passed', {
+        chain: token.chain,
+        token: token.address,
+        marketCapUsd: token.marketCapUsd,
+        liquidityUsd: token.liquidityUsd,
+      });
+    } catch (error) {
+      log.error('risk.check_failed', error, {
+        chain: token.chain,
+        token: token.address,
+        filters: settings.filters,
+        marketCapUsd: token.marketCapUsd,
+        liquidityUsd: token.liquidityUsd,
+      });
+      throw error;
+    }
+  }
+  private async checkCurrent(token: TokenInfo, settings: ChainSettings): Promise<void> {
     const filters = settings.filters;
     if (Date.now() - token.fetchedAt > 30_000) throw new Error('Entry market data is stale');
     if (filters.marketCapEnabled) {
@@ -38,10 +67,11 @@ export class RiskFilters {
       (token.liquidityUsd === null || token.liquidityUsd < filters.minLiquidityUsd)
     )
       throw new Error('Liquidity is unavailable or below the minimum');
-    if (token.chain === 'solana') await this.solana(token.address, settings);
+    if (token.chain === 'solana') await this.solana(token, settings);
     else await this.robinhood(token.address, settings);
   }
-  private async solana(address: string, settings: ChainSettings): Promise<void> {
+  private async solana(token: TokenInfo, settings: ChainSettings): Promise<void> {
+    const address = token.address;
     const filters = settings.filters;
     if (
       filters.rejectMintAuthority ||
@@ -50,13 +80,25 @@ export class RiskFilters {
     ) {
       const connection = new Connection(this.config.solanaRpc, {
         commitment: 'confirmed',
-        fetch: (input, init) =>
-          fetch(input, { ...init, signal: AbortSignal.timeout(this.config.httpTimeoutMs) }),
+        disableRetryOnRateLimit: true,
+        fetch: (input, init) => this.http.fetch('QuickNode Solana RPC', input, init),
       });
       const publicKey = new PublicKey(address);
       const account = await connection.getAccountInfo(publicKey, 'confirmed');
-      if (!account) throw new Error('Token mint account is unavailable');
+      if (
+        !account ||
+        (!account.owner.equals(TOKEN_PROGRAM_ID) && !account.owner.equals(TOKEN_2022_PROGRAM_ID))
+      )
+        throw new Error('Token mint account is unavailable or has an unsupported owner');
       const mint = unpackMint(publicKey, account, account.owner);
+      if (!mint.isInitialized || mint.decimals > 36)
+        throw new Error('Token mint state is unsupported');
+      log.info('risk.mint_authorities', {
+        token: address,
+        mintAuthority: mint.mintAuthority?.toBase58() ?? null,
+        freezeAuthority: mint.freezeAuthority?.toBase58() ?? null,
+        extensions: getExtensionTypes(mint.tlvData).map((type) => ExtensionType[type]),
+      });
       if (filters.rejectMintAuthority && mint.mintAuthority !== null)
         throw new Error('Mint authority is enabled');
       if (filters.rejectFreezeAuthority && mint.freezeAuthority !== null)
@@ -90,6 +132,12 @@ export class RiskFilters {
             : {},
         },
       );
+      log.info('risk.rugcheck_result', {
+        service: 'Rugcheck',
+        token: address,
+        report,
+        maximumScore: filters.maxRugcheckScore,
+      });
       if (
         report.error ||
         filters.maxRugcheckScore === null ||
@@ -98,8 +146,13 @@ export class RiskFilters {
         throw new Error('Rugcheck score is unavailable or exceeds the maximum');
     }
     if (filters.maxTopHoldersPercent !== null) {
-      const metadata = await this.market.solana(address);
-      const concentration = metadata?.audit?.topHoldersPercentage;
+      const concentration = token.topHoldersPercent;
+      log.info('risk.holder_concentration', {
+        service: 'Jupiter token data',
+        token: address,
+        observedPercent: concentration,
+        maximumPercent: filters.maxTopHoldersPercent,
+      });
       if (typeof concentration !== 'number' || concentration > filters.maxTopHoldersPercent)
         throw new Error('Holder concentration is unavailable or exceeds the maximum');
     }
@@ -113,20 +166,12 @@ export class RiskFilters {
       filters.rejectPausable ||
       filters.rejectProxy ||
       filters.maxTaxPercent !== null;
-    if (!enabled) return;
-    const response = await this.http.json(
-      'GoPlus',
-      `https://api.gopluslabs.io/api/v1/token_security/4663?contract_addresses=${address}`,
-      z.object({ code: z.number(), result: z.record(z.string(), securitySchema) }),
-      {
-        headers: this.config.goplusToken
-          ? { Authorization: `Bearer ${this.config.goplusToken}` }
-          : {},
-      },
-    );
-    if (response.code !== 1) throw new Error('GoPlus security data is incomplete');
-    const report = response.result[address.toLowerCase()];
-    if (!report) throw new Error('GoPlus has no analysis for this token');
+    if (!enabled) {
+      log.info('risk.goplus_skipped', { token: address, reason: 'security_filters_disabled' });
+      return;
+    }
+    const report = await this.goplus.security(address);
+    log.info('risk.goplus_result', { service: 'GoPlus', token: address, report });
     const checks: [boolean, string | undefined, string][] = [
       [filters.rejectHoneypot, report.is_honeypot, 'Honeypot'],
       [filters.rejectMintAuthority, report.is_mintable, 'Minting'],

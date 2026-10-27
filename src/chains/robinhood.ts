@@ -22,7 +22,6 @@ import {
   PendingTrade,
   ReviewRequired,
   TradeRejected,
-  parseAmount,
   type ChainSettings,
   type EvmStep,
   type Operation,
@@ -32,6 +31,10 @@ import {
   type TokenInfo,
 } from '../domain.js';
 import type { ChainAdapter } from './types.js';
+import { robinhoodGasFees } from './fees.js';
+import { logger } from '../logging/logger.js';
+
+const log = logger.child({ component: 'trading.robinhood', chain: 'robinhood' });
 
 // The router SDK's ESM build uses extensionless imports that native Node cannot resolve.
 const require = createRequire(import.meta.url);
@@ -233,6 +236,7 @@ export class RobinhoodAdapter implements ChainAdapter {
           transport: viemHttp(config.robinhoodRpc, {
             retryCount: 0,
             timeout: config.httpTimeoutMs,
+            fetchFn: (input, init) => this.http.fetch('QuickNode Robinhood RPC', input, init),
           }),
         })
       : null;
@@ -445,6 +449,8 @@ export class RobinhoodAdapter implements ChainAdapter {
     beforeSwap: () => Promise<void>,
     beforeSpend: () => void,
   ): Promise<SwapResult> {
+    if (this.config.listenOnly)
+      throw new TradeRejected('LISTEN_ONLY=true: Robinhood execution is blocked');
     this.beforeSpend = beforeSpend;
     await this.verifyNetwork();
     if (operation.kind === 'unwrap') {
@@ -728,17 +734,27 @@ export class RobinhoodAdapter implements ChainAdapter {
       const block = await this.rpc().getBlock();
       if (block.baseFeePerGas === null)
         throw new TradeRejected('Robinhood base fee is unavailable');
-      const estimated = await this.rpc().estimateFeesPerGas({ type: 'eip1559' });
-      const priority = estimated.maxPriorityFeePerGas;
-      const maxFeePerGas =
-        estimated.maxFeePerGas > block.baseFeePerGas * 2n + priority
-          ? estimated.maxFeePerGas
-          : block.baseFeePerGas * 2n + priority;
+      const automatic =
+        operation.settings.priorityFee == null
+          ? await this.rpc().estimateFeesPerGas({ type: 'eip1559' })
+          : null;
+      const { maxFeePerGas, maxPriorityFeePerGas: priority } = robinhoodGasFees(
+        block.baseFeePerGas,
+        operation.settings.priorityFee,
+        automatic,
+      );
       const gas =
         ((await this.rpc().estimateGas({ account: this.address, to, data, value })) * 120n) / 100n;
-      const budget = parseAmount(operation.settings.maxNetworkFeeNative ?? '0', 18);
-      if (this.fees(operation) + gas * maxFeePerGas > budget)
-        throw new TradeRejected('Robinhood network fees exceed the operation limit');
+      log.info('transaction.fee_selected', {
+        operationId: operation.id,
+        step: key,
+        source: operation.settings.priorityFee == null ? 'rpc_estimate' : 'user_override',
+        priorityFeeGwei: operation.settings.priorityFee ?? null,
+        maxPriorityFeePerGasWei: priority,
+        maxFeePerGasWei: maxFeePerGas,
+        gasLimit: gas,
+        maximumEstimatedFeeWei: gas * maxFeePerGas,
+      });
       if ((await this.rpc().getBalance({ address: this.address })) < value + gas * maxFeePerGas)
         throw new TradeRejected('Insufficient ETH for this transaction');
       const nonce = await this.rpc().getTransactionCount({
@@ -791,7 +807,13 @@ export class RobinhoodAdapter implements ChainAdapter {
           method: 'eth_sendRawTransaction',
           params: [step.serialized as Hex],
         });
-      } catch {
+      } catch (error) {
+        log.error('transaction.submission_uncertain', error, {
+          service: 'QuickNode Robinhood RPC',
+          operationId: operation.id,
+          hash: step.hash,
+          step: key,
+        });
         throw new PendingTrade(
           `Robinhood submission outcome is uncertain (${key}); the saved transaction will be reconciled`,
         );
@@ -805,7 +827,14 @@ export class RobinhoodAdapter implements ChainAdapter {
     let receipt: TransactionReceipt;
     try {
       receipt = await this.rpc().getTransactionReceipt({ hash });
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'TransactionReceiptNotFoundError')
+        log.info('transaction.receipt_pending', { hash, reason: 'not_yet_available' });
+      else
+        log.error('transaction.receipt_failed', error, {
+          service: 'QuickNode Robinhood RPC',
+          hash,
+        });
       throw new PendingTrade('Waiting for the swap receipt');
     }
     if (receipt.status !== 'success') throw new TradeRejected('Robinhood swap reverted');
@@ -838,6 +867,14 @@ export class RobinhoodAdapter implements ChainAdapter {
       else throw error;
     }
     const order = result.orders.find((item) => same(item.orderId, step.orderId));
+    log.info('order.status', {
+      operationId: operation.id,
+      orderId: step.orderId,
+      status: order?.orderStatus ?? 'not_found',
+      txHash: order?.txHash,
+      deadline: step.deadline,
+      submittedAt: step.submittedAt,
+    });
     if (order?.txHash) {
       step.txHash = order.txHash;
       persist();
@@ -877,6 +914,11 @@ export class RobinhoodAdapter implements ChainAdapter {
         persist();
       } catch (error) {
         if (error instanceof ReviewRequired) throw error;
+        log.error('order.submission_uncertain', error, {
+          service: 'UniswapX order submission',
+          operationId: operation.id,
+          orderId: step.orderId,
+        });
         throw new PendingTrade('UniswapX submission will be reconciled using the saved order ID');
       }
     }
