@@ -75,7 +75,9 @@ export function notificationMessage(text: string): MessageText {
     message`${icon} ${bold(heading)}`,
     ...lines.map((line) => {
       const reference = /^(Transaction|Operation):\s*(.+)$/.exec(line);
-      return reference ? message`${reference[1]!}: ${code(reference[2]!)}` : line;
+      if (reference) return message`${reference[1]!}: ${code(reference[2]!)}`;
+      const detail = /^(Reason|Sold|Remaining|Net proceeds):\s*(.+)$/.exec(line);
+      return detail ? message`${bold(`${detail[1]!}:`)} ${detail[2]!}` : line;
     }),
   ]);
 }

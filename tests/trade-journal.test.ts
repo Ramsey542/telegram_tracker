@@ -65,6 +65,7 @@ function fixture(t: TestContext) {
       return {
         tokenRaw: '1000000',
         nativeRaw: '100005000',
+        swapNativeRaw: '100000000',
         feeNativeRaw: '5000',
         signature: 'offline-receipt',
         nativeUsd: 200,
@@ -193,6 +194,10 @@ test('trade outcome measures from first local detection through submission and c
     assert.equal(outcome.executionMs, 1100);
     assert.equal(outcome.operationDurationMs, 1400);
     assert.equal(outcome.signature, 'offline-receipt');
+    assert.equal(outcome.nativeRaw, '100005000');
+    assert.equal(outcome.swapNativeRaw, '100000000');
+    assert.equal(value.store.positions('solana')[0]!.entryNativeRaw, '100005000');
+    assert.equal(value.store.positions('solana')[0]!.entrySwapNativeRaw, '100000000');
     assert.equal(
       outcome.reason,
       null,

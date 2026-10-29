@@ -16,6 +16,7 @@ import {
 } from 'viem';
 import type { Config } from '../config.js';
 import type { Wallets } from '../wallets.js';
+import { withdrawalAddress } from '../trading/withdrawal.js';
 import { HttpClient, HttpError } from '../infra/http.js';
 import { MarketData } from '../providers/market.js';
 import {
@@ -452,6 +453,32 @@ export class RobinhoodAdapter implements ChainAdapter {
       throw new TradeRejected('LISTEN_ONLY=true: Robinhood execution is blocked');
     this.beforeSpend = beforeSpend;
     await this.verifyNetwork();
+    if (operation.kind === 'withdraw') {
+      if (!operation.withdrawal) throw new TradeRejected('Withdrawal destination is missing');
+      const recipient = withdrawalAddress(
+        'robinhood',
+        operation.withdrawal.recipient,
+        this.address,
+      );
+      if (BigInt(operation.amountRaw) <= 0n)
+        throw new TradeRejected('Withdrawal amount must be greater than zero');
+      const receipt = await this.evmStep(
+        operation,
+        'withdraw',
+        recipient as Address,
+        '0x',
+        BigInt(operation.amountRaw),
+        persist,
+      );
+      operation.swapHash = receipt.transactionHash;
+      return {
+        tokenRaw: '0',
+        nativeRaw: (BigInt(operation.amountRaw) + this.fees(operation)).toString(),
+        feeNativeRaw: this.fees(operation).toString(),
+        signature: receipt.transactionHash,
+        nativeUsd: null,
+      };
+    }
     if (operation.kind === 'unwrap') {
       const receipt = await this.evmStep(
         operation,
@@ -773,6 +800,7 @@ export class RobinhoodAdapter implements ChainAdapter {
         gasPaidRaw: null,
       };
       operation.steps.push(step);
+      if (operation.kind === 'withdraw') operation.swapHash = step.hash;
       persist();
     }
     let receipt: TransactionReceipt | null = null;

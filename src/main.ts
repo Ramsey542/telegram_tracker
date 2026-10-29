@@ -6,6 +6,8 @@ import { HttpClient } from './infra/http.js';
 import { Store } from './infra/store.js';
 import { acquireProcessLock } from './infra/process-lock.js';
 import { MarketData } from './providers/market.js';
+import { NativePrices } from './providers/native-prices.js';
+import { PnlTracker } from './pnl/tracker.js';
 import { RiskFilters } from './providers/risk.js';
 import { SolanaAdapter } from './chains/solana.js';
 import { RobinhoodAdapter } from './chains/robinhood.js';
@@ -79,6 +81,7 @@ async function main(): Promise<void> {
   let reader: ChannelReader | null = null;
   let control: ControlBot | null = null;
   let engine: TradeEngine | null = null;
+  let pnl: PnlTracker | null = null;
   let closing = false;
   const shutdown = async (): Promise<void> => {
     if (closing) return;
@@ -86,6 +89,7 @@ async function main(): Promise<void> {
     log.debug('app.stopping');
     for (const [component, close] of [
       ['reader', async () => reader?.stop()],
+      ['pnl', async () => pnl?.stop()],
       ['engine', async () => engine?.stop()],
       ['control', async () => control?.stop()],
       ['store', async () => store?.close()],
@@ -133,15 +137,21 @@ async function main(): Promise<void> {
         robinhood: new RobinhoodAdapter(config, wallets, http, market),
       },
       filters,
+      () => pnl?.refreshRates(),
     );
     const activeEngine = engine;
+    pnl = new PnlTracker(config, store, engine.adapters, new NativePrices(http));
     reader = new ChannelReader(config, wallets, store, (signal) => {
       if (signal) activeEngine.observeSignal(signal);
       void activeEngine.tick().catch((error) => log.error('engine.tick_failed', error));
     });
     const activeReader = reader;
-    control = new ControlBot(config, store, engine, (messageIds) =>
-      activeReader.hydrateHistory(messageIds),
+    control = new ControlBot(
+      config,
+      store,
+      engine,
+      (messageIds) => activeReader.hydrateHistory(messageIds),
+      pnl,
     );
     log.debug('wallets.ready', {
       solana: wallets.solana.publicKey.toBase58(),
@@ -149,7 +159,10 @@ async function main(): Promise<void> {
     });
     await control.start();
     await reader.start();
-    if (!closing) engine.start();
+    if (!closing) {
+      engine.start();
+      pnl.start();
+    }
     log.debug('app.ready', {
       mode: config.listenOnly ? 'listen_only' : 'trading',
       source: config.sourceChannel,

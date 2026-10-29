@@ -1,5 +1,7 @@
 import {
   bps,
+  emptyTrail,
+  entryCostRaw,
   profitBps,
   type Position,
   type Quote,
@@ -28,6 +30,7 @@ function trailing(
   native: bigint,
   quantity: bigint,
   profit: bigint,
+  entryValue: bigint,
 ): ExitDecision | null {
   if (
     !rule.enabled ||
@@ -45,9 +48,11 @@ function trailing(
     });
     return null;
   }
-  if (!state.active && profit >= bps(rule.activationPercent)) {
+  if (!state.active && (rule.activationPercent === 0 || profit >= bps(rule.activationPercent))) {
     state.active = true;
-    state.peakNativeRaw = native.toString();
+    state.peakNativeRaw = (
+      rule.activationPercent === 0 && entryValue > native ? entryValue : native
+    ).toString();
     state.peakTokenRaw = quantity.toString();
     log.info('exit.trailing_activated', { key, profitPercent: Number(profit) / 100, rule, state });
   }
@@ -94,6 +99,57 @@ function trailing(
   return amount > 0n ? { key, amountRaw: amount.toString(), minimumNativeRaw: null } : null;
 }
 
+function trailingStages(
+  position: Position,
+  kind: 'sl' | 'tp',
+  native: bigint,
+  quantity: bigint,
+  profit: bigint,
+): ExitDecision | null {
+  const rule = kind === 'sl' ? position.exits.trailingSl : position.exits.trailingTp;
+  const entryValue = (entryCostRaw(position) * quantity) / BigInt(position.originalTokenRaw);
+  if (!rule.stages?.length)
+    return trailing(
+      rule,
+      kind === 'sl' ? position.trailingSl : position.trailingTp,
+      `trail:${kind}`,
+      native,
+      quantity,
+      profit,
+      entryValue,
+    );
+  position.trailingStages ??= {};
+  let decision: ExitDecision | null = null;
+  for (const stage of [...rule.stages].sort((a, b) => a.activationPercent - b.activationPercent)) {
+    const key = `trail:${kind}:${stage.id}`;
+    const state = (position.trailingStages[key] ??= {
+      ...emptyTrail(),
+      sold:
+        BigInt(
+          position.exitFills[key] ??
+            (stage.id === `saved-${kind}` ? position.exitFills[`trail:${kind}`] : undefined) ??
+            '0',
+        ) > 0n,
+    });
+    const candidate = trailing(
+      {
+        enabled: rule.enabled,
+        activationPercent: stage.activationPercent,
+        drawdownPercent: stage.drawdownPercent,
+        sellPercent: stage.sellPercent === 'rest' ? 100 : stage.sellPercent,
+      },
+      state,
+      key,
+      native,
+      quantity,
+      profit,
+      entryValue,
+    );
+    decision ??= candidate;
+  }
+  return decision;
+}
+
 export function evaluateExits(position: Position, quote: Quote): ExitDecision | null {
   const quantity = BigInt(position.remainingTokenRaw);
   if (
@@ -124,6 +180,7 @@ export function evaluateExits(position: Position, quote: Quote): ExitDecision | 
     profitPercent: position.lastProfitPercent,
     quote,
     entryNativeRaw: position.entryNativeRaw,
+    entrySwapNativeRaw: position.entrySwapNativeRaw,
     originalTokenRaw: position.originalTokenRaw,
     remainingTokenRaw: quantity,
     settings,
@@ -152,14 +209,8 @@ export function evaluateExits(position: Position, quote: Quote): ExitDecision | 
     profit <= -bps(settings.stopLoss.lossPercent)
   )
     return { key: 'sl', amountRaw: quantity.toString(), minimumNativeRaw: null };
-  const trailingSl = trailing(
-    settings.trailingSl,
-    position.trailingSl,
-    'trail:sl',
-    native,
-    quantity,
-    profit,
-  );
+  const trailingSl = trailingStages(position, 'sl', native, quantity, profit);
+  const trailingTp = trailingStages(position, 'tp', native, quantity, profit);
   if (trailingSl) return trailingSl;
   if (settings.takeProfitEnabled) {
     for (const tier of [...settings.takeProfits].sort(
@@ -195,7 +246,7 @@ export function evaluateExits(position: Position, quote: Quote): ExitDecision | 
           key,
           amountRaw: amount.toString(),
           minimumNativeRaw: minimum(
-            BigInt(position.entryNativeRaw),
+            entryCostRaw(position),
             amount,
             BigInt(position.originalTokenRaw),
             tier.profitPercent,
@@ -203,5 +254,5 @@ export function evaluateExits(position: Position, quote: Quote): ExitDecision | 
         };
     }
   } else log.info('exit.take_profit_check', { decision: 'wait', reason: 'disabled' });
-  return trailing(settings.trailingTp, position.trailingTp, 'trail:tp', native, quantity, profit);
+  return trailingTp;
 }

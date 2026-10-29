@@ -2,12 +2,16 @@ import { z } from 'zod';
 import bs58 from 'bs58';
 import {
   Connection,
+  ComputeBudgetProgram,
   PublicKey,
+  SystemProgram,
+  Transaction,
   VersionedTransaction,
   type VersionedTransactionResponse,
 } from '@solana/web3.js';
 import type { Config } from '../config.js';
 import type { Wallets } from '../wallets.js';
+import { withdrawalAddress } from '../trading/withdrawal.js';
 import {
   PendingTrade,
   ReviewRequired,
@@ -65,6 +69,8 @@ const executionSchema = z.object({
   signature: z.string().nullish(),
   code: z.number().int().optional(),
   error: z.string().nullish(),
+  totalInputAmount: unsignedRaw.nullish(),
+  totalOutputAmount: unsignedRaw.nullish(),
 });
 
 function priceImpact(order: z.infer<typeof orderSchema>): number | null {
@@ -207,6 +213,8 @@ export class SolanaAdapter implements ChainAdapter {
   ): Promise<SwapResult> {
     if (this.config.listenOnly)
       throw new TradeRejected('LISTEN_ONLY=true: Solana execution is blocked');
+    if (operation.kind === 'withdraw')
+      return this.advanceWithdrawal(operation, persist, beforeSpend);
     const legacy = operation.steps.find((step): step is SolanaStep => step.type === 'solana');
     if (legacy) return this.advanceLegacy(operation, legacy, persist);
     let step = operation.steps.find(
@@ -277,12 +285,21 @@ export class SolanaAdapter implements ChainAdapter {
     step.executionCode = result.code ?? null;
     step.executionError = result.error ?? null;
     step.status = result.status === 'Success' && result.code === 0 ? 'confirmed' : 'failed';
+    if (
+      step.status === 'confirmed' &&
+      (result.totalInputAmount != null || result.totalOutputAmount != null)
+    )
+      step.executionAmounts = {
+        inputRaw: result.totalInputAmount ?? '0',
+        outputRaw: result.totalOutputAmount ?? '0',
+      };
     persist();
     if (step.status === 'confirmed') {
       log.info('transaction.execute_confirmed', {
         operationId: operation.id,
         jupiterRequestId: step.requestId,
         signature: step.signature,
+        executionAmounts: step.executionAmounts,
         durationMs: Date.now() - (step.lastAttemptAt ?? step.createdAt),
       });
       if (step.signature === null)
@@ -470,7 +487,8 @@ export class SolanaAdapter implements ChainAdapter {
         commitment: 'confirmed',
         maxSupportedTransactionVersion: 0,
       });
-      if (receipt?.meta) return this.accountReceipt(operation, step.signature, receipt);
+      if (receipt?.meta)
+        return this.accountReceipt(operation, step.signature, receipt, step.executionAmounts);
       if (
         step.submittedAt !== null &&
         (Date.now() - step.submittedAt > 30_000 || step.status === 'failed')
@@ -525,6 +543,7 @@ export class SolanaAdapter implements ChainAdapter {
     operation: Operation,
     signature: string,
     receipt: VersionedTransactionResponse,
+    executionAmounts?: JupiterStep['executionAmounts'],
   ): SwapResult {
     const meta = receipt.meta!;
     if (meta.err) {
@@ -571,14 +590,156 @@ export class SolanaAdapter implements ChainAdapter {
     const nativeRaw = operation.kind === 'buy' ? -nativeDelta : nativeDelta;
     if (tokenRaw <= 0n || (operation.kind === 'buy' && nativeRaw <= 0n))
       throw new ReviewRequired('Confirmed Solana swap has unexpected balance changes');
+    let swapNativeRaw: string | undefined;
+    if (executionAmounts) {
+      const input = BigInt(executionAmounts.inputRaw);
+      const output = BigInt(executionAmounts.outputRaw);
+      if (input <= 0n || output <= 0n || tokenRaw !== (operation.kind === 'buy' ? output : input))
+        throw new ReviewRequired(
+          'Jupiter execution amounts do not match the confirmed token receipt',
+        );
+      swapNativeRaw = (operation.kind === 'buy' ? input : output).toString();
+    } else if (operation.kind === 'buy') {
+      if (BigInt(operation.amountRaw) <= 0n)
+        throw new ReviewRequired('Confirmed exact-input swap amount is unavailable');
+      swapNativeRaw = operation.amountRaw;
+    }
+    const feeNativeRaw = keys.get(0)?.toBase58() === this.address ? meta.fee.toString() : '0';
     operation.swapHash = signature;
+    log.info('transaction.accounted', {
+      operationId: operation.id,
+      kind: operation.kind,
+      signature,
+      tokenRaw: tokenRaw.toString(),
+      swapNativeRaw,
+      walletNativeRaw: nativeRaw.toString(),
+      feeNativeRaw,
+      priceSource: executionAmounts
+        ? 'jupiter_execution'
+        : operation.kind === 'buy'
+          ? 'confirmed_exact_input'
+          : 'unavailable',
+    });
     return {
       tokenRaw: tokenRaw.toString(),
       nativeRaw: nativeRaw.toString(),
-      feeNativeRaw: keys.get(0)?.toBase58() === this.address ? meta.fee.toString() : '0',
+      swapNativeRaw,
+      feeNativeRaw,
       signature,
       nativeUsd: operation.quote?.nativeUsd ?? null,
     };
+  }
+  private async advanceWithdrawal(
+    operation: Operation,
+    persist: () => void,
+    beforeSpend: () => void,
+  ): Promise<SwapResult> {
+    await this.verifyNetwork();
+    if (!operation.withdrawal) throw new TradeRejected('Withdrawal destination is missing');
+    const recipient = withdrawalAddress('solana', operation.withdrawal.recipient, this.address);
+    const amount = BigInt(operation.amountRaw);
+    if (amount <= 0n) throw new TradeRejected('Withdrawal amount must be greater than zero');
+    let step = operation.steps.find(
+      (candidate): candidate is SolanaStep =>
+        candidate.type === 'solana' && candidate.key === 'withdraw',
+    );
+    if (!step) {
+      const latest = await this.rpc().getLatestBlockhash('confirmed');
+      const transaction = new Transaction({
+        feePayer: this.wallets.solana.publicKey,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+      });
+      if (operation.settings.priorityFee != null) {
+        const units = 5_000;
+        const lamports = BigInt(solanaPriorityLamports(operation.settings.priorityFee));
+        transaction.add(
+          ComputeBudgetProgram.setComputeUnitLimit({ units }),
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: (lamports * 1_000_000n + BigInt(units) - 1n) / BigInt(units),
+          }),
+        );
+      }
+      transaction.add(
+        SystemProgram.transfer({
+          fromPubkey: this.wallets.solana.publicKey,
+          toPubkey: new PublicKey(recipient),
+          lamports: amount,
+        }),
+      );
+      const fee = (await this.rpc().getFeeForMessage(transaction.compileMessage(), 'confirmed'))
+        .value;
+      if (fee === null || !Number.isSafeInteger(fee) || fee < 0)
+        throw new TradeRejected('Solana withdrawal fee is unavailable');
+      const balance = await this.rpc().getBalance(this.wallets.solana.publicKey, 'confirmed');
+      if (!Number.isSafeInteger(balance) || BigInt(balance) < amount + BigInt(fee))
+        throw new TradeRejected('Insufficient SOL for the withdrawal and network fee');
+      beforeSpend();
+      transaction.sign(this.wallets.solana);
+      if (!transaction.signature) throw new TradeRejected('Withdrawal signature is missing');
+      step = {
+        type: 'solana',
+        key: 'withdraw',
+        signature: bs58.encode(transaction.signature),
+        serialized: transaction.serialize().toString('base64'),
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+        submittedAt: null,
+        bundleId: null,
+        jito: false,
+      };
+      operation.swapHash = step.signature;
+      operation.steps.push(step);
+      persist();
+    }
+    const receipt = await this.rpc().getTransaction(step.signature, {
+      commitment: 'confirmed',
+      maxSupportedTransactionVersion: 0,
+    });
+    if (receipt?.meta) {
+      if (receipt.meta.err) throw new TradeRejected('Solana withdrawal failed on chain');
+      return {
+        tokenRaw: '0',
+        nativeRaw: (amount + BigInt(receipt.meta.fee)).toString(),
+        feeNativeRaw: receipt.meta.fee.toString(),
+        signature: step.signature,
+        nativeUsd: null,
+      };
+    }
+    const status = (
+      await this.rpc().getSignatureStatuses([step.signature], {
+        searchTransactionHistory: true,
+      })
+    ).value[0];
+    if (status?.err) throw new TradeRejected('Solana withdrawal failed on chain');
+    if (status && step.submittedAt !== null && Date.now() - step.submittedAt > 120_000)
+      throw new ReviewRequired(
+        'Solana withdrawal signature exists but its confirmed receipt is unavailable',
+      );
+    const height = await this.rpc().getBlockHeight('confirmed');
+    if (height > step.lastValidBlockHeight + 32 && !status)
+      throw new ReviewRequired(
+        'Withdrawal expired without a confirmed receipt; inspect the saved signature before retrying',
+      );
+    if (
+      !status &&
+      height <= step.lastValidBlockHeight &&
+      (step.submittedAt === null || Date.now() - step.submittedAt > 15_000)
+    ) {
+      beforeSpend();
+      step.submittedAt = Date.now();
+      persist();
+      const signature = await this.rpc().sendRawTransaction(
+        Buffer.from(step.serialized, 'base64'),
+        {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+          maxRetries: 0,
+        },
+      );
+      if (signature !== step.signature)
+        throw new ReviewRequired('RPC returned an unexpected withdrawal signature');
+    }
+    throw new PendingTrade('Waiting for Solana withdrawal confirmation');
   }
   private async advanceLegacy(
     operation: Operation,

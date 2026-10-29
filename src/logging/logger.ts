@@ -71,6 +71,14 @@ export class Logger {
     const trade = tradeEvents.has(event);
     if (!diagnostic && !trade) return;
     const merged = { ...this.fields, ...context.getStore(), ...fields };
+    const component = String(merged.component ?? 'app');
+    const tracking =
+      event.startsWith('position.') ||
+      event === 'positions.poll' ||
+      event.startsWith('exit.') ||
+      (typeof merged.positionId === 'string' &&
+        (component.startsWith('trading.') ||
+          (component.startsWith('api.') && !component.startsWith('api.telegram'))));
     const record = redact({
       ...merged,
       timestamp: new Date().toISOString(),
@@ -84,8 +92,8 @@ export class Logger {
       if (trade) append('trades', line);
       if (diagnostic) {
         append('app', line);
+        if (tracking) append('tracking', line);
         if (level === 'warn' || level === 'error') append('errors', line);
-        const component = String(merged.component ?? 'app');
         if (component.startsWith('api')) append('api', line);
         if (component.startsWith('telegram')) append('telegram', line);
       }

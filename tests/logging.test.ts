@@ -184,6 +184,91 @@ test('diagnostic severity does not hide signal and outcome records from the trad
   }
 });
 
+test('tracking logs retain position checks, sell progress and correlated provider failures without Telegram noise', async () => {
+  const logs = capture('info');
+  try {
+    await withLogContext(
+      { chain: 'solana', positionId: 'position-1', token: 'mint-1' },
+      async () => {
+        await Promise.resolve();
+        logger.child({ component: 'trading.engine' }).info('position.quote_received', {
+          quote: { inputRaw: '100', outputRaw: '170', nativeUsd: null },
+        });
+        logger.child({ component: 'trading.exits' }).info('exit.take_profit_check', {
+          profitPercent: 70,
+          decision: 'sell',
+          reason: 'threshold_met',
+        });
+        logger.child({ component: 'api.http', service: 'Jupiter quote' }).error(
+          'api.http_failed',
+          new ApiError('HTTP 401 unauthorized', {
+            status: 401,
+            code: 'INVALID_KEY',
+            endpoint: 'https://example.invalid/quote?api_key=tracking-test-credential',
+          }),
+          { requestId: 'request-1' },
+        );
+        logger.child({ component: 'trading.engine' }).info('operation.pending', {
+          operationId: 'operation-1',
+        });
+        logger.child({ component: 'trading.journal' }).info('trade.confirmed', {
+          operationId: 'operation-1',
+          kind: 'sell',
+        });
+        logger.child({ component: 'api.telegram' }).warn('api.telegram_failed');
+        logger.child({ component: 'telegram.control' }).warn('control.polling_unavailable');
+      },
+    );
+    logger.child({ component: 'trading.signals' }).info('signal.detected');
+    logger.child({ component: 'api.http' }).warn('api.retry_scheduled');
+    const tracking = logs.read('tracking');
+    const records = tracking
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.deepEqual(
+      records.map((record) => record.event),
+      [
+        'position.quote_received',
+        'exit.take_profit_check',
+        'api.http_failed',
+        'operation.pending',
+        'trade.confirmed',
+      ],
+    );
+    for (const record of records) {
+      assert.equal(record.chain, 'solana');
+      assert.equal(record.positionId, 'position-1');
+      assert.equal(record.token, 'mint-1');
+      assert.equal(typeof record.timestamp, 'string');
+      assert.equal(typeof record.runId, 'string');
+    }
+    assert.match(tracking, /INVALID_KEY/);
+    assert.match(tracking, /request-1/);
+    assert.doesNotMatch(tracking, /tracking-test-credential/);
+    assert.doesNotMatch(logs.read('trades'), /exit.take_profit_check|api.http_failed/);
+  } finally {
+    logs.close();
+  }
+});
+
+test('tracking files follow the configured diagnostic severity', () => {
+  const logs = capture('warn');
+  try {
+    logger.child({ component: 'trading.exits' }).info('exit.evaluating');
+    logger.child({ component: 'trading.engine' }).debug('positions.poll');
+    assert.equal(logs.read('tracking'), '');
+    logger.child({ component: 'trading.exits' }).warn('exit.quote_rejected', {
+      positionId: 'position-1',
+      reason: 'stale_quote',
+    });
+    assert.match(logs.read('tracking'), /exit.quote_rejected/);
+    assert.doesNotMatch(logs.read('tracking'), /exit.evaluating|positions.poll/);
+  } finally {
+    logs.close();
+  }
+});
+
 test('rotation retains the configured backup count', () => {
   const logs = capture();
   const restore = configureLogging({
@@ -194,11 +279,13 @@ test('rotation retains the configured backup count', () => {
     maxFiles: 2,
   });
   try {
-    for (let index = 0; index < 5; index++) logger.info('rotation.test', { index });
-    assert.equal(existsSync(join(logs.directory, 'app.jsonl.1')), true);
-    assert.equal(existsSync(join(logs.directory, 'app.jsonl.2')), true);
-    assert.equal(existsSync(join(logs.directory, 'app.jsonl.3')), false);
-    assert.match(logs.read('app'), /"index":4/);
+    for (let index = 0; index < 5; index++) logger.info('position.waiting', { index });
+    for (const name of ['app', 'tracking']) {
+      assert.equal(existsSync(join(logs.directory, `${name}.jsonl.1`)), true);
+      assert.equal(existsSync(join(logs.directory, `${name}.jsonl.2`)), true);
+      assert.equal(existsSync(join(logs.directory, `${name}.jsonl.3`)), false);
+      assert.match(logs.read(name), /"index":4/);
+    }
   } finally {
     restore();
     logs.close();

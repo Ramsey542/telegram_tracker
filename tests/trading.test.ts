@@ -42,6 +42,7 @@ function position(): Position {
     originalTokenRaw: '1000000000',
     remainingTokenRaw: '1000000000',
     entryNativeRaw: '1000000000',
+    entrySwapNativeRaw: '1000000000',
     entryFeeNativeRaw: '5000',
     entryUsd: null,
     realizedNativeRaw: '0',
@@ -135,13 +136,182 @@ test('TP percentages use the original entry and never repeat a completed tier', 
     '100000000',
   );
 });
-test('confirmed entry fees are included when assessing the take profit trigger', () => {
+test('Solana take profit and its minimum output use swap cost instead of wallet spending', () => {
   const value = position();
   value.exits.takeProfitEnabled = true;
   value.exits.takeProfits = [{ id: 'first', profitPercent: 50, sellPercent: 90 }];
+  value.entryNativeRaw = '2521044000';
+  value.entryFeeNativeRaw = '7204000';
+  const decision = evaluateExits(value, quote('1500000000'));
+  assert.equal(decision?.amountRaw, '900000000');
+  assert.equal(decision?.minimumNativeRaw, '1350000000');
+  assert.equal(value.lastProfitPercent, 50);
+});
+
+for (const [name, walletRaw, tokensRaw, outputRaw, gain] of [
+  ['Mars', '2521044', '3739460179', '1047591', 4.75],
+  ['discat', '2525810', '138369725', '993031', -0.69],
+] as const) {
+  test(`${name} does not hit the price stop loss because of account funding`, () => {
+    const value = position();
+    value.entryNativeRaw = walletRaw;
+    value.entrySwapNativeRaw = '1000000';
+    value.originalTokenRaw = tokensRaw;
+    value.remainingTokenRaw = tokensRaw;
+    value.exits.stopLoss = { enabled: true, lossPercent: 30 };
+    value.exits.takeProfitEnabled = true;
+    value.exits.takeProfits = [{ id: 'first', profitPercent: 30, sellPercent: 'rest' }];
+    assert.equal(evaluateExits(value, quote(outputRaw, tokensRaw)), null);
+    assert.equal(value.lastProfitPercent, gain);
+  });
+}
+
+test('Robinhood entry-cost accounting is unchanged', () => {
+  const value = position();
+  value.chain = 'robinhood';
   value.entryNativeRaw = '1010000000';
+  value.exits.takeProfitEnabled = true;
+  value.exits.takeProfits = [{ id: 'first', profitPercent: 50, sellPercent: 90 }];
   assert.equal(evaluateExits(value, quote('1500000000')), null);
 });
+
+test('automatic Solana exits wait when the confirmed swap entry cost is unavailable', () => {
+  const value = position();
+  delete value.entrySwapNativeRaw;
+  value.exits.stopLoss = { enabled: true, lossPercent: 30 };
+  assert.throws(() => evaluateExits(value, quote('1000000000')), /swap entry cost is unavailable/);
+});
+
+test('trailing activation zero uses the swap entry price when wallet spending is higher', () => {
+  const value = position();
+  value.entryNativeRaw = '2521044000';
+  value.exits.trailingSl = {
+    enabled: true,
+    activationPercent: 0,
+    drawdownPercent: 20,
+    sellPercent: 100,
+  };
+  assert.equal(evaluateExits(value, quote('1000000000')), null);
+  assert.equal(value.trailingSl.peakNativeRaw, '1000000000');
+  assert.equal(evaluateExits(value, quote('800000000'))?.key, 'trail:sl');
+});
+for (const savedExecution of [false, true]) {
+  test(`old open Solana positions recover swap cost once with saved execution ${savedExecution}`, () => {
+    const directory = mkdtempSync(join(tmpdir(), 'telegram-entry-cost-'));
+    let store: Store | null = null;
+    try {
+      store = new Store(directory);
+      const value = position();
+      delete value.entrySwapNativeRaw;
+      value.entryNativeRaw = '2521044';
+      value.entryFeeNativeRaw = '7204';
+      value.originalTokenRaw = '3739460179';
+      value.remainingTokenRaw = '3739460179';
+      value.lastProfitPercent = -58.44;
+      value.trailingSl = {
+        active: true,
+        peakNativeRaw: '2521044',
+        peakTokenRaw: '3739460179',
+        sold: false,
+      };
+      value.trailingStages = {
+        'trail:tp:completed': {
+          active: true,
+          peakNativeRaw: '3000000',
+          peakTokenRaw: '3739460179',
+          sold: true,
+        },
+      };
+      value.exitFills['tp:completed'] = '10';
+      const buy: Operation = {
+        id: 'confirmed-buy',
+        chain: 'solana',
+        address: value.address,
+        kind: 'buy',
+        status: 'confirmed',
+        positionId: null,
+        signal: null,
+        exitKey: null,
+        amountRaw: savedExecution ? '1100000' : '1000000',
+        token: {
+          chain: 'solana',
+          address: value.address,
+          symbol: value.symbol,
+          decimals: 6,
+          marketCapUsd: null,
+          liquidityUsd: null,
+          usdPrice: null,
+          fetchedAt: Date.now(),
+        },
+        settings: chainSettingsSchema.parse({}),
+        steps: savedExecution
+          ? [
+              {
+                type: 'jupiter',
+                key: 'swap',
+                requestId: 'saved-order',
+                router: 'metis',
+                serialized: 'saved-transaction',
+                signature: 'confirmed-signature',
+                lastValidBlockHeight: null,
+                expiresAt: null,
+                createdAt: value.openedAt,
+                submittedAt: value.openedAt,
+                lastAttemptAt: value.openedAt,
+                status: 'confirmed',
+                executionCode: 0,
+                executionError: null,
+                executionAmounts: { inputRaw: '1000000', outputRaw: value.originalTokenRaw },
+              },
+            ]
+          : [],
+        quote: null,
+        swapHash: 'confirmed-signature',
+        outputRaw: null,
+        minimumNativeRaw: null,
+        createdAt: value.openedAt,
+        error: null,
+      };
+      store.saveOperation(buy);
+      store.savePosition(value);
+      store.savePosition({ ...value, id: 'closed-position', closedAt: Date.now() });
+      store.savePosition({ ...value, id: 'orphan-position', address: 'missing-confirmed-buy' });
+      store.close();
+      store = new Store(directory);
+      const restored = store.position(value.id)!;
+      assert.equal(restored.entrySwapNativeRaw, '1000000');
+      assert.equal(restored.entryNativeRaw, '2521044');
+      assert.equal(restored.entryFeeNativeRaw, '7204');
+      assert.equal(restored.lastProfitPercent, null);
+      assert.equal(restored.trailingSl.active, false);
+      assert.equal(restored.trailingStages?.['trail:tp:completed']?.sold, true);
+      assert.deepEqual(restored.exitFills, value.exitFills);
+      restored.exits.stopLoss = { enabled: true, lossPercent: 30 };
+      assert.equal(evaluateExits(restored, quote('1047591', restored.remainingTokenRaw)), null);
+      assert.equal(restored.lastProfitPercent, 4.75);
+      assert.equal(store.position('closed-position')!.entrySwapNativeRaw, undefined);
+      assert.throws(
+        () =>
+          evaluateExits(
+            store!.position('orphan-position')!,
+            quote('1047591', value.remainingTokenRaw),
+          ),
+        /swap entry cost is unavailable/,
+      );
+      restored.trailingSl.active = true;
+      restored.trailingSl.peakNativeRaw = '1047591';
+      store.savePosition(restored);
+      store.close();
+      store = new Store(directory);
+      assert.equal(store.position(value.id)!.trailingSl.active, true);
+      assert.equal(store.position(value.id)!.trailingSl.peakNativeRaw, '1047591');
+    } finally {
+      store?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
 test('SL takes precedence and sells the whole remaining position', () => {
   const value = position();
   value.remainingTokenRaw = '100000000';
@@ -170,6 +340,112 @@ test('slippage bounds do not create an artificial stop loss', () => {
   const current = quote('1000000000');
   current.minOutputRaw = '500000000';
   assert.equal(evaluateExits(value, current), null);
+});
+
+test('trailing activation zero protects against a decline before the first position poll', () => {
+  const value = position();
+  value.exits.trailingSl.enabled = true;
+  value.exits.trailingSl.stages = [
+    { id: 'initial', activationPercent: 0, drawdownPercent: 20, sellPercent: 'rest' },
+  ];
+  const decision = evaluateExits(value, quote('790000000'));
+  assert.equal(decision?.key, 'trail:sl:initial');
+  assert.equal(decision?.amountRaw, value.remainingTokenRaw);
+});
+
+test('all trailing stages track their peaks before a sale and normalize for remaining holdings', () => {
+  const value = position();
+  value.exits.trailingTp.enabled = true;
+  value.exits.trailingTp.stages = [
+    { id: 'first', activationPercent: 50, drawdownPercent: 20, sellPercent: 90 },
+    { id: 'moon', activationPercent: 1000, drawdownPercent: 10, sellPercent: 'rest' },
+  ];
+  assert.equal(evaluateExits(value, quote('12000000000')), null);
+  const first = evaluateExits(value, quote('9000000000'));
+  assert.equal(first?.key, 'trail:tp:first');
+  assert.equal(first?.amountRaw, '900000000');
+  assert.equal(value.trailingStages?.['trail:tp:moon']?.peakNativeRaw, '12000000000');
+  value.remainingTokenRaw = '100000000';
+  value.trailingStages!['trail:tp:first']!.sold = true;
+  const restored = JSON.parse(JSON.stringify(value)) as Position;
+  const remaining = evaluateExits(restored, quote('900000000', restored.remainingTokenRaw));
+  assert.equal(remaining?.key, 'trail:tp:moon');
+  assert.equal(remaining?.amountRaw, '100000000');
+});
+
+test('a confirmed trailing stage completion survives a database restart without completing other stages', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'telegram-trailing-stage-'));
+  let store: Store | null = null;
+  try {
+    store = new Store(directory);
+    const value = position();
+    value.exits.trailingTp.enabled = true;
+    value.exits.trailingTp.stages = [
+      { id: 'first', activationPercent: 50, drawdownPercent: 20, sellPercent: 90 },
+      { id: 'moon', activationPercent: 1000, drawdownPercent: 10, sellPercent: 'rest' },
+    ];
+    evaluateExits(value, quote('2000000000'));
+    const decision = evaluateExits(value, quote('1590000000'))!;
+    store.savePosition(value);
+    const operation: Operation = {
+      id: 'staged-sale',
+      chain: 'solana',
+      address: value.address,
+      kind: 'sell',
+      status: 'active',
+      positionId: value.id,
+      signal: null,
+      exitKey: decision.key,
+      amountRaw: decision.amountRaw,
+      token: {
+        chain: 'solana',
+        address: value.address,
+        symbol: 'TEST',
+        decimals: 6,
+        marketCapUsd: null,
+        liquidityUsd: null,
+        usdPrice: null,
+        fetchedAt: Date.now(),
+      },
+      settings: chainSettingsSchema.parse({}),
+      steps: [],
+      quote: null,
+      swapHash: 'offline-signature',
+      outputRaw: null,
+      minimumNativeRaw: null,
+      createdAt: Date.now(),
+      error: null,
+    };
+    assert.equal(store.claim(operation), true);
+    store.completeSell(operation, value, {
+      tokenRaw: '900000000',
+      nativeRaw: '1431000000',
+      feeNativeRaw: '5000',
+      signature: 'offline-signature',
+      nativeUsd: null,
+    });
+    store.close();
+    store = new Store(directory);
+    const restored = store.position(value.id)!;
+    assert.equal(restored.trailingStages?.['trail:tp:first']?.sold, true);
+    assert.equal(restored.trailingStages?.['trail:tp:moon']?.sold, false);
+    assert.equal(evaluateExits(restored, quote('159000000', restored.remainingTokenRaw)), null);
+  } finally {
+    store?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('converted saved trailing rules retain their previous completed sale', () => {
+  const value = position();
+  value.remainingTokenRaw = '100000000';
+  value.exitFills['trail:tp'] = '900000000';
+  value.exits.trailingTp.enabled = true;
+  value.exits.trailingTp.stages = [
+    { id: 'saved-tp', activationPercent: 0, drawdownPercent: 20, sellPercent: 90 },
+  ];
+  assert.equal(evaluateExits(value, quote('50000000', value.remainingTokenRaw)), null);
+  assert.equal(value.trailingStages?.['trail:tp:saved-tp']?.sold, true);
 });
 test('take profit follows the quoted gain rather than the worst slippage outcome', () => {
   const value = position();

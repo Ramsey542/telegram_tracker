@@ -3,9 +3,16 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { logger } from '../logging/logger.js';
 import { logSignalDetected, logSignalSkipped, logTradeOutcome } from '../logging/trades.js';
+import { pnlFill, USD_CAPTURE_WINDOW_MS } from '../pnl/accounting.js';
+import type { PnlFill, PnlMark } from '../pnl/types.js';
+import { exitReasonLabel } from '../trading/exit-reason.js';
 import {
   chainSettingsSchema,
   settingsSchema,
+  emptyTrail,
+  formatAmount,
+  nativeDecimals,
+  nativeSymbol,
   normalizeAddress,
   type CallSignal,
   type CallObservation,
@@ -31,7 +38,7 @@ export class Store {
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 2)
+    if (Number(version?.user_version ?? 0) > 4)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -48,6 +55,10 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations (chain) WHERE status IN ('active', 'review');
       CREATE TABLE IF NOT EXISTS token_entries (chain TEXT NOT NULL, address TEXT NOT NULL, operation_id TEXT NOT NULL, bought INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chain, address));
       CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE NOT NULL, text TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS notification_deliveries (notification_id INTEGER NOT NULL REFERENCES notifications(id), recipient_id INTEGER NOT NULL, PRIMARY KEY (notification_id, recipient_id));
+      CREATE TABLE IF NOT EXISTS pnl_fills (operation_id TEXT PRIMARY KEY, position_id TEXT NOT NULL, chain TEXT NOT NULL, confirmed_at INTEGER NOT NULL, payload TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS pnl_fills_by_time ON pnl_fills (confirmed_at, chain);
+      CREATE INDEX IF NOT EXISTS pnl_fills_by_position ON pnl_fills (position_id, confirmed_at);
     `);
     this.transaction(() => {
       const columns = this.db.prepare('PRAGMA table_info(signals)').all();
@@ -58,10 +69,87 @@ export class Store {
       this.db.exec(
         "CREATE INDEX IF NOT EXISTS operations_by_signal ON operations (json_extract(payload, '$.signal.id'), created_at DESC)",
       );
-      this.db.exec('PRAGMA user_version = 2');
+      this.restoreSolanaEntryPrices();
+      this.restorePnlFills();
+      this.db.exec('PRAGMA user_version = 4');
     });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));
+  }
+  private restorePnlFills(): void {
+    const rows = this.db
+      .prepare(
+        "SELECT operations.payload FROM operations LEFT JOIN pnl_fills ON pnl_fills.operation_id = operations.id WHERE operations.status = 'confirmed' AND json_extract(operations.payload, '$.kind') IN ('buy', 'sell') AND pnl_fills.operation_id IS NULL ORDER BY operations.created_at",
+      )
+      .all();
+    for (const row of rows) {
+      const operation = decodeOperation(row)!;
+      const position =
+        operation.kind === 'sell'
+          ? operation.positionId
+            ? this.position(operation.positionId)
+            : null
+          : decode<Position>(
+              this.db
+                .prepare('SELECT payload FROM positions WHERE chain = ? AND address = ? LIMIT 1')
+                .get(operation.chain, operation.address),
+            );
+      if (!position) continue;
+      this.savePnlFill(
+        pnlFill(
+          operation,
+          position,
+          null,
+          operation.kind === 'buy' ? position.openedAt : operation.createdAt,
+          true,
+        ),
+      );
+    }
+  }
+  private restoreSolanaEntryPrices(): void {
+    const rows = this.db
+      .prepare("SELECT payload FROM positions WHERE chain = 'solana' AND closed = 0")
+      .all();
+    for (const row of rows) {
+      const position = decode<Position>(row)!;
+      if (position.entrySwapNativeRaw !== undefined) continue;
+      const operation = decodeOperation(
+        this.db
+          .prepare(
+            "SELECT payload FROM operations WHERE chain = 'solana' AND address = ? AND status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy' ORDER BY created_at DESC LIMIT 1",
+          )
+          .get(position.address),
+      );
+      const step = operation?.steps.find((candidate) => candidate.type === 'jupiter');
+      const amount = step?.executionAmounts?.inputRaw ?? operation?.amountRaw;
+      const log = logger.child({
+        component: 'trading.positions',
+        chain: 'solana',
+        positionId: position.id,
+        token: position.address,
+      });
+      if (!amount || !/^\d+$/.test(amount) || BigInt(amount) <= 0n) {
+        log.warn('position.entry_price_unavailable', {
+          reason: 'confirmed_buy_amount_missing',
+        });
+        continue;
+      }
+      position.entrySwapNativeRaw = amount;
+      position.lastProfitPercent = null;
+      if (amount !== position.entryNativeRaw) {
+        position.trailingSl = { ...emptyTrail(), sold: position.trailingSl.sold };
+        position.trailingTp = { ...emptyTrail(), sold: position.trailingTp.sold };
+        for (const [key, state] of Object.entries(position.trailingStages ?? {}))
+          position.trailingStages![key] = { ...emptyTrail(), sold: state.sold };
+      }
+      this.savePosition(position);
+      log.info('position.entry_price_restored', {
+        operationId: operation?.id,
+        entryNativeRaw: position.entryNativeRaw,
+        entrySwapNativeRaw: amount,
+        source: step?.executionAmounts ? 'jupiter_execution' : 'confirmed_exact_input',
+      });
+    }
   }
   transaction<T>(action: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -256,6 +344,8 @@ export class Store {
       signalId: operation.signal?.id,
       amountRaw: operation.amountRaw,
       exitKey: operation.exitKey,
+      exitDescription: operation.exitDescription,
+      withdrawal: operation.withdrawal,
       swapHash: operation.swapHash,
       quote: operation.quote,
       reason: operation.error,
@@ -271,6 +361,7 @@ export class Store {
             status: step.status,
             executionCode: step.executionCode,
             executionError: step.executionError,
+            executionAmounts: step.executionAmounts,
           };
         if (step.type === 'solana')
           return {
@@ -319,11 +410,12 @@ export class Store {
       return true;
     });
   }
-  completeBuy(operation: Operation, position: Position): void {
+  completeBuy(operation: Operation, position: Position, result: SwapResult): void {
     this.transaction(() => {
       operation.status = 'confirmed';
       this.saveOperation(operation);
       this.savePosition(position);
+      this.savePnlFill(pnlFill(operation, position, result, position.openedAt));
       this.db
         .prepare(
           'UPDATE token_entries SET bought = 1 WHERE chain = ? AND address = ? AND operation_id = ?',
@@ -338,6 +430,7 @@ export class Store {
       positionId: position.id,
       tokenRaw: position.originalTokenRaw,
       nativeRaw: position.entryNativeRaw,
+      swapNativeRaw: position.entrySwapNativeRaw,
       feeNativeRaw: position.entryFeeNativeRaw,
     });
   }
@@ -359,20 +452,49 @@ export class Store {
           BigInt(position.exitFills[operation.exitKey] ?? '0') + sold
         ).toString();
       if (operation.exitKey?.startsWith('trail:')) {
-        const state = operation.exitKey === 'trail:sl' ? position.trailingSl : position.trailingTp;
-        if (sold >= BigInt(operation.amountRaw)) state.sold = true;
+        const parts = operation.exitKey.split(':');
+        const state =
+          parts.length > 2
+            ? position.trailingStages?.[operation.exitKey]
+            : operation.exitKey === 'trail:sl'
+              ? position.trailingSl
+              : position.trailingTp;
+        if (state && sold >= BigInt(operation.amountRaw)) state.sold = true;
       }
       if (BigInt(position.remainingTokenRaw) === 0n) position.closedAt = Date.now();
+      this.db.prepare('DELETE FROM metadata WHERE key = ?').run(`pnl:mark:${position.id}`);
       position.lastError = null;
+      operation.swapHash = result.signature.trim() || operation.swapHash;
       operation.status = 'confirmed';
       this.savePosition(position);
       this.saveOperation(operation);
+      this.savePnlFill(pnlFill(operation, position, result, Date.now()));
       this.notify(
         `trade:${operation.id}`,
-        `Sold ${position.symbol} on ${position.chain}.\nReason: ${operation.exitKey ?? 'manual'}\nTransaction: ${result.signature}`,
+        [
+          `Sold ${position.symbol.replace(/[\x00-\x1f]/g, ' ').slice(0, 60)} on ${position.chain === 'solana' ? 'Solana' : 'Robinhood'}.`,
+          `Reason: ${operation.exitDescription ?? exitReasonLabel(operation.exitKey, position.exits)}`,
+          `Sold: ${formatAmount(result.tokenRaw, position.decimals)} tokens`,
+          `Remaining: ${formatAmount(position.remainingTokenRaw, position.decimals)} tokens`,
+          `Net proceeds: ${formatAmount(result.nativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}`,
+          ...(operation.swapHash ? [`Transaction: ${operation.swapHash}`] : []),
+        ].join('\n'),
       );
     });
     logTradeOutcome(operation, { ...result, positionId: position.id, exitKey: operation.exitKey });
+  }
+  completeWithdrawal(operation: Operation, result: SwapResult): void {
+    if (operation.kind !== 'withdraw' || !operation.withdrawal || !result.signature.trim())
+      throw new Error('Confirmed withdrawal details are missing');
+    this.transaction(() => {
+      operation.status = 'confirmed';
+      operation.swapHash = result.signature;
+      this.saveOperation(operation);
+      this.notify(
+        `withdraw:${operation.id}`,
+        `Withdrawal confirmed on ${operation.chain === 'solana' ? 'Solana' : 'Robinhood'}.\nAmount: ${formatAmount(operation.amountRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}\nDestination: ${operation.withdrawal!.recipient}\nNetwork fee: ${formatAmount(result.feeNativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}\nTransaction: ${result.signature}`,
+      );
+    });
   }
   failOperation(operation: Operation, reason: string, review: boolean): void {
     this.transaction(() => {
@@ -424,19 +546,116 @@ export class Store {
       .map((row) => decodeOperation(row)!)
       .filter(Boolean);
   }
+  private savePnlFill(fill: PnlFill): void {
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO pnl_fills (operation_id,position_id,chain,confirmed_at,payload) VALUES (?,?,?,?,?)',
+      )
+      .run(fill.operationId, fill.positionId, fill.chain, fill.confirmedAt, JSON.stringify(fill));
+  }
+  pnlFills(): PnlFill[] {
+    return this.db
+      .prepare('SELECT payload FROM pnl_fills ORDER BY confirmed_at, operation_id')
+      .all()
+      .map((row) => decode<PnlFill>(row)!);
+  }
+  positionEntryFill(positionId: string): PnlFill | null {
+    return decode<PnlFill>(
+      this.db
+        .prepare(
+          "SELECT payload FROM pnl_fills WHERE position_id = ? AND json_extract(payload, '$.kind') = 'buy' ORDER BY confirmed_at LIMIT 1",
+        )
+        .get(positionId),
+    );
+  }
+  pnlPendingRates(now = Date.now()): PnlFill[] {
+    return this.db
+      .prepare(
+        "SELECT payload FROM pnl_fills WHERE confirmed_at >= ? AND confirmed_at <= ? AND json_extract(payload, '$.nativeUsd') IS NULL AND json_extract(payload, '$.legacy') = 0 ORDER BY confirmed_at",
+      )
+      .all(now - USD_CAPTURE_WINDOW_MS, now)
+      .map((row) => decode<PnlFill>(row)!);
+  }
+  pricePnlFill(operationId: string, nativeUsd: number, observedAt: number): void {
+    const row = this.db
+      .prepare('SELECT payload FROM pnl_fills WHERE operation_id = ?')
+      .get(operationId);
+    const fill = decode<PnlFill>(row);
+    if (!fill || fill.nativeUsd !== null) return;
+    if (
+      !Number.isFinite(nativeUsd) ||
+      nativeUsd <= 0 ||
+      Math.abs(observedAt - fill.confirmedAt) > USD_CAPTURE_WINDOW_MS
+    )
+      throw new Error('USD price is unavailable near the fill time');
+    fill.nativeUsd = nativeUsd;
+    fill.usdSource = 'coinbase_spot';
+    fill.usdAt = observedAt;
+    this.db
+      .prepare('UPDATE pnl_fills SET payload = ? WHERE operation_id = ?')
+      .run(JSON.stringify(fill), operationId);
+  }
+  savePnlMark(mark: PnlMark): void {
+    this.setMetadata(`pnl:mark:${mark.positionId}`, JSON.stringify(mark));
+  }
+  pnlMarks(): PnlMark[] {
+    return this.db
+      .prepare("SELECT value FROM metadata WHERE key LIKE 'pnl:mark:%'")
+      .all()
+      .map((row) => decode<PnlMark>(row, 'value')!);
+  }
   notify(eventKey: string, text: string): void {
     this.db
       .prepare('INSERT OR IGNORE INTO notifications (event_key,text) VALUES (?,?)')
       .run(eventKey, text);
   }
-  notifications(): { id: number; text: string }[] {
+  notifications(
+    recipientId?: number,
+  ): { id: number; text: string; solanaSignature: string | null }[] {
     return this.db
-      .prepare('SELECT id,text FROM notifications WHERE delivered = 0 ORDER BY id LIMIT 3')
-      .all()
-      .map((row) => ({ id: Number(row.id), text: String(row.text) }));
+      .prepare(
+        'SELECT id,event_key,text FROM notifications WHERE delivered = 0 AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM notification_deliveries WHERE notification_id = notifications.id AND recipient_id = ?)) ORDER BY id LIMIT 3',
+      )
+      .all(recipientId ?? null, recipientId ?? null)
+      .map((row) => {
+        const operationId = /^(?:trade|fill|proceeds|withdraw):([^:]+)$/.exec(
+          String(row.event_key),
+        )?.[1];
+        const operation = operationId
+          ? this.db
+              .prepare(
+                "SELECT chain,json_extract(payload, '$.swapHash') AS signature FROM operations WHERE id = ? AND status = 'confirmed'",
+              )
+              .get(operationId)
+          : undefined;
+        const solanaSignature =
+          operation?.chain === 'solana' &&
+          typeof operation.signature === 'string' &&
+          operation.signature.length > 0
+            ? operation.signature
+            : null;
+        return { id: Number(row.id), text: String(row.text), solanaSignature };
+      });
   }
-  delivered(id: number): void {
-    this.db.prepare('UPDATE notifications SET delivered = 1 WHERE id = ?').run(id);
+  delivered(id: number, recipientId: number, recipients: readonly number[]): void {
+    this.transaction(() => {
+      this.db
+        .prepare(
+          'INSERT OR IGNORE INTO notification_deliveries (notification_id,recipient_id) VALUES (?,?)',
+        )
+        .run(id, recipientId);
+      if (
+        recipients.length > 0 &&
+        recipients.every((recipient) =>
+          this.db
+            .prepare(
+              'SELECT 1 FROM notification_deliveries WHERE notification_id = ? AND recipient_id = ?',
+            )
+            .get(id, recipient),
+        )
+      )
+        this.db.prepare('UPDATE notifications SET delivered = 1 WHERE id = ?').run(id);
+    });
   }
   close(): void {
     this.db.close();

@@ -5,12 +5,8 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { Api, TelegramClient, utils, Logger as TelegramLogger } from 'teleproto';
 import { StringSession } from 'teleproto/sessions';
-import {
-  NewMessage,
-  EditedMessage,
-  type NewMessageEvent,
-  type EditedMessageEvent,
-} from 'teleproto/events';
+import { type NewMessageEvent, type EditedMessageEvent } from 'teleproto/events';
+import { channelEvents } from './channel-events.js';
 import type { Config } from '../config.js';
 import { chains, type ChannelPost, type CallSignal } from '../domain.js';
 import type { Wallets } from '../wallets.js';
@@ -152,8 +148,7 @@ export class ChannelReader {
         }
       }
     };
-    client.addEventHandler(ingest, new NewMessage({ chats: [entity] }));
-    client.addEventHandler(ingest, new EditedMessage({ chats: [entity] }));
+    for (const event of channelEvents(channelId)) client.addEventHandler(ingest, event);
     const cursorKey = `cursor:${channelId}`;
     if (this.store.metadata(cursorKey) === null) {
       const messages = await this.request('getMessages', () =>

@@ -172,6 +172,9 @@ function harness(t: TestContext) {
           status: 'Success',
           code: 0,
           signature: sponsored ? makerSignature : signature,
+          totalInputAmount: orders.at(-1)!.searchParams.get('amount'),
+          totalOutputAmount:
+            orders.at(-1)!.searchParams.get('inputMint') === SOL_MINT ? '1000000' : '100000000',
           ...executionOverride,
         });
       }
@@ -248,6 +251,7 @@ for (const kind of ['buy', 'sell'] as const) {
     assert.equal(result.signature, signature);
     assert.equal(result.tokenRaw, '1000000');
     assert.equal(result.nativeRaw, kind === 'buy' ? '100005000' : '99995000');
+    assert.equal(result.swapNativeRaw, '100000000');
     assert.equal(trade.token.decimals, 6);
     assert.deepEqual(value.events, ['order', 'execute', 'getGenesisHash', 'getTransaction']);
     assert.equal(value.orders[0]!.searchParams.get('taker'), owner.toBase58());
@@ -257,6 +261,73 @@ for (const kind of ['buy', 'sell'] as const) {
     assert.equal((trade.steps[0] as JupiterStep).status, 'confirmed');
   });
 }
+test('confirmed fill amounts exclude wallet overhead and replace the estimated token quantity', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  trade.amountRaw = '1000000';
+  value.setOrder({ outAmount: '3739457655', otherAmountThreshold: '3720760366' });
+  value.setExecution({ totalInputAmount: '1000000', totalOutputAmount: '3739460179' });
+  const actual = receipt();
+  actual.meta!.fee = 7204;
+  actual.meta!.postBalances[0] = 997478956;
+  actual.meta!.postTokenBalances![0]!.uiTokenAmount.amount = '3739460179';
+  value.setReceipt(actual);
+  const result = await advance(value, trade);
+  assert.equal(result.swapNativeRaw, '1000000');
+  assert.equal(result.nativeRaw, '2521044');
+  assert.equal(result.feeNativeRaw, '7204');
+  assert.equal(result.tokenRaw, '3739460179');
+  assert.deepEqual((value.snapshots.at(-1)!.steps[0] as JupiterStep).executionAmounts, {
+    inputRaw: '1000000',
+    outputRaw: '3739460179',
+  });
+  assert.deepEqual(value.events, ['order', 'execute', 'getGenesisHash', 'getTransaction']);
+});
+
+test('confirmed execution amounts survive receipt delays and process recovery', async (t) => {
+  const value = harness(t);
+  const trade = operation();
+  value.setExecution({ totalInputAmount: '99000000', totalOutputAmount: '1100000' });
+  await assert.rejects(advance(value, trade), PendingTrade);
+  const restored = structuredClone(value.snapshots.at(-1)!);
+  const actual = receipt();
+  actual.meta!.postTokenBalances![0]!.uiTokenAmount.amount = '1100000';
+  value.setReceipt(actual);
+  const result = await advance(value, restored);
+  assert.equal(result.swapNativeRaw, '99000000');
+  assert.equal(result.tokenRaw, '1100000');
+  assert.equal(value.executions.length, 1);
+  assert.equal(value.orders.length, 1);
+});
+
+test('a lost execution response recovers the confirmed exact input without using the wallet debit', async (t) => {
+  const value = harness(t);
+  value.setRejectExecution(true);
+  const trade = operation();
+  await assert.rejects(advance(value, trade), /Offline Jupiter timeout/);
+  value.setReceipt(receipt());
+  const result = await advance(value, structuredClone(trade));
+  assert.equal(result.swapNativeRaw, trade.amountRaw);
+  assert.equal(result.nativeRaw, '100005000');
+  assert.equal(value.executions.length, 1);
+});
+
+for (const amounts of [
+  { totalInputAmount: '0', totalOutputAmount: '1000000' },
+  { totalInputAmount: '100000000', totalOutputAmount: '999999' },
+  { totalInputAmount: '100000000', totalOutputAmount: null },
+]) {
+  test(`inconsistent confirmed fill amounts require review: ${JSON.stringify(amounts)}`, async (t) => {
+    const value = harness(t);
+    value.setExecution(amounts);
+    value.setReceipt(receipt());
+    const trade = operation();
+    await assert.rejects(advance(value, trade), ReviewRequired);
+    assert.equal((trade.steps[0] as JupiterStep).status, 'confirmed');
+    assert.equal(value.executions.length, 1);
+  });
+}
+
 for (const priority of [null, '0', '0.00001'] as const) {
   test(`priority override ${priority ?? 'auto'} is passed in the Jupiter order`, async (t) => {
     const value = harness(t);

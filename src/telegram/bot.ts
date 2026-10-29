@@ -14,10 +14,42 @@ import {
 import { Store } from '../infra/store.js';
 import { safeError } from '../infra/http.js';
 import { TradeEngine } from '../trading/engine.js';
+import { withdrawalAddress, withdrawalAmount } from '../trading/withdrawal.js';
 import { applyField, editableFields, toggles, type EditableField } from './settings.js';
-import { randomUUID } from 'node:crypto';
+import {
+  exitKind,
+  exitMode,
+  selectedMode,
+  exitEnabled,
+  exitReady,
+  setExitEnabled,
+  setExitMode,
+  saveHardExit,
+  saveTrailingStage,
+  removeTrailingStage,
+  exitSummary,
+  exitPlanLines,
+  exitPanel,
+  exitPrompt,
+  settingsError,
+  type ExitKind,
+  type ExitMode,
+} from './exits.js';
+import { telegramTiming, telegramApiLogging } from './control-api.js';
+import {
+  BotAccess,
+  watcherCallbackAllowed,
+  watcherCommandAllowed,
+  watcherKeyboard,
+} from './access.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { recentCallMessage } from './call-history.js';
+import { positionEntryPrice } from './positions.js';
+import { pnlChain, pnlMessage, pnlPeriod } from './pnl.js';
+import { pnlWindow } from '../pnl/periods.js';
+import { summarizePnl } from '../pnl/accounting.js';
+import type { PnlChain, PnlPeriod } from '../pnl/types.js';
+import type { PnlTracker } from '../pnl/tracker.js';
 import {
   bold,
   italic,
@@ -30,12 +62,31 @@ import {
 } from './presentation.js';
 
 const log = logger.child({ component: 'telegram.control' });
-const apiLog = logger.child({ component: 'api.telegram', service: 'Telegram Bot API' });
 
 type PendingInput =
   | { kind: 'field'; chain: Chain; field: string }
-  | { kind: 'tp'; chain: Chain }
-  | { kind: 'block'; remove: boolean };
+  | {
+      kind: 'exit';
+      chain: Chain;
+      target: ExitKind;
+      mode: ExitMode;
+      enableAfter: boolean;
+      append: boolean;
+    }
+  | { kind: 'block'; remove: boolean }
+  | { kind: 'withdraw_address'; chain: Chain }
+  | { kind: 'withdraw_amount'; chain: Chain; recipient: string };
+interface InteractionState {
+  pending: PendingInput | null;
+  sale: { id: string; percentage: number; balance: string; expires: number } | null;
+  withdrawal: {
+    id: string;
+    chain: Chain;
+    recipient: string;
+    amount: string;
+    expires: number;
+  } | null;
+}
 const label = (value: string): string => value.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 60);
 const onOff = (value: boolean): string => (value ? '✅ On' : '⚪ Off');
 const chainName = (chain: Chain): string =>
@@ -61,64 +112,73 @@ const groupValue = (value: string | undefined): EditableField['group'] => {
 };
 export class ControlBot {
   readonly bot: Bot;
-  private pending: PendingInput | null = null;
-  private sale: { id: string; percentage: number; balance: string; expires: number } | null = null;
+  private readonly interactions = new Map<number, InteractionState>();
   private notifier: ReturnType<typeof setInterval> | null = null;
-  private sending = false;
-  private notificationCooldown = 0;
+  private readonly sending = new Set<number>();
+  private readonly notificationCooldown = new Map<number, number>();
+  private readonly access: BotAccess;
+  private stopping = false;
+  private readonly pollingTimeoutSeconds: number;
   constructor(
     private readonly config: Config,
     private readonly store: Store,
     private readonly engine: TradeEngine,
     private readonly hydrateHistory?: (messageIds: number[]) => Promise<void>,
+    private readonly pnlTracker?: PnlTracker,
   ) {
-    this.bot = new Bot(config.botToken);
-    this.bot.api.config.use(async (prev, method, payload, signal) => {
-      const fields = { apiMethod: method, requestId: randomUUID() };
-      const started = Date.now();
-      apiLog.debug('api.request', fields);
-      try {
-        const response = await prev(method, payload, signal);
-        if (!response.ok)
-          apiLog.error('api.telegram_failed', response, {
-            ...fields,
-            durationMs: Date.now() - started,
-          });
-        else
-          apiLog.debug('api.response', {
-            ...fields,
-            durationMs: Date.now() - started,
-            updateCount:
-              method === 'getUpdates' && Array.isArray(response.result)
-                ? response.result.length
-                : undefined,
-          });
-        return response;
-      } catch (error) {
-        apiLog.error('api.telegram_failed', error, { ...fields, durationMs: Date.now() - started });
-        throw error;
-      }
+    this.access = new BotAccess(config.ownerId, config.watcherUsername ?? '', store);
+    const timing = telegramTiming(config.httpTimeoutMs);
+    this.pollingTimeoutSeconds = timing.pollingTimeoutSeconds;
+    this.bot = new Bot(config.botToken, {
+      client: { timeoutSeconds: timing.requestTimeoutSeconds },
     });
+    this.bot.api.config.use(telegramApiLogging(config.httpTimeoutMs, () => this.stopping));
     this.bot.use(async (ctx, next) => {
-      if (ctx.from?.id === config.ownerId && ctx.chat?.type === 'private') {
-        await withLogContext({ updateId: ctx.update.update_id }, async () => {
-          log.debug('control.update_received', {
-            action:
-              ctx.callbackQuery?.data ??
-              ctx.message?.text?.split(/\s/)[0]?.replace(/^[^/].*$/, 'setting_input'),
-          });
-          await next();
-          log.debug('control.update_handled');
-        });
+      const previousWatcher = this.access.watcherId();
+      const role = this.access.role(ctx.from, ctx.chat?.type);
+      if (role) {
+        if (role === 'watcher' && previousWatcher === null)
+          log.info('control.watcher_bound', { userId: ctx.from?.id, username: ctx.from?.username });
+        if (role === 'watcher') {
+          const allowed =
+            ctx.callbackQuery?.data !== undefined
+              ? watcherCallbackAllowed(ctx.callbackQuery.data)
+              : watcherCommandAllowed(ctx.message?.text ?? '');
+          if (!allowed) {
+            const reason =
+              'Watcher access is read-only. Trading, fund movements and settings changes are restricted to the owner.';
+            log.warn('control.action_denied', {
+              userId: ctx.from?.id,
+              accessRole: role,
+              action: ctx.callbackQuery?.data ?? 'text_input',
+            });
+            if (ctx.callbackQuery)
+              await ctx.answerCallbackQuery({ text: reason, show_alert: true });
+            else await this.reply(ctx, reason);
+            return;
+          }
+        }
+        await withLogContext(
+          { updateId: ctx.update.update_id, userId: ctx.from?.id, accessRole: role },
+          async () => {
+            log.debug('control.update_received', {
+              action:
+                ctx.callbackQuery?.data ??
+                ctx.message?.text?.split(/\s/)[0]?.replace(/^[^/].*$/, 'setting_input'),
+            });
+            await next();
+            log.debug('control.update_handled');
+          },
+        );
       } else log.warn('control.access_denied', { userId: ctx.from?.id, chatType: ctx.chat?.type });
     });
     this.bot.command(['start', 'settings'], (ctx) => this.home(ctx));
     this.bot.command('wallets', (ctx) => this.wallets(ctx));
     this.bot.command('positions', (ctx) => this.positions(ctx, 0));
     this.bot.command('history', (ctx) => this.history(ctx));
+    this.bot.command('pnl', (ctx) => this.pnl(ctx));
     this.bot.command('cancel', async (ctx) => {
-      this.pending = null;
-      this.sale = null;
+      if (ctx.from) this.interactions.delete(ctx.from.id);
       await this.home(ctx);
     });
     this.bot.command('help', (ctx) =>
@@ -131,6 +191,7 @@ export class ControlBot {
           '👛 /wallets · Addresses and balances',
           '📊 /positions · Inspect positions or sell',
           '📜 /history · Recent trades',
+          '/pnl - Daily, weekly and monthly USD profit and loss',
           '✖️ /cancel · Cancel the current input',
           '',
           message`💰 ${bold('Before enabling a chain')}`,
@@ -138,12 +199,12 @@ export class ControlBot {
           'Enable a chain to buy matching calls automatically. Disable it to stop new buys; configured exits for existing positions continue.',
           '',
           message`🎯 ${bold('Profit and sell percentages')}`,
-          'Profit uses fresh SOL/ETH quotes against entry spending, including recorded entry fees. Confirmed proceeds include sell network fees; fills follow your slippage setting.',
+          'Solana exits compare fresh SOL quotes against the confirmed swap entry price. USD PNL includes recorded swap and network fees. Confirmed sale proceeds are net of sell network fees; fills follow your slippage setting.',
           message`Fixed TP: percentage of the ${bold('original entry')}.`,
           message`Trailing TP: percentage of the ${bold('remaining balance')}.`,
           '',
           italic(
-            'Settings apply to future positions. Use Apply current exit settings to update an open position. Wallet withdrawal and private-key export are unavailable.',
+            'Settings apply to future positions. Use Apply current exit settings to update an open position. The owner can withdraw SOL or Robinhood ETH from Wallets after confirming the destination and amount.',
           ),
           ...(this.config.listenOnly
             ? [
@@ -162,7 +223,7 @@ export class ControlBot {
         log.error('control.callback_failed', error, { action: ctx.callbackQuery.data });
         await this.reply(
           ctx,
-          message`⚠️ ${bold('Action could not be completed')}\n${safeError(error)}`,
+          message`⚠️ ${bold('Action could not be completed')}\n${settingsError(error)}`,
         );
       }
     });
@@ -170,16 +231,32 @@ export class ControlBot {
       try {
         await this.text(ctx, ctx.message.text);
       } catch (error) {
-        log.error('control.input_failed', error, { inputKind: this.pending?.kind });
-        await this.reply(ctx, message`⚠️ ${bold('Setting not saved')}\n${safeError(error)}`);
+        log.error('control.input_failed', error, {
+          inputKind: this.interaction(ctx).pending?.kind,
+        });
+        await this.reply(ctx, message`⚠️ ${bold('Setting not saved')}\n${settingsError(error)}`);
       }
     });
     this.bot.catch((error) => {
       log.error('control.handler_failed', error.error, { updateId: error.ctx.update.update_id });
     });
   }
+  private isWatcher(ctx: Context): boolean {
+    return this.access.role(ctx.from, ctx.chat?.type) === 'watcher';
+  }
+  private interaction(ctx: Context): InteractionState {
+    if (!ctx.from) throw new Error('Telegram user is missing');
+    let state = this.interactions.get(ctx.from.id);
+    if (!state) {
+      state = { pending: null, sale: null, withdrawal: null };
+      this.interactions.set(ctx.from.id, state);
+    }
+    return state;
+  }
   private async reply(ctx: Context, text: string | MessageText): Promise<void> {
-    const rendered = renderMessage(text);
+    const rendered = renderMessage(
+      this.isWatcher(ctx) ? joinMessages([bold('Watcher access: read only'), text], '\n\n') : text,
+    );
     await ctx.reply(rendered.text, {
       entities: rendered.entities,
       link_preview_options: { is_disabled: true },
@@ -190,10 +267,13 @@ export class ControlBot {
     text: string | MessageText,
     keyboard: InlineKeyboard,
   ): Promise<void> {
-    const rendered = renderMessage(text);
+    const watcher = this.isWatcher(ctx);
+    const rendered = renderMessage(
+      watcher ? joinMessages([bold('Watcher access: read only'), text], '\n\n') : text,
+    );
     const options = {
       entities: rendered.entities,
-      reply_markup: keyboard,
+      reply_markup: watcher ? watcherKeyboard(keyboard) : keyboard,
       link_preview_options: { is_disabled: true },
     };
     if (ctx.callbackQuery?.message) {
@@ -208,7 +288,8 @@ export class ControlBot {
     await ctx.reply(rendered.text, options);
   }
   private async home(ctx: Context): Promise<void> {
-    this.pending = null;
+    this.interaction(ctx).pending = null;
+    this.interaction(ctx).withdrawal = null;
     const settings = this.store.settings();
     const reader = this.store.metadata('reader:last-success');
     const pending = chains
@@ -253,7 +334,8 @@ export class ControlBot {
       .text('🚫 Caller blocklist', 'blocklist')
       .text('📜 History', 'history')
       .row()
-      .text('📞 Recent calls', 'recent');
+      .text('📞 Recent calls', 'recent')
+      .text('PNL', 'pnl:day:all:0');
     for (const operation of pending)
       if (operation.status === 'review')
         keyboard.row().text(`🔄 Reconcile ${operation.chain}`, `reconcile:${operation.id}`);
@@ -262,6 +344,8 @@ export class ControlBot {
   private async chainMenu(ctx: Context, chain: Chain): Promise<void> {
     const settings = this.store.settings().chains[chain];
     const missing = this.engine.readiness(chain);
+    const tpTargets = exitPlanLines(settings.exits, 'tp', selectedMode(settings.exits, 'tp'));
+    const slTargets = exitPlanLines(settings.exits, 'sl', selectedMode(settings.exits, 'sl'));
     const text = joinMessages([
       bold(`${chainName(chain)} settings`),
       '',
@@ -270,6 +354,12 @@ export class ControlBot {
       '',
       message`🎯 ${bold('Minimum consistency')}`,
       `Overall: ${settings.consistency.overall}% · Recent: ${settings.consistency.recent}% · Chain: ${settings.consistency.chain}%`,
+      '',
+      bold(exitSummary(settings.exits, 'tp')),
+      ...(tpTargets.length ? tpTargets.map(italic) : [italic('No take-profit targets set.')]),
+      '',
+      bold(exitSummary(settings.exits, 'sl')),
+      ...(slTargets.length ? slTargets.map(italic) : [italic('No stop-loss targets set.')]),
       '',
       missing.length
         ? message`📝 ${bold('Still needed:')} ${missing.join(', ')}`
@@ -301,7 +391,123 @@ export class ControlBot {
       .text('⬅️ Back', 'home');
     await this.display(ctx, text, keyboard);
   }
+  private async pnl(
+    ctx: Context,
+    period: PnlPeriod = 'day',
+    chain: PnlChain = 'all',
+    offset = 0,
+  ): Promise<void> {
+    const window = pnlWindow(period, offset, this.config.pnlTimeZone ?? 'UTC');
+    const summary = summarizePnl(
+      this.store.pnlFills(),
+      this.store.positions(),
+      this.store.pnlMarks(),
+      window,
+      chain,
+    );
+    const key = `${period}:${chain}:${offset}`;
+    const keyboard = new InlineKeyboard();
+    for (const [value, label] of [
+      ['day', 'Daily'],
+      ['week', 'Weekly'],
+      ['month', 'Monthly'],
+    ] as const)
+      keyboard.text(value === period ? `[${label}]` : label, `pnl:${value}:${chain}:0`);
+    keyboard.row();
+    for (const [value, label] of [
+      ['all', 'All chains'],
+      ['solana', 'Solana'],
+      ['robinhood', 'Robinhood'],
+    ] as const)
+      keyboard.text(value === chain ? `[${label}]` : label, `pnl:${period}:${value}:${offset}`);
+    keyboard.row().text('Previous', `pnl:${period}:${chain}:${offset + 1}`);
+    if (offset > 0)
+      keyboard
+        .text('Next', `pnl:${period}:${chain}:${offset - 1}`)
+        .text('Current', `pnl:${period}:${chain}:0`);
+    keyboard.row().text('🔄 Refresh view', `pnl:${key}`);
+    if (!this.config.listenOnly && this.pnlTracker)
+      keyboard.text('Update open quotes', `pnlquotes:${key}`);
+    await this.display(
+      ctx,
+      pnlMessage(summary, this.pnlTracker?.updating ?? false),
+      keyboard.row().text('Back', 'home'),
+    );
+  }
+  private async exitHome(ctx: Context, chain: Chain): Promise<void> {
+    const exits = this.store.settings().chains[chain].exits;
+    await this.display(
+      ctx,
+      joinMessages([
+        bold('Take profit / Stop loss'),
+        chainName(chain),
+        '',
+        exitSummary(exits, 'tp'),
+        exitSummary(exits, 'sl'),
+        '',
+        'Choose TP or SL, select Hard or Trailing, then enable it.',
+        italic(
+          'Hard exits use a percentage. Trailing exits use activation, distance and sale stages.',
+        ),
+      ]),
+      new InlineKeyboard()
+        .text(`Take profit: ${exitEnabled(exits, 'tp') ? 'On' : 'Off'}`, `exit:${chain}:tp`)
+        .row()
+        .text(`Stop loss: ${exitEnabled(exits, 'sl') ? 'On' : 'Off'}`, `exit:${chain}:sl`)
+        .row()
+        .text('Back', `chain:${chain}`),
+    );
+  }
+  private async exitDetails(ctx: Context, chain: Chain, target: ExitKind): Promise<void> {
+    const exits = this.store.settings().chains[chain].exits;
+    if (this.isWatcher(ctx)) {
+      const targets = exitPlanLines(exits, target);
+      await this.display(
+        ctx,
+        joinMessages([
+          bold(exitSummary(exits, target)),
+          chainName(chain),
+          '',
+          ...(targets.length ? targets : ['No targets configured.']),
+        ]),
+        new InlineKeyboard().text('Back', `menu:${chain}:exits`),
+      );
+      return;
+    }
+    const panel = exitPanel(chain, exits, target);
+    await this.display(ctx, panel.text, panel.keyboard);
+  }
+  private async promptExit(
+    ctx: Context,
+    chain: Chain,
+    target: ExitKind,
+    mode: ExitMode,
+    enableAfter = false,
+    append = false,
+  ): Promise<void> {
+    this.interaction(ctx).pending = { kind: 'exit', chain, target, mode, enableAfter, append };
+    await this.reply(ctx, exitPrompt(target, mode, append));
+  }
+  private async toggleExit(
+    ctx: Context,
+    chain: Chain,
+    target: ExitKind,
+    desired?: boolean,
+  ): Promise<void> {
+    const exits = this.store.settings().chains[chain].exits;
+    const enabled = desired ?? !exitEnabled(exits, target);
+    if (enabled && !exitReady(exits, target)) {
+      await this.promptExit(ctx, chain, target, selectedMode(exits, target), true);
+      return;
+    }
+    this.updateChain(chain, (settings) => setExitEnabled(settings.exits, target, enabled));
+    await this.exitDetails(ctx, chain, target);
+  }
   private async group(ctx: Context, chain: Chain, group: EditableField['group']): Promise<void> {
+    if (group === 'exits') {
+      await this.exitHome(ctx, chain);
+      return;
+    }
     const settings = this.store.settings().chains[chain];
     const keyboard = new InlineKeyboard();
     const title = {
@@ -324,28 +530,6 @@ export class ControlBot {
       keyboard
         .text(`${toggle.label}: ${onOff(toggle.value(settings))}`, `toggle:${chain}:${key}`)
         .row();
-    }
-    if (group === 'exits') {
-      lines.push(
-        '',
-        message`🎯 ${bold('Fixed TP stages')}`,
-        italic('Sell percentages refer to the original entry.'),
-      );
-      for (const tier of [...settings.exits.takeProfits].sort(
-        (a, b) => a.profitPercent - b.profitPercent,
-      )) {
-        lines.push(
-          message`${bold(`+${tier.profitPercent}% profit:`)} ${tier.sellPercent === 'rest' ? 'sell remaining' : `sell ${tier.sellPercent}%`}`,
-        );
-        keyboard.text(`🗑️ Remove +${tier.profitPercent}% TP`, `deltp:${chain}:${tier.id}`).row();
-      }
-      keyboard.text('➕ Add TP stage', `addtp:${chain}`).row();
-      lines.push(
-        '',
-        italic(
-          'Set values, then enable the desired exits. Trailing activates at its profit threshold and can sell before a later fixed TP. Changes apply to new positions; open positions have a separate apply action.',
-        ),
-      );
     }
     if (group === 'filters')
       lines.push(
@@ -387,7 +571,7 @@ export class ControlBot {
           );
       } catch (error) {
         log.error('control.balance_failed', error, { chain });
-        lines.push(message`⚠️ ${bold('Balance unavailable:')} ${safeError(error)}`);
+        lines.push(message`⚠️ ${bold('Balance unavailable:')} ${settingsError(error)}`);
       }
       lines.push('');
     }
@@ -395,6 +579,9 @@ export class ControlBot {
       ctx,
       joinMessages(lines),
       new InlineKeyboard()
+        .text('Withdraw SOL', 'withdraw:solana')
+        .text('Withdraw Robinhood ETH', 'withdraw:robinhood')
+        .row()
         .text('🔄 Unwrap idle Robinhood WETH', 'unwrap')
         .row()
         .text('🔄 Refresh', 'wallets')
@@ -410,6 +597,7 @@ export class ControlBot {
     for (const position of visible) {
       lines.push(
         bold(`${label(position.symbol)} (${nativeSymbol[position.chain]})`),
+        message`${bold('Entry price:')} ${positionEntryPrice(position, this.store.positionEntryFill(position.id))}`,
         `${formatAmount(position.remainingTokenRaw, position.decimals)} tokens | ${position.lastProfitPercent === null ? 'Value not refreshed' : `${position.lastProfitPercent.toFixed(2)}% in ${nativeSymbol[position.chain]}`}`,
         '',
       );
@@ -444,24 +632,31 @@ export class ControlBot {
         message`📊 ${bold(`${label(position.symbol)} (${nativeSymbol[position.chain]})`)}`,
         code(position.address),
         '',
+        message`${bold('Entry price:')} ${positionEntryPrice(position, this.store.positionEntryFill(position.id))}`,
         message`🪙 ${bold('Remaining:')} ${formatAmount(position.remainingTokenRaw, position.decimals)} tokens`,
+        ...(position.entrySwapNativeRaw === undefined
+          ? []
+          : [
+              message`${bold('Swap entry:')} ${formatAmount(position.entrySwapNativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}`,
+              message`${bold('Entry network fees:')} ${formatAmount(position.entryFeeNativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}`,
+            ]),
         message`💳 ${bold('Entry spending:')} ${formatAmount(position.entryNativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}`,
         ...(position.entryUsd === null
           ? []
           : [message`💵 ${bold('Entry USD estimate:')} $${position.entryUsd.toFixed(2)}`]),
         message`💸 ${bold('Net sale proceeds so far:')} ${formatAmount(position.realizedNativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}`,
         message`📈 ${bold('Quoted gain:')} ${position.lastProfitPercent === null ? 'Not refreshed' : `${position.lastProfitPercent.toFixed(2)}%`}`,
-        italic('Quoted gain is before sell network fees.'),
+        italic(
+          position.chain === 'solana'
+            ? 'Quoted gain compares swap prices; network fees and account funding are excluded.'
+            : 'Quoted gain is before sell network fees.',
+        ),
         ...(currentValue ? [currentValue] : []),
         '',
-        message`🛑 ${bold('Fixed SL:')} ${onOff(exits.stopLoss.enabled)}${exits.stopLoss.lossPercent === null ? '' : ` (-${exits.stopLoss.lossPercent}%)`}`,
-        message`🎯 ${bold('TP stages:')} ${onOff(exits.takeProfitEnabled)}`,
-        ...exits.takeProfits.map(
-          (tier) =>
-            message`${bold(`+${tier.profitPercent}%:`)} ${tier.sellPercent === 'rest' ? 'sell remaining' : `sell ${tier.sellPercent}% of original`}`,
-        ),
-        message`📉 ${bold('Trailing SL:')} ${onOff(exits.trailingSl.enabled)}`,
-        message`📈 ${bold('Trailing TP:')} ${onOff(exits.trailingTp.enabled)}`,
+        bold(exitSummary(exits, 'sl')),
+        ...exitPlanLines(exits, 'sl').map(italic),
+        bold(exitSummary(exits, 'tp')),
+        ...exitPlanLines(exits, 'tp').map(italic),
         ...(position.lastError
           ? ['', message`⚠️ ${bold('Last issue')}\n${position.lastError}`]
           : []),
@@ -573,9 +768,11 @@ export class ControlBot {
     });
   }
   private async callback(ctx: Context, data: string): Promise<void> {
-    const [action, value, option] = data.split(':');
-    if (action !== 'confirm') this.sale = null;
-    this.pending = null;
+    const [action, value, option, detail] = data.split(':');
+    const state = this.interaction(ctx);
+    if (action !== 'confirm') state.sale = null;
+    if (action !== 'withdrawconfirm') state.withdrawal = null;
+    state.pending = null;
     switch (action) {
       case 'home':
         await this.home(ctx);
@@ -586,12 +783,53 @@ export class ControlBot {
       case 'menu':
         await this.group(ctx, chainValue(value), groupValue(option));
         return;
+      case 'exit': {
+        await this.exitDetails(ctx, chainValue(value), exitKind(option));
+        return;
+      }
+      case 'exitmode': {
+        const chain = chainValue(value);
+        const target = exitKind(option);
+        this.updateChain(chain, (settings) =>
+          setExitMode(settings.exits, target, exitMode(detail)),
+        );
+        await this.exitDetails(ctx, chain, target);
+        return;
+      }
+      case 'exittoggle': {
+        await this.toggleExit(ctx, chainValue(value), exitKind(option));
+        return;
+      }
+      case 'exitset':
+      case 'exitaddhard': {
+        const chain = chainValue(value);
+        const target = exitKind(option);
+        await this.promptExit(
+          ctx,
+          chain,
+          target,
+          action === 'exitaddhard'
+            ? 'hard'
+            : selectedMode(this.store.settings().chains[chain].exits, target),
+          false,
+          action === 'exitaddhard',
+        );
+        return;
+      }
+      case 'exitdel': {
+        const chain = chainValue(value);
+        const target = exitKind(option);
+        if (!detail) throw new Error('Missing stage');
+        this.updateChain(chain, (settings) => removeTrailingStage(settings.exits, target, detail));
+        await this.exitDetails(ctx, chain, target);
+        return;
+      }
       case 'edit': {
         const chain = chainValue(value);
         const field = option ? editableFields[option] : undefined;
         if (!field || !option || (field.chains && !field.chains.includes(chain)))
           throw new Error('Unknown setting');
-        this.pending = { kind: 'field', chain, field: option };
+        state.pending = { kind: 'field', chain, field: option };
         await this.reply(
           ctx,
           message`${bold(`${field.label} (${nativeSymbol[chain]})`)}\n\n${field.hint}\n\n${italic('Send /cancel to cancel.')}`,
@@ -603,6 +841,15 @@ export class ControlBot {
         const toggle = option ? toggles[option] : undefined;
         if (!toggle || (toggle.chains && !toggle.chains.includes(chain)))
           throw new Error('Unknown switch');
+        if (toggle.group === 'exits') {
+          const desired = !toggle.value(this.store.settings().chains[chain]);
+          const target = option === 'tp' || option === 'ttp' ? 'tp' : 'sl';
+          const mode = option === 'tsl' || option === 'ttp' ? 'trailing' : 'hard';
+          if (selectedMode(this.store.settings().chains[chain].exits, target) !== mode)
+            this.updateChain(chain, (settings) => setExitMode(settings.exits, target, mode));
+          await this.toggleExit(ctx, chain, target, desired);
+          return;
+        }
         this.updateChain(chain, toggle.change);
         await this.group(ctx, chain, toggle.group);
         return;
@@ -624,21 +871,7 @@ export class ControlBot {
         return;
       }
       case 'addtp':
-        this.pending = { kind: 'tp', chain: chainValue(value) };
-        await this.reply(
-          ctx,
-          joinMessages([
-            message`🎯 ${bold('Add a take-profit stage')}`,
-            '',
-            'Send the profit target and sell percentage:',
-            code('profit_percentage sell_percentage'),
-            '',
-            message`${code('50 90')} · Sell 90% of the original entry at +50%.`,
-            message`${code('1000 rest')} · Sell the remaining tokens at +1000%.`,
-            '',
-            italic('Enable Take profit stages when your plan is ready. Send /cancel to cancel.'),
-          ]),
-        );
+        await this.promptExit(ctx, chainValue(value), 'tp', 'hard', false, true);
         return;
       case 'deltp': {
         const chain = chainValue(value);
@@ -648,7 +881,7 @@ export class ControlBot {
           );
           if (!settings.exits.takeProfits.length) settings.exits.takeProfitEnabled = false;
         });
-        await this.group(ctx, chain, 'exits');
+        await this.exitDetails(ctx, chain, 'tp');
         return;
       }
       case 'wallets':
@@ -666,11 +899,19 @@ export class ControlBot {
       case 'history':
         await this.history(ctx);
         return;
+      case 'pnl':
+        await this.pnl(ctx, pnlPeriod(value), pnlChain(option), Number(detail ?? 0));
+        return;
+      case 'pnlquotes':
+        if (!this.pnlTracker) throw new Error('PNL quote tracking is unavailable');
+        this.pnlTracker.requestQuotes();
+        await this.pnl(ctx, pnlPeriod(value), pnlChain(option), Number(detail ?? 0));
+        return;
       case 'blocklist':
         await this.blocklist(ctx);
         return;
       case 'block':
-        this.pending = { kind: 'block', remove: value === 'remove' };
+        state.pending = { kind: 'block', remove: value === 'remove' };
         await this.reply(
           ctx,
           message`🚫 ${bold(value === 'remove' ? 'Remove blocked callers' : 'Block callers')}\n\nSend caller handles or numeric channel IDs, separated by spaces or newlines.\n\n${italic('Send /cancel to cancel.')}`,
@@ -685,7 +926,7 @@ export class ControlBot {
         const position = this.store.position(value);
         const percentage = Number(option);
         if (!position || ![25, 50, 100].includes(percentage)) throw new Error('Invalid sale');
-        this.sale = {
+        state.sale = {
           id: value,
           percentage,
           balance: position.remainingTokenRaw,
@@ -702,8 +943,8 @@ export class ControlBot {
         return;
       }
       case 'confirm': {
-        const sale = this.sale;
-        this.sale = null;
+        const sale = state.sale;
+        state.sale = null;
         if (
           !sale ||
           sale.id !== value ||
@@ -742,8 +983,40 @@ export class ControlBot {
         position.exits = structuredClone(this.store.settings().chains[position.chain].exits);
         position.trailingSl = emptyTrail();
         position.trailingTp = emptyTrail();
+        position.trailingStages = {};
         this.store.savePosition(position);
         await this.position(ctx, value);
+        return;
+      }
+      case 'withdraw': {
+        if (ctx.from?.id !== this.config.ownerId)
+          throw new Error('Only the owner can withdraw funds');
+        if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks withdrawals');
+        const chain = chainValue(value);
+        state.pending = { kind: 'withdraw_address', chain };
+        await this.reply(
+          ctx,
+          message`${bold(`Withdraw ${nativeSymbol[chain]}`)}\n\nNetwork: ${chain === 'solana' ? 'Solana mainnet' : 'Robinhood Chain'}\nSend the destination wallet address.\n\n${italic('Send /cancel to cancel.')}`,
+        );
+        return;
+      }
+      case 'withdrawconfirm': {
+        if (ctx.from?.id !== this.config.ownerId)
+          throw new Error('Only the owner can withdraw funds');
+        const withdrawal = state.withdrawal;
+        state.withdrawal = null;
+        if (!withdrawal || withdrawal.id !== value || withdrawal.expires < Date.now())
+          throw new Error('Withdrawal confirmation expired. Start again from Wallets.');
+        const id = await this.engine.withdraw(
+          withdrawal.chain,
+          withdrawal.recipient,
+          withdrawal.amount,
+          ctx.from.id,
+        );
+        await this.reply(
+          ctx,
+          message`${bold('Withdrawal queued')}\nAmount: ${withdrawal.amount} ${nativeSymbol[withdrawal.chain]}\nDestination: ${code(withdrawal.recipient)}\nOperation: ${code(id)}\nConfirmation will be sent after the transaction is confirmed.`,
+        );
         return;
       }
       case 'unwrap':
@@ -775,9 +1048,62 @@ export class ControlBot {
     }
   }
   private async text(ctx: Context, text: string): Promise<void> {
-    const pending = this.pending;
+    const state = this.interaction(ctx);
+    const pending = state.pending;
     if (!pending) {
       await this.reply(ctx, message`⚙️ Use /settings to choose a setting to edit.`);
+      return;
+    }
+    if (pending.kind === 'withdraw_address' || pending.kind === 'withdraw_amount') {
+      if (ctx.from?.id !== this.config.ownerId)
+        throw new Error('Only the owner can withdraw funds');
+      if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks withdrawals');
+      if (pending.kind === 'withdraw_address') {
+        const recipient = withdrawalAddress(
+          pending.chain,
+          text,
+          this.engine.adapters[pending.chain].address,
+        );
+        state.pending = { kind: 'withdraw_amount', chain: pending.chain, recipient };
+        await this.reply(
+          ctx,
+          message`${bold('Withdrawal destination')}\n${code(recipient)}\n\nSend the exact ${nativeSymbol[pending.chain]} amount to transfer. Keep enough native balance for the network fee.\n\n${italic('Send /cancel to cancel.')}`,
+        );
+        return;
+      }
+      const amountRaw = withdrawalAmount(pending.chain, text);
+      const amount = formatAmount(amountRaw, nativeDecimals[pending.chain]);
+      state.pending = null;
+      state.withdrawal = {
+        id: this.store.newId(),
+        chain: pending.chain,
+        recipient: pending.recipient,
+        amount,
+        expires: Date.now() + 120_000,
+      };
+      await this.display(
+        ctx,
+        message`${bold('Confirm withdrawal')}\n\nNetwork: ${pending.chain === 'solana' ? 'Solana mainnet' : 'Robinhood Chain'}\nFrom: ${code(this.engine.adapters[pending.chain].address)}\nDestination: ${code(pending.recipient)}\nAmount: ${bold(`${amount} ${nativeSymbol[pending.chain]}`)}\n\nNetwork fees are charged in addition to this amount. Verify the full destination and network before confirming.\n\n${italic('Confirmation expires in two minutes.')}`,
+        new InlineKeyboard()
+          .text('Confirm withdrawal', `withdrawconfirm:${state.withdrawal.id}`)
+          .row()
+          .text('Cancel', 'wallets'),
+      );
+      return;
+    }
+    if (pending.kind === 'exit') {
+      this.updateChain(pending.chain, (settings) => {
+        if (pending.mode === 'hard')
+          saveHardExit(settings.exits, pending.target, text, this.store.newId(), pending.append);
+        else saveTrailingStage(settings.exits, pending.target, text, this.store.newId());
+        if (pending.enableAfter) setExitEnabled(settings.exits, pending.target, true);
+      });
+      state.pending = null;
+      await this.reply(
+        ctx,
+        bold(pending.enableAfter ? 'Exit configured and enabled' : 'Exit settings saved'),
+      );
+      await this.exitDetails(ctx, pending.chain, pending.target);
       return;
     }
     if (pending.kind === 'field') {
@@ -790,36 +1116,9 @@ export class ControlBot {
       this.store.updateSettings((settings) => {
         settings.chains[pending.chain] = updated;
       });
-      this.pending = null;
+      state.pending = null;
       await this.reply(ctx, message`✅ ${bold('Setting saved')}`);
       await this.group(ctx, pending.chain, editableFields[pending.field]!.group);
-      return;
-    }
-    if (pending.kind === 'tp') {
-      const [profitValue, saleValue, extra] = text.trim().split(/\s+/);
-      if (
-        !profitValue ||
-        !saleValue ||
-        extra ||
-        !/^\d+(?:\.\d+)?$/.test(profitValue) ||
-        (saleValue !== 'rest' && !/^\d+(?:\.\d+)?$/.test(saleValue))
-      )
-        throw new Error('Send two values, for example: 50 90 or 1000 rest');
-      const profit = Number(profitValue);
-      if (profit > 1_000_000) throw new Error('Profit target is too large');
-      this.updateChain(pending.chain, (settings) => {
-        settings.exits.takeProfits.push({
-          id: this.store.newId(),
-          profitPercent: profit,
-          sellPercent: saleValue === 'rest' ? 'rest' : Number(saleValue),
-        });
-      });
-      this.pending = null;
-      await this.reply(
-        ctx,
-        message`✅ ${bold('TP stage saved')}\n${italic('Enable Take profit stages when your plan is ready.')}`,
-      );
-      await this.group(ctx, pending.chain, 'exits');
       return;
     }
     const callers = text
@@ -834,10 +1133,11 @@ export class ControlBot {
         ? settings.blockedCallers.filter((caller) => !callers.includes(caller.replace(/^@/, '')))
         : [...new Set([...settings.blockedCallers, ...callers])];
     });
-    this.pending = null;
+    state.pending = null;
     await this.blocklist(ctx);
   }
   async start(): Promise<void> {
+    this.stopping = false;
     await this.bot.init();
     await this.bot.api.setMyCommands([
       { command: 'settings', description: '⚙️ Configure trading and filters' },
@@ -850,45 +1150,77 @@ export class ControlBot {
     this.notifier = setInterval(() => {
       void this.flushNotifications();
     }, 1500);
-    void this.bot.start({ allowed_updates: ['message', 'callback_query'] }).catch((error) => {
-      log.error('control.polling_failed', error);
-      this.store.updateSettings((settings) => {
-        for (const chain of chains) settings.chains[chain].enabled = false;
+    void this.bot
+      .start({
+        timeout: this.pollingTimeoutSeconds,
+        allowed_updates: ['message', 'callback_query'],
+      })
+      .catch((error) => {
+        log.error('control.polling_failed', error);
+        this.store.updateSettings((settings) => {
+          for (const chain of chains) settings.chains[chain].enabled = false;
+        });
+        log.warn('chain.entries_disabled', { chains, reason: 'telegram_control_polling_failed' });
       });
-      log.warn('chain.entries_disabled', { chains, reason: 'telegram_control_polling_failed' });
-    });
     log.debug('control.started', {
       ownerId: this.config.ownerId,
+      watcherUsername: this.config.watcherUsername || null,
       listenOnly: this.config.listenOnly,
     });
   }
   private async flushNotifications(): Promise<void> {
-    if (this.sending || Date.now() < this.notificationCooldown) return;
-    this.sending = true;
-    try {
-      for (const notification of this.store.notifications()) {
-        log.debug('notification.sending', { notificationId: notification.id });
-        const rendered = renderMessage(notificationMessage(notification.text));
-        await this.bot.api.sendMessage(this.config.ownerId, rendered.text, {
-          entities: rendered.entities,
-          link_preview_options: { is_disabled: true },
-        });
-        this.store.delivered(notification.id);
-        log.debug('notification.delivered', { notificationId: notification.id });
-        await delay(1200);
-      }
-    } catch (error) {
-      this.notificationCooldown = Date.now() + 30_000;
-      log.error('notification.failed', error, {
-        retryAt: new Date(this.notificationCooldown).toISOString(),
-      });
-    } finally {
-      this.sending = false;
-    }
+    if (this.stopping) return;
+    const recipients = this.access.recipients();
+    await Promise.all(
+      recipients.map(async (recipientId) => {
+        if (
+          this.sending.has(recipientId) ||
+          Date.now() < (this.notificationCooldown.get(recipientId) ?? 0)
+        )
+          return;
+        this.sending.add(recipientId);
+        try {
+          for (const notification of this.store.notifications(recipientId)) {
+            if (this.stopping) break;
+            log.debug('notification.sending', { notificationId: notification.id, recipientId });
+            const content = notificationMessage(notification.text);
+            const rendered = renderMessage(
+              recipientId === this.config.ownerId
+                ? content
+                : joinMessages([bold('Owner activity: read only'), content], '\n\n'),
+            );
+            const keyboard = notification.solanaSignature
+              ? new InlineKeyboard().url(
+                  'View on Solscan',
+                  `https://solscan.io/tx/${encodeURIComponent(notification.solanaSignature)}`,
+                )
+              : undefined;
+            await this.bot.api.sendMessage(recipientId, rendered.text, {
+              entities: rendered.entities,
+              reply_markup: keyboard,
+              link_preview_options: { is_disabled: true },
+            });
+            this.store.delivered(notification.id, recipientId, recipients);
+            log.debug('notification.delivered', { notificationId: notification.id, recipientId });
+            await delay(1200);
+          }
+        } catch (error) {
+          const retryAt = Date.now() + 30_000;
+          this.notificationCooldown.set(recipientId, retryAt);
+          log.error('notification.failed', error, {
+            recipientId,
+            retryAt: new Date(retryAt).toISOString(),
+          });
+        } finally {
+          this.sending.delete(recipientId);
+        }
+      }),
+    );
   }
   async stop(): Promise<void> {
+    this.stopping = true;
     if (this.notifier) clearInterval(this.notifier);
     if (this.bot.isRunning()) await this.bot.stop();
-    while (this.sending) await delay(100);
+    while (this.sending.size > 0) await delay(100);
   }
 }

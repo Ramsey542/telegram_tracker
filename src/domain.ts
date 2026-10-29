@@ -12,24 +12,47 @@ const amount = z
   .regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/)
   .refine((value) => /[1-9]/.test(value));
 
+export const trailStageSchema = z.object({
+  id: z.string().min(1),
+  activationPercent: z.number().finite().min(0).max(1_000_000),
+  drawdownPercent: positivePercent.max(99.99),
+  sellPercent: z.union([positivePercent, z.literal('rest')]),
+});
 export const trailSchema = z
   .object({
     enabled: z.boolean().default(false),
     activationPercent: z.number().finite().min(0).nullable().default(null),
     drawdownPercent: positivePercent.max(99.99).nullable().default(null),
     sellPercent: positivePercent.nullable().default(null),
+    stages: z.array(trailStageSchema).max(20).optional(),
   })
   .refine(
     (value) =>
       !value.enabled ||
+      (value.stages?.length ?? 0) > 0 ||
       (value.activationPercent !== null &&
         value.drawdownPercent !== null &&
         value.sellPercent !== null),
     'Configure activation, drawdown and sell percentage before enabling trailing',
-  );
+  )
+  .superRefine((value, context) => {
+    const activations = new Set<number>();
+    const ids = new Set<string>();
+    for (const stage of value.stages ?? []) {
+      if (activations.has(stage.activationPercent) || ids.has(stage.id))
+        context.addIssue({
+          code: 'custom',
+          message: 'Trailing stages must have distinct activation percentages and IDs',
+        });
+      activations.add(stage.activationPercent);
+      ids.add(stage.id);
+    }
+  });
 
 export const exitSchema = z
   .object({
+    tpMode: z.enum(['hard', 'trailing']).optional(),
+    slMode: z.enum(['hard', 'trailing']).optional(),
     stopLoss: z
       .object({
         enabled: z.boolean().default(false),
@@ -168,6 +191,7 @@ export type Settings = z.infer<typeof settingsSchema>;
 export type ChainSettings = z.infer<typeof chainSettingsSchema>;
 export type ExitSettings = z.infer<typeof exitSchema>;
 export type TrailRule = z.infer<typeof trailSchema>;
+export type TrailStage = z.infer<typeof trailStageSchema>;
 
 export interface ChannelPost {
   channelId: string;
@@ -249,6 +273,7 @@ export interface Position {
   originalTokenRaw: string;
   remainingTokenRaw: string;
   entryNativeRaw: string;
+  entrySwapNativeRaw?: string;
   entryFeeNativeRaw: string;
   entryUsd: number | null;
   realizedNativeRaw: string;
@@ -257,6 +282,7 @@ export interface Position {
   exitFills: Record<string, string>;
   trailingSl: TrailState;
   trailingTp: TrailState;
+  trailingStages?: Record<string, TrailState>;
   openedAt: number;
   closedAt: number | null;
   lastProfitPercent: number | null;
@@ -267,6 +293,7 @@ export interface Position {
 export interface SwapResult {
   tokenRaw: string;
   nativeRaw: string;
+  swapNativeRaw?: string;
   feeNativeRaw: string;
   signature: string;
   nativeUsd: number | null;
@@ -315,17 +342,20 @@ export interface JupiterStep {
   status: 'prepared' | 'submitted' | 'confirmed' | 'failed';
   executionCode: number | null;
   executionError: string | null;
+  executionAmounts?: { inputRaw: string; outputRaw: string };
 }
 export type TradeStep = EvmStep | SolanaStep | OrderStep | JupiterStep;
 export interface Operation {
   id: string;
   chain: Chain;
   address: string;
-  kind: 'buy' | 'sell' | 'unwrap';
+  kind: 'buy' | 'sell' | 'unwrap' | 'withdraw';
   status: OperationStatus;
   positionId: string | null;
   signal: CallSignal | null;
   exitKey: string | null;
+  exitDescription?: string;
+  withdrawal?: { recipient: string; requestedBy: number };
   amountRaw: string;
   token: TokenInfo;
   settings: ChainSettings;
@@ -377,8 +407,15 @@ export function formatAmount(raw: bigint | string, decimals: number, digits = de
   return `${sign}${absolute / scale}${fraction ? `.${fraction}` : ''}`;
 }
 export const bps = (value: number): bigint => BigInt(Math.round(value * 100));
+export function entryCostRaw(position: Position): bigint {
+  const amount =
+    position.chain === 'solana' ? position.entrySwapNativeRaw : position.entryNativeRaw;
+  if (amount === undefined)
+    throw new ReviewRequired('Confirmed swap entry cost is unavailable; automatic exits must wait');
+  return BigInt(amount);
+}
 export function profitBps(nativeRaw: bigint, tokenRaw: bigint, position: Position): bigint {
-  const cost = BigInt(position.entryNativeRaw) * tokenRaw;
+  const cost = entryCostRaw(position) * tokenRaw;
   if (cost <= 0n) throw new Error('Position has no valid entry cost');
   return ((nativeRaw * BigInt(position.originalTokenRaw) - cost) * 10_000n) / cost;
 }

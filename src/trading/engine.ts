@@ -2,6 +2,7 @@ import type { Config } from '../config.js';
 import {
   chains,
   emptyTrail,
+  entryCostRaw,
   nativeDecimals,
   nativeSymbol,
   parseAmount,
@@ -22,6 +23,8 @@ import { Store } from '../infra/store.js';
 import { safeError } from '../infra/http.js';
 import { RiskFilters } from '../providers/risk.js';
 import { evaluateExits } from './exits.js';
+import { exitReasonLabel } from './exit-reason.js';
+import { withdrawalAddress, withdrawalAmount } from './withdrawal.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { logTradeOutcome } from '../logging/trades.js';
 
@@ -36,6 +39,7 @@ export class TradeEngine {
     private readonly store: Store,
     readonly adapters: Record<Chain, ChainAdapter>,
     private readonly filters: RiskFilters,
+    private readonly onFill?: () => void,
   ) {}
   start(): void {
     log.debug('engine.started', {
@@ -143,6 +147,8 @@ export class TradeEngine {
         log.debug('operation.poll', {
           chain,
           operationId: operation.id,
+          positionId: operation.positionId,
+          token: operation.address,
           status: operation.status,
           reason: operation.error,
         });
@@ -398,6 +404,10 @@ export class TradeEngine {
           originalTokenRaw: result.tokenRaw,
           remainingTokenRaw: result.tokenRaw,
           entryNativeRaw: result.nativeRaw,
+          entrySwapNativeRaw:
+            operation.chain === 'solana'
+              ? (result.swapNativeRaw ?? operation.amountRaw)
+              : undefined,
           entryFeeNativeRaw: result.feeNativeRaw,
           entryUsd: usd !== null && Number.isFinite(usd) ? usd : null,
           realizedNativeRaw: '0',
@@ -414,7 +424,8 @@ export class TradeEngine {
           lastError: null,
         };
         operation.swapHash = result.signature;
-        this.store.completeBuy(operation, position);
+        this.store.completeBuy(operation, position, result);
+        this.onFill?.();
         log.info('position.opened', {
           positionId: position.id,
           operationId: operation.id,
@@ -422,12 +433,15 @@ export class TradeEngine {
         });
         this.store.notify(
           `fill:${operation.id}`,
-          `${operation.token.symbol}: ${formatAmount(result.tokenRaw, decimals)} tokens received for ${formatAmount(result.nativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}${position.entryUsd === null ? '' : ` (approximately $${position.entryUsd.toFixed(2)})`}.`,
+          operation.chain === 'solana'
+            ? `${operation.token.symbol}: ${formatAmount(result.tokenRaw, decimals)} tokens received.\nSwap input: ${formatAmount(position.entrySwapNativeRaw!, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}.\nWallet spending: ${formatAmount(result.nativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}${position.entryUsd === null ? '' : ` (approximately $${position.entryUsd.toFixed(2)})`}.`
+            : `${operation.token.symbol}: ${formatAmount(result.tokenRaw, decimals)} tokens received for ${formatAmount(result.nativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}${position.entryUsd === null ? '' : ` (approximately $${position.entryUsd.toFixed(2)})`}.`,
         );
       } else if (operation.kind === 'sell') {
         const position = operation.positionId ? this.store.position(operation.positionId) : null;
         if (!position) throw new ReviewRequired('Confirmed sale has no matching position');
         this.store.completeSell(operation, position, result);
+        this.onFill?.();
         log.info('position.sold', {
           positionId: position.id,
           operationId: operation.id,
@@ -438,6 +452,9 @@ export class TradeEngine {
           `proceeds:${operation.id}`,
           `Net sale proceeds: ${formatAmount(result.nativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}.`,
         );
+      } else if (operation.kind === 'withdraw') {
+        this.store.completeWithdrawal(operation, result);
+        logTradeOutcome(operation, { ...result, recipient: operation.withdrawal?.recipient });
       } else {
         operation.status = 'confirmed';
         this.store.saveOperation(operation);
@@ -526,6 +543,7 @@ export class TradeEngine {
         continue;
       }
       try {
+        entryCostRaw(position);
         const quote = await withLogContext(
           { chain, positionId: position.id, token: position.address },
           () =>
@@ -537,6 +555,7 @@ export class TradeEngine {
           token: position.address,
           quote,
           entryNativeRaw: position.entryNativeRaw,
+          entrySwapNativeRaw: position.entrySwapNativeRaw,
           originalTokenRaw: position.originalTokenRaw,
           remainingTokenRaw: position.remainingTokenRaw,
         });
@@ -551,11 +570,19 @@ export class TradeEngine {
             ? null
             : Number(formatAmount(quotedValue, nativeDecimals[chain])) * quote.nativeUsd;
         position.lastError = null;
+        this.store.savePnlMark({
+          positionId: position.id,
+          tokenRaw: quote.inputRaw,
+          outputRaw: quote.outputRaw,
+          nativeUsd: quote.nativeUsd,
+          receivedAt: quote.receivedAt,
+        });
         this.store.savePosition(position);
         if (!decision) {
           log.info('position.waiting', {
             chain,
             positionId: position.id,
+            token: position.address,
             profitPercent: position.lastProfitPercent,
             reason: 'no_exit_triggered',
           });
@@ -564,6 +591,7 @@ export class TradeEngine {
         log.info('exit.triggered', {
           chain,
           positionId: position.id,
+          token: position.address,
           profitPercent: position.lastProfitPercent,
           decision,
         });
@@ -580,6 +608,7 @@ export class TradeEngine {
         const operation = this.operation(chain, token, 'sell', decision.amountRaw);
         operation.positionId = position.id;
         operation.exitKey = decision.key;
+        operation.exitDescription = exitReasonLabel(decision.key, position.exits);
         operation.minimumNativeRaw = decision.minimumNativeRaw;
         operation.quote = quote;
         if (this.store.claim(operation)) {
@@ -592,6 +621,7 @@ export class TradeEngine {
         log.info('exit.waiting', {
           chain,
           positionId: position.id,
+          token: position.address,
           reason: 'chain_operation_already_reserved',
         });
       } catch (error) {
@@ -627,6 +657,13 @@ export class TradeEngine {
           ? null
           : Number(formatAmount(quotedValue, nativeDecimals[position.chain])) * quote.nativeUsd;
       position.lastError = null;
+      this.store.savePnlMark({
+        positionId: position.id,
+        tokenRaw: quote.inputRaw,
+        outputRaw: quote.outputRaw,
+        nativeUsd: quote.nativeUsd,
+        receivedAt: quote.receivedAt,
+      });
     } catch (error) {
       log.error('position.refresh_failed', error, {
         chain: position.chain,
@@ -668,6 +705,7 @@ export class TradeEngine {
     );
     operation.positionId = position.id;
     operation.exitKey = 'manual';
+    operation.exitDescription = exitReasonLabel('manual', position.exits);
     if (!this.store.claim(operation))
       throw new Error('This chain already has an operation in progress');
     void this.tick();
@@ -696,6 +734,49 @@ export class TradeEngine {
     );
     if (!this.store.claim(operation)) throw new Error('Robinhood has an operation in progress');
     void this.tick();
+  }
+  async withdraw(
+    chain: Chain,
+    recipient: string,
+    amount: string,
+    requestedBy: number,
+  ): Promise<string> {
+    this.ensureTradingAllowed();
+    if (requestedBy !== this.config.ownerId) throw new Error('Only the owner can withdraw funds');
+    if (this.stopped) throw new Error('Bot is shutting down');
+    if (this.busy.has(chain) || this.store.activeOperation(chain))
+      throw new Error('This chain already has an operation in progress');
+    const address = withdrawalAddress(chain, recipient, this.adapters[chain].address);
+    const amountRaw = withdrawalAmount(chain, amount);
+    const operation = this.operation(
+      chain,
+      {
+        chain,
+        address,
+        symbol: nativeSymbol[chain],
+        decimals: nativeDecimals[chain],
+        marketCapUsd: null,
+        liquidityUsd: null,
+        usdPrice: null,
+        fetchedAt: Date.now(),
+      },
+      'withdraw',
+      amountRaw,
+    );
+    operation.withdrawal = { recipient: address, requestedBy };
+    if (!this.store.claim(operation))
+      throw new Error('This chain already has an operation in progress');
+    log.info('withdrawal.queued', {
+      chain,
+      operationId: operation.id,
+      recipient: address,
+      amountRaw,
+      requestedBy,
+    });
+    void this.tick().catch((error) =>
+      log.error('withdrawal.tick_failed', error, { chain, operationId: operation.id }),
+    );
+    return operation.id;
   }
   reconcile(id: string): void {
     this.ensureTradingAllowed();

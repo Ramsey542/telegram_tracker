@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import type { LogLevel } from './logging/logger.js';
+import { watcherUsernameSchema } from './telegram/access.js';
 
 const envSchema = z.object({
   TELEGRAM_API_ID: z.coerce.number().int().positive(),
@@ -9,6 +10,7 @@ const envSchema = z.object({
   TELEGRAM_PHONE: z.string().min(5),
   TELEGRAM_BOT_TOKEN: z.string().regex(/^\d+:[A-Za-z0-9_-]+$/),
   TELEGRAM_OWNER_ID: z.coerce.number().int().positive().safe(),
+  TELEGRAM_WATCHER_USERNAME: watcherUsernameSchema,
   TELEGRAM_SOURCE_CHANNEL: z
     .string()
     .regex(/^@?[A-Za-z][A-Za-z0-9_]{3,}$/)
@@ -18,6 +20,17 @@ const envSchema = z.object({
   MAX_SIGNAL_AGE_SECONDS: z.coerce.number().min(10).max(3600).default(120),
   HTTP_TIMEOUT_SECONDS: z.coerce.number().min(3).max(120).default(15),
   JUPITER_REQUESTS_PER_SECOND: z.coerce.number().min(0.5).max(150).default(1),
+  PNL_TIMEZONE: z
+    .string()
+    .default('UTC')
+    .refine((value) => {
+      try {
+        new Intl.DateTimeFormat('en', { timeZone: value });
+        return true;
+      } catch {
+        return false;
+      }
+    }),
   LISTEN_ONLY: z.enum(['true', 'false']).default('false'),
   LOG_DIRECTORY: z.string().min(1).default('logs'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
@@ -31,6 +44,7 @@ export interface Config {
   telegramPhone: string;
   botToken: string;
   ownerId: number;
+  watcherUsername: string;
   sourceChannel: string;
   dataDirectory: string;
   pollMs: number;
@@ -46,6 +60,7 @@ export interface Config {
   goplusAppSecret: string;
   walletEncryptionKey: string;
   jupiterRps: number;
+  pnlTimeZone: string;
   listenOnly: boolean;
   logDirectory: string;
   logLevel: LogLevel;
@@ -77,6 +92,7 @@ export function loadConfig(): Config {
     telegramPhone: value.TELEGRAM_PHONE,
     botToken: value.TELEGRAM_BOT_TOKEN,
     ownerId: value.TELEGRAM_OWNER_ID,
+    watcherUsername: value.TELEGRAM_WATCHER_USERNAME,
     sourceChannel: value.TELEGRAM_SOURCE_CHANNEL.replace(/^@/, ''),
     dataDirectory: resolve(value.DATA_DIRECTORY),
     pollMs: value.POSITION_POLL_SECONDS * 1000,
@@ -92,6 +108,7 @@ export function loadConfig(): Config {
     goplusAppSecret,
     walletEncryptionKey: process.env.WALLET_ENCRYPTION_KEY?.trim() ?? '',
     jupiterRps: value.JUPITER_REQUESTS_PER_SECOND,
+    pnlTimeZone: value.PNL_TIMEZONE,
     listenOnly: value.LISTEN_ONLY === 'true',
     logDirectory: resolve(value.LOG_DIRECTORY),
     logLevel: value.LOG_LEVEL,
