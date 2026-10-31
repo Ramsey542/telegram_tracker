@@ -44,14 +44,14 @@ function retryFailureReason(error: unknown): string {
       return summary;
     }
   }
-  if (
-    !response ||
-    typeof response !== 'object' ||
-    !('detail' in response) ||
-    typeof response.detail !== 'string'
-  )
-    return summary;
-  return safeError(new Error(`${summary}: ${response.detail}`));
+  if (!response || typeof response !== 'object') return summary;
+  const fields = response as Record<string, unknown>;
+  for (const key of ['detail', 'message', 'error', 'errorCode'] as const) {
+    const detail = fields[key];
+    if (typeof detail === 'string' && detail.trim())
+      return safeError(new Error(`${summary}: ${detail}`));
+  }
+  return summary;
 }
 
 export class TradeEngine {
@@ -304,7 +304,9 @@ export class TradeEngine {
       source: signal.sourceName,
       sourceMode: signal.mode ?? 'spydefi',
       blockedCallers,
-      duplicate: this.store.hasEntry(signal.chain, signal.address),
+      duplicate:
+        this.store.hasEntry(signal.chain, signal.address) ||
+        this.store.hasPurchased(signal.chain, signal.address, signal.channelId),
     });
     if (age > this.config.maxSignalAgeMs || age < -30_000)
       throw new TradeRejected('Call is outside the allowed age window');
@@ -427,15 +429,24 @@ export class TradeEngine {
             filters.marketCapEnabled ||
             filters.minLiquidityUsd !== null ||
             filters.maxTopHoldersPercent !== null;
-          const token = needsMarket
-            ? await this.adapters[operation.chain].tokenInfo(operation.address)
-            : { ...operation.token, fetchedAt: Date.now() };
+          const tokenRequest = needsMarket
+            ? this.adapters[operation.chain].tokenInfo(operation.address, operation.settings)
+            : Promise.resolve({ ...operation.token, fetchedAt: Date.now() });
+          const classicBuy = operation.chain === 'robinhood' && !operation.settings.mevProtection;
+          const token = classicBuy
+            ? (
+                await Promise.all([
+                  tokenRequest,
+                  this.filters.check(operation.token, operation.settings, tokenRequest),
+                ])
+              )[0]
+            : await tokenRequest;
           log.info('entry.market_data', {
             token,
             source: needsMarket ? 'current_api_data' : 'call_and_order',
             enabledFiltersOnly: operation.chain === 'solana',
           });
-          await this.filters.check(token, operation.settings);
+          if (!classicBuy) await this.filters.check(token, operation.settings);
           operation.token = token;
         },
         () => this.ensureEntryActive(operation),
@@ -562,6 +573,8 @@ export class TradeEngine {
         });
         operation.error = error.message;
         this.store.saveOperation(operation);
+        if (error.message.startsWith('Robinhood submission outcome is uncertain'))
+          this.store.notify(`submission-uncertain:${operation.id}`, error.message);
         if (this.timer && !this.stopped && !this.transactionTimers.has(operation.chain)) {
           const timer = setTimeout(() => {
             this.transactionTimers.delete(operation.chain);
@@ -621,7 +634,7 @@ export class TradeEngine {
       });
       this.store.failOperation(
         operation,
-        safeError(error),
+        retryFailureReason(error),
         error instanceof ReviewRequired || operation.swapHash !== null,
       );
     }
@@ -629,6 +642,10 @@ export class TradeEngine {
   private ensureEntryActive(operation: Operation): void {
     this.ensureTradingAllowed();
     if (operation.kind !== 'buy') return;
+    if (
+      this.store.hasPurchased(operation.chain, operation.address, operation.signal?.channelId ?? '')
+    )
+      throw new TradeRejected('Token was already purchased for this channel');
     if (this.stopped) throw new TradeRejected('Bot is shutting down before swap submission');
     if (operation.signal?.sourceId) {
       const source = this.store.callChannel(operation.signal.sourceId);

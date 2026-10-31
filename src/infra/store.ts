@@ -41,7 +41,7 @@ export class Store {
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 6)
+    if (Number(version?.user_version ?? 0) > 7)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -57,6 +57,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, chain TEXT NOT NULL, address TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, payload TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations (chain) WHERE status IN ('active', 'review');
       CREATE TABLE IF NOT EXISTS token_entries (chain TEXT NOT NULL, address TEXT NOT NULL, operation_id TEXT NOT NULL, bought INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chain, address));
+      CREATE TABLE IF NOT EXISTS purchased_tokens (channel_id TEXT NOT NULL, chain TEXT NOT NULL, address TEXT NOT NULL, operation_id TEXT NOT NULL, PRIMARY KEY (channel_id, chain, address));
       CREATE TABLE IF NOT EXISTS token_exits (chain TEXT NOT NULL, address TEXT NOT NULL, closed_at INTEGER NOT NULL, position_id TEXT NOT NULL, PRIMARY KEY (chain, address));
       CREATE TABLE IF NOT EXISTS call_channels (id TEXT PRIMARY KEY, channel_id TEXT UNIQUE, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE NOT NULL, text TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
@@ -82,9 +83,18 @@ export class Store {
       );
       if (Number(version?.user_version ?? 0) < 5) this.restoreEntryLinks();
       if (Number(version?.user_version ?? 0) < 6) this.restoreChannelRules();
+      if (Number(version?.user_version ?? 0) < 7)
+        this.db.exec(`
+          INSERT OR IGNORE INTO purchased_tokens (channel_id,chain,address,operation_id)
+          SELECT COALESCE(json_extract(payload, '$.signal.channelId'), ''), chain,
+            CASE WHEN chain = 'robinhood' THEN lower(address) ELSE address END, id
+          FROM operations
+          WHERE status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy'
+          ORDER BY created_at;
+        `);
       this.restoreSolanaEntryPrices();
       this.restorePnlFills();
-      this.db.exec('PRAGMA user_version = 6');
+      this.db.exec('PRAGMA user_version = 7');
     });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));
@@ -347,6 +357,8 @@ export class Store {
         return 'Entries for this channel and chain are disabled';
       if (signal.date < channel.activatedAt) return 'Call predates channel activation';
     }
+    if (this.hasPurchased(signal.chain, signal.address, signal.channelId))
+      return 'Token was already purchased for this channel';
     if (this.hasEntry(signal.chain, signal.address))
       return 'Token is already purchased or reserved';
     const closedAt = this.lastExit(signal.chain, signal.address);
@@ -603,6 +615,15 @@ export class Store {
         .get(chain, normalizeAddress(chain, address), chain, normalizeAddress(chain, address)),
     );
   }
+  hasPurchased(chain: Chain, address: string, channelId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          'SELECT 1 FROM purchased_tokens WHERE channel_id = ? AND chain = ? AND address = ?',
+        )
+        .get(channelId, chain, normalizeAddress(chain, address)),
+    );
+  }
   activeOperation(chain: Chain): Operation | null {
     return decodeOperation(
       this.db
@@ -691,6 +712,11 @@ export class Store {
         this.activeOperation(operation.chain) ||
         (operation.kind === 'buy' &&
           (this.hasEntry(operation.chain, operation.address) ||
+            this.hasPurchased(
+              operation.chain,
+              operation.address,
+              operation.signal?.channelId ?? '',
+            ) ||
             (operation.signal && this.entryRejection(operation.signal))))
       )
         return false;
@@ -717,6 +743,16 @@ export class Store {
       operation.status = 'confirmed';
       this.saveOperation(operation);
       this.savePosition(position);
+      this.db
+        .prepare(
+          'INSERT OR IGNORE INTO purchased_tokens (channel_id,chain,address,operation_id) VALUES (?,?,?,?)',
+        )
+        .run(
+          operation.signal?.channelId ?? '',
+          operation.chain,
+          normalizeAddress(operation.chain, operation.address),
+          operation.id,
+        );
       this.savePnlFill(pnlFill(operation, position, result, position.openedAt));
       this.db
         .prepare(

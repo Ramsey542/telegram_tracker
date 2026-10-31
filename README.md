@@ -173,7 +173,9 @@ Jupiter's quoted platform fees apply and the selected fee fields are logged. Qui
 
 ## Robinhood execution
 
-Robinhood Chain uses its own ETH wallet and QuickNode RPC. Uniswap supplies the swap route. Buys wrap ETH to WETH as needed; sales unwrap the resulting WETH back to ETH. Allowance, wrapping, swap and unwrapping steps are persisted and reconciled.
+Robinhood Chain uses its own ETH wallet and QuickNode RPC. Uniswap supplies the swap route. Classic buys require WETH, ETH for gas and token approval prepared in Wallets; they do not check balances or allowances, wrap ETH, or submit approvals automatically. Protected UniswapX buys can wrap a shortage when Wrap my ETH is enabled. Sales unwrap the resulting WETH back to ETH. Signed transactions are persisted and reconciled.
+
+Classic buys request the Uniswap quote, enabled GoPlus checks and the pending wallet nonce in parallel. Token symbol and decimals must be present in the quote route; the swap response must provide valid gas limit and EIP-1559 fee fields. Missing data, failed simulation or insufficient funds rejects the buy without alternative metadata providers or RPC gas estimation. DEX Screener is queried only when a market-cap or liquidity filter requires it, in parallel with GoPlus. The normal prepared-wallet path uses two Uniswap API requests, one GoPlus request when enabled, and four RPC requests (nonce, broadcast, receipt and a fresh confirmation height), excluding startup verification, GoPlus authentication and additional receipt polls. Unknown submission outcomes are reported and reconciled from the saved transaction without automatically rebroadcasting a Classic buy.
 
 With UniswapX protection enabled, an eligible `DUTCH_V3` route is required. The bot does not silently fall back to a public AMM route. Direct routes are available when that requirement is disabled. This execution path has different RPC counts from the Solana diagram.
 
@@ -186,7 +188,7 @@ With UniswapX protection enabled, an eligible `DUTCH_V3` route is required. The 
 - `wallet-master.key`: local encryption key when `WALLET_ENCRYPTION_KEY` is not configured.
 - `telegram.session.enc.json`: encrypted Telegram user session.
 
-Messages are keyed by channel ID plus message ID. Token reservations have a unique chain-plus-contract key. A reservation is created before submission, becomes purchased after confirmation, and remains after selling the position. A definitively failed unpurchased buy releases it. An uncertain outcome retains it to prevent duplicate spending.
+Messages are keyed by channel ID plus message ID. Token reservations have a unique chain-plus-contract key and prevent duplicate spending while a buy is pending or a position remains open. Every confirmed purchase also creates a permanent record keyed by Telegram channel ID, chain and token address. That channel can never buy the token again, even after a full sale, a restart, or removing and re-adding the channel. Existing confirmed buys are included when the database is upgraded. A definitively failed unpurchased buy releases its reservation without creating a purchase record; an uncertain outcome retains the reservation until reconciled.
 
 Keep the database, encrypted wallet files and matching encryption key together when backing up or moving the installation. Stop the app before making a simple file-copy backup. The app refuses to generate replacement wallets when an existing trading database has lost its wallet file. Credentials, wallets, the database and logs are excluded from Git. Wallet withdrawal and private-key export are not exposed through the Telegram bot.
 

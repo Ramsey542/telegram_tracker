@@ -62,11 +62,12 @@ export class MarketData {
     });
     return token;
   }
-  async robinhood(address: string) {
+  async robinhood(address: string, retry = true) {
     const pairs = await this.http.json(
       'DEX Screener',
       `https://api.dexscreener.com/token-pairs/v1/robinhood/${address}`,
       z.array(pairSchema),
+      { retry },
     );
     const matching = pairs.filter(
       (pair) =>

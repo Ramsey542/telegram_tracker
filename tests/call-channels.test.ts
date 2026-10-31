@@ -262,7 +262,7 @@ function holding(id: string): Position {
   };
 }
 
-test('partial sales block duplicates; a full bot exit permits only fresh calls, with independent positions after restart', (t) => {
+test('partial sales block duplicates; a full exit permits only a different channel first purchase', (t) => {
   const db = database(t);
   let now = 10_000;
   t.mock.method(Date, 'now', () => now);
@@ -311,6 +311,11 @@ test('partial sales block duplicates; a full bot exit permits only fresh calls, 
     nativeUsd: 100,
   });
   assert.equal(db.store.hasEntry('solana', mint), false);
+  assert.equal(db.store.hasPurchased('solana', mint, general.channelId!), true);
+  assert.match(
+    db.store.entryRejection(signal(now + 1, general, 10))!,
+    /already purchased for this channel/,
+  );
   assert.match(db.store.entryRejection(staleCall)!, /posted after/);
   assert.equal(db.store.claim(trade('stale-buy', staleCall)), false);
   now = 40_000;
@@ -339,6 +344,8 @@ test('partial sales block duplicates; a full bot exit permits only fresh calls, 
   );
   assert.equal(db.store.positions().length, 1);
   assert.equal(db.store.hasEntry('solana', mint), true);
+  assert.equal(db.store.hasPurchased('solana', mint, general.channelId!), true);
+  assert.equal(db.store.hasPurchased('solana', mint, spy.channelId!), true);
   assert.equal(
     db.store.recordPost({ ...post(mint), revision: 20 }, { ...firstCall, date: now }, null),
     false,
@@ -407,7 +414,149 @@ test('migration links legacy entries and releases only a confirmed full bot sale
   assert.equal(db.store.position(position.id)?.entryOperationId, buy.id);
   assert.equal(db.store.hasEntry('solana', mint), false);
   assert.ok(db.store.lastExit('solana', mint));
+  assert.equal(db.store.hasPurchased('solana', mint, ''), true);
 });
+
+for (const [chain, address] of [
+  ['solana', mint],
+  ['robinhood', evm],
+] as const) {
+  test(`${chain} purchases permanently block the same channel across sales, restarts and channel re-adds`, async (t) => {
+    t.mock.method(globalThis, 'fetch', async () =>
+      assert.fail('Duplicate checks must remain local'),
+    );
+    const db = database(t);
+    let now = 10_000;
+    t.mock.method(Date, 'now', () => now);
+    const source = channel();
+    const other = channel('other');
+    db.store.saveCallChannel(source);
+    db.store.saveCallChannel(other);
+    const call = (from = source, id = 1): CallSignal => ({
+      ...signal(now, from, id),
+      chain,
+      address,
+    });
+    const operation = (
+      id: string,
+      entry: CallSignal | null,
+      kind: 'buy' | 'sell' = 'buy',
+    ): Operation => ({
+      ...trade(id, entry, kind),
+      chain,
+      address,
+      token: { ...trade(id, entry, kind).token, chain, address },
+    });
+    const buy = operation('permanent-buy', call());
+    const position = { ...holding('permanent-position'), chain, address };
+    assert.equal(db.store.claim(buy), true);
+    db.store.completeBuy(buy, position, {
+      tokenRaw: '100',
+      nativeRaw: '1000100',
+      swapNativeRaw: '1000000',
+      feeNativeRaw: '100',
+      signature: buy.id,
+      nativeUsd: 100,
+    });
+    assert.equal(db.store.hasPurchased(chain, address, source.channelId!), true);
+    assert.equal(db.store.hasPurchased(chain, address, other.channelId!), false);
+    assert.equal(db.store.claim(operation('duplicate-open', call(source, 2))), false);
+    for (const id of ['partial-sale', 'full-sale']) {
+      now += 10_000;
+      const sell = operation(id, null, 'sell');
+      sell.positionId = position.id;
+      assert.equal(db.store.claim(sell), true);
+      db.store.completeSell(sell, position, {
+        tokenRaw: '50',
+        nativeRaw: '599900',
+        swapNativeRaw: '600000',
+        feeNativeRaw: '100',
+        signature: sell.id,
+        nativeUsd: 100,
+      });
+      assert.equal(db.store.hasPurchased(chain, address, source.channelId!), true);
+      assert.equal(db.store.claim(operation(`duplicate-${id}`, call(source, 3))), false);
+    }
+    db.restart();
+    now += 10_000;
+    assert.equal(db.store.hasEntry(chain, address), false);
+    assert.equal(db.store.hasPurchased(chain, address, source.channelId!), true);
+    const repeated = call(source, 4);
+    if (chain === 'robinhood') repeated.address = address.toUpperCase().replace('0X', '0x');
+    db.store.recordPost({ ...post(address), date: now, messageId: 4 }, repeated, null);
+    const engine = new TradeEngine(
+      { listenOnly: false, maxSignalAgeMs: 120_000 } as Config,
+      db.store,
+      {} as TradeEngine['adapters'],
+      {} as RiskFilters,
+    );
+    await engine.tick(true);
+    assert.equal(db.store.signalHistory()[0]?.state, 'skipped');
+    assert.match(db.store.signalHistory()[0]?.reason ?? '', /already purchased for this channel/);
+
+    db.store.removeCallChannel(source.id);
+    const readded = { ...channel('re-added'), channelId: source.channelId };
+    db.store.saveCallChannel(readded);
+    assert.match(db.store.entryRejection(call(readded, 5))!, /already purchased for this channel/);
+    assert.equal(db.store.claim(operation('duplicate-readded', call(readded, 5))), false);
+
+    const firstOtherBuy = operation('first-other-buy', call(other, 6));
+    assert.equal(db.store.claim(firstOtherBuy), true);
+    db.store.failOperation(firstOtherBuy, 'Simulation rejected before buying', false);
+    assert.equal(db.store.hasPurchased(chain, address, other.channelId!), false);
+    assert.equal(db.store.claim(operation('retry-other-buy', call(other, 7))), true);
+  });
+
+  test(`${chain} upgrade backfills permanent channel history from previously sold confirmed buys`, (t) => {
+    const db = database(t);
+    const source = channel();
+    db.store.saveCallChannel(source);
+    const originalAddress =
+      chain === 'robinhood' ? address.toUpperCase().replace('0X', '0x') : address;
+    const original = { ...signal(10_000, source), chain, address: originalAddress };
+    const buy = { ...trade('historical-buy', original), chain, address: originalAddress };
+    const position = { ...holding('historical-position'), chain, address: originalAddress };
+    assert.equal(db.store.claim(buy), true);
+    db.store.completeBuy(buy, position, {
+      tokenRaw: '100',
+      nativeRaw: '1000100',
+      swapNativeRaw: '1000000',
+      feeNativeRaw: '100',
+      signature: buy.id,
+      nativeUsd: 100,
+    });
+    const sell = {
+      ...trade('historical-sale', null, 'sell'),
+      chain,
+      address: originalAddress,
+      positionId: position.id,
+    };
+    assert.equal(db.store.claim(sell), true);
+    db.store.completeSell(sell, position, {
+      tokenRaw: '100',
+      nativeRaw: '1199900',
+      swapNativeRaw: '1200000',
+      feeNativeRaw: '100',
+      signature: sell.id,
+      nativeUsd: 100,
+    });
+    db.restart(() => {
+      const sql = new DatabaseSync(join(db.directory, 'tracker.sqlite'));
+      sql.exec('DROP TABLE purchased_tokens; PRAGMA user_version = 6;');
+      sql.close();
+    });
+    assert.equal(db.store.hasEntry(chain, address), false);
+    assert.equal(db.store.hasPurchased(chain, address, source.channelId!), true);
+    const repeated = { ...signal(Date.now() + 1, source, 2), chain, address };
+    assert.match(db.store.entryRejection(repeated)!, /already purchased for this channel/);
+    assert.equal(
+      db.store.claim({ ...trade('historical-duplicate', repeated), chain, address }),
+      false,
+    );
+    db.restart();
+    assert.equal(db.store.hasPurchased(chain, address, source.channelId!), true);
+  });
+}
 
 test('channel registry keeps cursors separate, refuses groups and records pending private access', async (t) => {
   const db = database(t);

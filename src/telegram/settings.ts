@@ -92,10 +92,10 @@ export const editableFields: Record<string, EditableField> = {
   },
   evmPriorityFee: {
     label: '⚡ Priority tip (gwei)',
-    hint: 'Optional priority tip in gwei per gas for wallet-sent transactions. Enter 0 for no tip, or auto/off to use QuickNode estimates. UniswapX fillers choose the gas for their fill transaction; this setting applies to your approvals, wrapping, direct swaps and unwrapping.',
+    hint: 'Optional priority tip in gwei per gas for wallet-sent transactions. Enter 0 for no tip, or auto/off for estimates. Classic buys use Uniswap gas fields; other wallet transactions use QuickNode estimates. UniswapX fillers choose the gas for their fill transaction.',
     group: 'execution',
     chains: ['robinhood'],
-    emptyLabel: 'Auto (QuickNode)',
+    emptyLabel: 'Auto',
     value: (s) => s.priorityFee,
     set: (s, v) => {
       s.priorityFee = ['auto', 'off'].includes(v.toLowerCase()) ? null : v;

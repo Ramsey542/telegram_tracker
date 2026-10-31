@@ -23,7 +23,11 @@ export class RiskFilters {
   ) {
     this.goplus = new GoPlusClient(config, http);
   }
-  async check(token: TokenInfo, settings: ChainSettings): Promise<void> {
+  async check(
+    token: TokenInfo,
+    settings: ChainSettings,
+    currentToken?: Promise<TokenInfo>,
+  ): Promise<void> {
     log.info('risk.check_started', {
       chain: token.chain,
       token: token.address,
@@ -33,7 +37,14 @@ export class RiskFilters {
       filters: settings.filters,
     });
     try {
-      await this.checkCurrent(token, settings);
+      if (currentToken && token.chain === 'robinhood') {
+        const [current] = await Promise.all([
+          currentToken,
+          this.robinhood(token.address, settings),
+        ]);
+        token = current;
+        this.checkMarket(token, settings);
+      } else await this.checkCurrent(token, settings);
       log.info('risk.check_passed', {
         chain: token.chain,
         token: token.address,
@@ -52,6 +63,11 @@ export class RiskFilters {
     }
   }
   private async checkCurrent(token: TokenInfo, settings: ChainSettings): Promise<void> {
+    this.checkMarket(token, settings);
+    if (token.chain === 'solana') await this.solana(token, settings);
+    else await this.robinhood(token.address, settings);
+  }
+  private checkMarket(token: TokenInfo, settings: ChainSettings): void {
     const filters = settings.filters;
     if (Date.now() - token.fetchedAt > 30_000) throw new Error('Entry market data is stale');
     if (filters.marketCapEnabled) {
@@ -67,8 +83,6 @@ export class RiskFilters {
       (token.liquidityUsd === null || token.liquidityUsd < filters.minLiquidityUsd)
     )
       throw new Error('Liquidity is unavailable or below the minimum');
-    if (token.chain === 'solana') await this.solana(token, settings);
-    else await this.robinhood(token.address, settings);
   }
   private async solana(token: TokenInfo, settings: ChainSettings): Promise<void> {
     const address = token.address;

@@ -6,7 +6,7 @@ export interface ChainAdapter {
   readiness(settings: ChainSettings): string[];
   verifyNetwork(): Promise<void>;
   balance(): Promise<{ nativeRaw: string; wrappedRaw: string | null }>;
-  tokenInfo(address: string): Promise<TokenInfo>;
+  tokenInfo(address: string, settings?: ChainSettings): Promise<TokenInfo>;
   quoteSell(address: string, amountRaw: string, settings: ChainSettings): Promise<Quote>;
   advance(
     operation: Operation,

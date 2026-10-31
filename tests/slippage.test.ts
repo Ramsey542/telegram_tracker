@@ -181,6 +181,7 @@ for (const kind of ['buy', 'sell'] as const) {
     const http = new HttpClient(1000);
     const adapter = new RobinhoodAdapter(config, wallets, http, new MarketData(config, http));
     const operation = trade(kind);
+    operation.wrapAmountRaw = '0';
     await assert.rejects(
       kind === 'buy'
         ? adapter.advance(

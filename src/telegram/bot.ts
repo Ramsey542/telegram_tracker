@@ -678,14 +678,14 @@ export class ControlBot {
         italic(
           chain === 'solana'
             ? 'Jupiter builds and submits Solana buys and sells through its managed execution service. QuickNode reads receipts and reconciles pending trades. QuickNode dashboard MEV settings do not apply to Jupiter submissions.'
-            : 'Robinhood buys spend WETH. Wrap my ETH, under Buy size, can wrap a shortage before buying; this adds a transaction. Protected swaps require UniswapX. Sale proceeds are unwrapped back to ETH.',
+            : 'Classic Robinhood buys require WETH, ETH for gas and token approval prepared in Wallets. They fail without automatic wrapping or approval. Wrap my ETH applies to protected UniswapX buys. Sale proceeds are unwrapped back to ETH.',
         ),
       );
     if (group === 'buy' && chain === 'robinhood')
       lines.push(
         '',
         italic(
-          'Buys use WETH directly. Wrap my ETH allows one WETH balance read and wraps only the shortage, adding a transaction and fee. With this switch off, insufficient WETH fails the buy and disables new Robinhood buys for this channel. Prepare WETH upfront in Wallets.',
+          'Classic buys require WETH and approval prepared in Wallets; Wrap my ETH does not apply to Classic buys. Protected UniswapX buys can use this switch to wrap a WETH shortage, adding a transaction and fee. Insufficient funds disables new Robinhood buys for this channel.',
         ),
       );
     await this.display(ctx, joinMessages(lines), keyboard.text('⬅️ Back', `chain:${chain}`));
@@ -718,7 +718,7 @@ export class ControlBot {
     }
     lines.push(
       italic(
-        'Robinhood buys spend WETH. ETH pays network fees. Use Wrap Robinhood ETH to prepare WETH; Wrap my ETH in channel buy settings allows automatic top-ups when needed.',
+        'Robinhood buys spend WETH. ETH pays network fees. Use Wrap Robinhood ETH to prepare WETH and its token approval. Classic buys require this preparation. Wrap my ETH allows automatic top-ups for protected UniswapX buys.',
       ),
       '',
     );

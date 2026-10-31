@@ -9,6 +9,7 @@ import {
   erc20Abi,
   keccak256,
   zeroAddress,
+  RpcRequestError,
   type Address,
   type Hex,
   type TransactionReceipt,
@@ -31,6 +32,7 @@ import {
   type Quote,
   type SwapResult,
   type TokenInfo,
+  parseAmount,
 } from '../domain.js';
 import type { ChainAdapter } from './types.js';
 import { robinhoodGasFees } from './fees.js';
@@ -164,7 +166,32 @@ const transactionSchema = z.object({
     .regex(/^(?:\d+|0x[0-9a-fA-F]+)$/)
     .transform((value) => BigInt(value).toString()),
   chainId: z.number(),
+  gasLimit: z.unknown().optional(),
+  maxFeePerGas: z.unknown().optional(),
+  maxPriorityFeePerGas: z.unknown().optional(),
 });
+const strictSwapSchema = transactionSchema
+  .extend({
+    gasLimit: raw.refine((value) => BigInt(value) > 0n),
+    maxFeePerGas: raw.refine((value) => BigInt(value) > 0n),
+    maxPriorityFeePerGas: raw,
+  })
+  .refine((swap) => BigInt(swap.maxFeePerGas) >= BigInt(swap.maxPriorityFeePerGas));
+const routeTokenSchema = z.object({
+  address: addressSchema,
+  chainId: z.number().int(),
+  symbol: z.string().trim().min(1).max(64),
+  decimals: z
+    .union([raw, z.number().int()])
+    .transform(Number)
+    .pipe(z.number().int().min(0).max(36)),
+});
+type EvmParameters = {
+  gas: bigint;
+  nonce: number;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+};
 const same = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
 function signingValue(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
@@ -315,7 +342,7 @@ export class RobinhoodAdapter implements ChainAdapter {
     ]);
     return { nativeRaw: native.toString(), wrappedRaw: wrapped.toString() };
   }
-  async tokenInfo(address: string): Promise<TokenInfo> {
+  async tokenInfo(address: string, settings?: ChainSettings): Promise<TokenInfo> {
     if (
       !/^0x[0-9a-fA-F]{40}$/.test(address) ||
       same(address, ROBINHOOD_WETH) ||
@@ -323,9 +350,12 @@ export class RobinhoodAdapter implements ChainAdapter {
     )
       throw new TradeRejected('Invalid project token address');
     const tokenAddress = address as Address;
+    const classicBuy = settings !== undefined && !settings.mevProtection;
+    const needsMarket =
+      !classicBuy || settings.filters.marketCapEnabled || settings.filters.minLiquidityUsd !== null;
     const [decimals, metadata] = await Promise.all([
-      this.tokenDecimals(tokenAddress),
-      this.market.robinhood(address),
+      classicBuy ? Promise.resolve(null) : this.tokenDecimals(tokenAddress),
+      needsMarket ? this.market.robinhood(address, !classicBuy) : Promise.resolve(null),
     ]);
     return {
       chain: this.chain,
@@ -340,6 +370,40 @@ export class RobinhoodAdapter implements ChainAdapter {
           : null,
       fetchedAt: Date.now(),
     };
+  }
+  private classicBuyMetadata(
+    response: ApiQuote,
+    address: string,
+  ): { symbol: string; decimals: number } {
+    const route = z
+      .object({ route: z.array(z.array(z.object({ tokenOut: z.unknown() }))).min(1) })
+      .safeParse(response.quote);
+    if (!route.success)
+      throw new TradeRejected(
+        'Uniswap quote is missing output token metadata (symbol and decimals)',
+      );
+    const tokens = route.data.route.flat().flatMap(({ tokenOut }) => {
+      if (
+        !tokenOut ||
+        typeof tokenOut !== 'object' ||
+        !('address' in tokenOut) ||
+        typeof tokenOut.address !== 'string' ||
+        !same(tokenOut.address, address)
+      )
+        return [];
+      const parsed = routeTokenSchema.safeParse(tokenOut);
+      if (!parsed.success || parsed.data.chainId !== ROBINHOOD_CHAIN_ID)
+        throw new TradeRejected('Uniswap quote has invalid output token metadata');
+      return [parsed.data];
+    });
+    const token = tokens[0];
+    if (!token)
+      throw new TradeRejected(
+        'Uniswap quote is missing output token metadata (symbol and decimals)',
+      );
+    if (tokens.some((item) => item.decimals !== token.decimals || item.symbol !== token.symbol))
+      throw new TradeRejected('Uniswap quote has conflicting output token metadata');
+    return { symbol: token.symbol, decimals: token.decimals };
   }
   private async tokenDecimals(address: Address): Promise<number> {
     const key = address.toLowerCase();
@@ -515,6 +579,7 @@ export class RobinhoodAdapter implements ChainAdapter {
       throw new TradeRejected('LISTEN_ONLY=true: Robinhood execution is blocked');
     this.beforeSpend = beforeSpend;
     await this.verifyNetwork();
+    const classicBuy = operation.kind === 'buy' && !operation.settings.mevProtection;
     if (operation.kind === 'withdraw') {
       if (!operation.withdrawal) throw new TradeRejected('Withdrawal destination is missing');
       const recipient = withdrawalAddress(
@@ -570,7 +635,7 @@ export class RobinhoodAdapter implements ChainAdapter {
         nativeUsd: null,
       };
     }
-    if (operation.kind === 'buy' && operation.wrapAmountRaw === undefined) {
+    if (operation.kind === 'buy' && !classicBuy && operation.wrapAmountRaw === undefined) {
       let shortfall = operation.steps.some((step) => step.type === 'evm' && step.key === 'wrap')
         ? BigInt(operation.amountRaw)
         : 0n;
@@ -598,13 +663,18 @@ export class RobinhoodAdapter implements ChainAdapter {
       else if (pending?.type === 'order')
         swapReceipt = await this.orderStep(operation, pending, persist);
       else {
+        let swapNonce: number | undefined;
         if (!operation.preparedQuote) {
-          const [quoted] = await Promise.all([
+          const [quoted, , nonce] = await Promise.all([
             this.fetchQuote(input, output, operation.amountRaw, operation.settings).then(
               (response) => ({ response, receivedAt: Date.now() }),
             ),
             beforeSwap(),
+            classicBuy
+              ? this.rpc().getTransactionCount({ address: this.address, blockTag: 'pending' })
+              : Promise.resolve(undefined),
           ]);
+          swapNonce = nonce;
           operation.preparedQuote = {
             provider: 'uniswap',
             response: quoted.response,
@@ -614,7 +684,15 @@ export class RobinhoodAdapter implements ChainAdapter {
             priorityFee: operation.settings.priorityFee,
           };
           persist();
-        } else if (operation.kind === 'buy') await beforeSwap();
+        } else if (operation.kind === 'buy') {
+          const [, nonce] = await Promise.all([
+            beforeSwap(),
+            classicBuy
+              ? this.rpc().getTransactionCount({ address: this.address, blockTag: 'pending' })
+              : Promise.resolve(undefined),
+          ]);
+          swapNonce = nonce;
+        }
         const prepared = operation.preparedQuote;
         if (
           prepared.provider !== 'uniswap' ||
@@ -626,6 +704,17 @@ export class RobinhoodAdapter implements ChainAdapter {
             'The original Uniswap quote expired or no longer matches the trade',
           );
         const response = quoteResponseSchema.parse(prepared.response);
+        if (classicBuy) {
+          if (response.routing !== 'CLASSIC')
+            throw new TradeRejected('Classic buys require a Uniswap CLASSIC quote');
+          const failures = response.quote.txFailureReasons;
+          if (Array.isArray(failures) && failures.length > 0)
+            throw new TradeRejected(`Uniswap quote simulation failed: ${failures.join(', ')}`);
+          operation.token = {
+            ...operation.token,
+            ...this.classicBuyMetadata(response, operation.address),
+          };
+        }
         const quote = this.validateQuote(
           response,
           input,
@@ -655,7 +744,11 @@ export class RobinhoodAdapter implements ChainAdapter {
           receivedAt: prepared.receivedAt,
         };
         persist();
-        if (operation.kind === 'buy' && BigInt(operation.wrapAmountRaw ?? operation.amountRaw) > 0n)
+        if (
+          operation.kind === 'buy' &&
+          !classicBuy &&
+          BigInt(operation.wrapAmountRaw ?? operation.amountRaw) > 0n
+        )
           await this.evmStep(
             operation,
             'wrap',
@@ -664,9 +757,21 @@ export class RobinhoodAdapter implements ChainAdapter {
             BigInt(operation.wrapAmountRaw ?? operation.amountRaw),
             persist,
           );
-        await this.approveToken(operation, input, persist);
-        if (!operation.settings.mevProtection && response.permitData === undefined)
-          await this.approveRouter(operation, input, persist);
+        if (classicBuy) {
+          // Reconcile preparation transactions saved by older versions without creating new ones.
+          for (const step of operation.steps)
+            if (step.type === 'evm' && step.key !== 'swap')
+              await this.evmStep(operation, step.key, input, '0x', 0n, persist);
+          if (operation.steps.length > 0)
+            swapNonce = await this.rpc().getTransactionCount({
+              address: this.address,
+              blockTag: 'pending',
+            });
+        } else {
+          await this.approveToken(operation, input, persist);
+          if (!operation.settings.mevProtection && response.permitData === undefined)
+            await this.approveRouter(operation, input, persist);
+        }
         if (Date.now() - prepared.receivedAt > 30_000)
           throw new TradeRejected(
             'The original Uniswap quote expired during transaction preparation',
@@ -719,6 +824,19 @@ export class RobinhoodAdapter implements ChainAdapter {
                 ...permit,
                 simulateTransaction: true,
                 refreshGasPrice: true,
+                ...(classicBuy && operation.settings.priorityFee !== null
+                  ? {
+                      urgency: {
+                        level: 'normal',
+                        overrides: {
+                          maxPriorityFeePerGas: parseAmount(
+                            operation.settings.priorityFee,
+                            9,
+                          ).toString(),
+                        },
+                      },
+                    }
+                  : {}),
                 deadline: Math.floor(Date.now() / 1000) + 120,
               },
             },
@@ -733,6 +851,35 @@ export class RobinhoodAdapter implements ChainAdapter {
               'Uniswap swap transaction has an unexpected destination or value',
             );
           validateClassicCalldata(result.swap.data, this.address);
+          let parameters: EvmParameters | undefined;
+          if (classicBuy) {
+            const parsed = strictSwapSchema.safeParse(result.swap);
+            if (!parsed.success)
+              throw new TradeRejected(
+                'Uniswap swap is missing or has invalid gas fields (gasLimit, maxFeePerGas, maxPriorityFeePerGas)',
+              );
+            const swap = parsed.data;
+            if (swapNonce === undefined)
+              throw new TradeRejected('The pending transaction nonce is unavailable');
+            const priority =
+              operation.settings.priorityFee === null
+                ? BigInt(swap.maxPriorityFeePerGas)
+                : parseAmount(operation.settings.priorityFee, 9);
+            if (BigInt(swap.maxFeePerGas) < priority)
+              throw new TradeRejected(
+                'Uniswap maximum gas fee is below the configured priority fee',
+              );
+            if (Date.now() - prepared.receivedAt > 30_000)
+              throw new TradeRejected(
+                'The original Uniswap quote expired during swap construction',
+              );
+            parameters = {
+              gas: BigInt(swap.gasLimit),
+              nonce: swapNonce,
+              maxFeePerGas: BigInt(swap.maxFeePerGas),
+              maxPriorityFeePerGas: priority,
+            };
+          }
           swapReceipt = await this.evmStep(
             operation,
             'swap',
@@ -740,6 +887,7 @@ export class RobinhoodAdapter implements ChainAdapter {
             result.swap.data as Hex,
             0n,
             persist,
+            parameters,
           );
         }
       }
@@ -898,32 +1046,45 @@ export class RobinhoodAdapter implements ChainAdapter {
     data: Hex,
     value: bigint,
     persist: () => void,
+    parameters?: EvmParameters,
   ): Promise<TransactionReceipt> {
+    const classicBuySwap =
+      operation.kind === 'buy' && !operation.settings.mevProtection && key === 'swap';
     let step = operation.steps.find(
       (candidate): candidate is EvmStep => candidate.type === 'evm' && candidate.key === key,
     );
     const created = !step;
     if (!step) {
-      const [block, automatic, estimatedGas, nonce] = await Promise.all([
-        this.rpc().getBlock(),
-        operation.settings.priorityFee == null
-          ? this.rpc().estimateFeesPerGas({ type: 'eip1559' })
-          : Promise.resolve(null),
-        this.rpc().estimateGas({ account: this.address, to, data, value }),
-        this.rpc().getTransactionCount({ address: this.address, blockTag: 'pending' }),
-      ]);
-      if (block.baseFeePerGas === null)
-        throw new TradeRejected('Robinhood base fee is unavailable');
-      const { maxFeePerGas, maxPriorityFeePerGas: priority } = robinhoodGasFees(
-        block.baseFeePerGas,
-        operation.settings.priorityFee,
-        automatic,
-      );
-      const gas = (estimatedGas * 120n) / 100n;
+      if (classicBuySwap && !parameters)
+        throw new TradeRejected('Classic buy requires Uniswap gas fields and a pending nonce');
+      if (!parameters) {
+        const [block, automatic, estimatedGas, nonce] = await Promise.all([
+          this.rpc().getBlock(),
+          operation.settings.priorityFee == null
+            ? this.rpc().estimateFeesPerGas({ type: 'eip1559' })
+            : Promise.resolve(null),
+          this.rpc().estimateGas({ account: this.address, to, data, value }),
+          this.rpc().getTransactionCount({ address: this.address, blockTag: 'pending' }),
+        ]);
+        if (block.baseFeePerGas === null)
+          throw new TradeRejected('Robinhood base fee is unavailable');
+        const fees = robinhoodGasFees(
+          block.baseFeePerGas,
+          operation.settings.priorityFee,
+          automatic,
+        );
+        parameters = { gas: (estimatedGas * 120n) / 100n, nonce, ...fees };
+      }
+      const { gas, nonce, maxFeePerGas, maxPriorityFeePerGas: priority } = parameters;
       log.info('transaction.fee_selected', {
         operationId: operation.id,
         step: key,
-        source: operation.settings.priorityFee == null ? 'rpc_estimate' : 'user_override',
+        source:
+          operation.settings.priorityFee != null
+            ? 'user_override'
+            : classicBuySwap
+              ? 'uniswap'
+              : 'rpc_estimate',
         priorityFeeGwei: operation.settings.priorityFee ?? null,
         maxPriorityFeePerGasWei: priority,
         maxFeePerGasWei: maxFeePerGas,
@@ -960,20 +1121,39 @@ export class RobinhoodAdapter implements ChainAdapter {
       try {
         receipt = await this.rpc().getTransactionReceipt({ hash: step.hash as Hex });
       } catch (error) {
-        if (!(error instanceof Error) || error.name !== 'TransactionReceiptNotFoundError')
+        if (!(error instanceof Error) || error.name !== 'TransactionReceiptNotFoundError') {
+          if (classicBuySwap)
+            throw new PendingTrade(
+              'Robinhood receipt lookup failed; the saved swap will be reconciled',
+            );
           throw error;
+        }
       }
     if (receipt) {
       if (receipt.status !== 'success')
         throw new TradeRejected(`Robinhood transaction reverted (${key})`);
-      if ((await this.rpc().getBlockNumber()) < receipt.blockNumber + 1n)
+      let blockNumber: bigint;
+      try {
+        blockNumber = await this.rpc().getBlockNumber({ cacheTime: 0 });
+      } catch (error) {
+        if (classicBuySwap)
+          throw new PendingTrade(
+            'Robinhood confirmation lookup failed; the saved swap will be reconciled',
+          );
+        throw error;
+      }
+      if (blockNumber < receipt.blockNumber + 1n)
         throw new PendingTrade('Waiting for Robinhood confirmations');
       step.gasPaidRaw = (receipt.gasUsed * receipt.effectiveGasPrice).toString();
       persist();
       return receipt;
     }
-    if (step.submittedAt === null || Date.now() - step.submittedAt > 30_000) {
+    if (step.submittedAt === null || (!classicBuySwap && Date.now() - step.submittedAt > 30_000)) {
       if (step.submittedAt === null) this.beforeSpend();
+      if (classicBuySwap) {
+        step.submittedAt = Date.now();
+        persist();
+      }
       try {
         await this.rpc().request({
           method: 'eth_sendRawTransaction',
@@ -981,6 +1161,21 @@ export class RobinhoodAdapter implements ChainAdapter {
         });
       } catch (error) {
         if (insufficientFunds(error)) throw error;
+        if (classicBuySwap) {
+          let cause: unknown = error;
+          for (let depth = 0; depth < 8 && cause instanceof Error; depth++) {
+            if (
+              cause instanceof RpcRequestError &&
+              /intrinsic gas too low|gas required exceeds allowance|max fee per gas less than block base fee|fee cap (?:less than|too low)|max priority fee per gas higher than max fee per gas|exceeds block gas limit|invalid (?:sender|signature|chain id)|transaction type not supported/i.test(
+                cause.details,
+              )
+            )
+              throw new TradeRejected(
+                `Robinhood transaction rejected: ${safeError(new Error(cause.details))}`,
+              );
+            cause = cause.cause;
+          }
+        }
         log.error('transaction.submission_uncertain', error, {
           service: 'QuickNode Robinhood RPC',
           operationId: operation.id,
@@ -1011,7 +1206,7 @@ export class RobinhoodAdapter implements ChainAdapter {
       throw new PendingTrade('Waiting for the swap receipt');
     }
     if (receipt.status !== 'success') throw new TradeRejected('Robinhood swap reverted');
-    if ((await this.rpc().getBlockNumber()) < receipt.blockNumber + 1n)
+    if ((await this.rpc().getBlockNumber({ cacheTime: 0 })) < receipt.blockNumber + 1n)
       throw new PendingTrade('Waiting for Robinhood confirmations');
     return receipt;
   }
