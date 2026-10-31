@@ -4,6 +4,7 @@ import { chains, type Chain } from '../domain.js';
 import { Store } from '../infra/store.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { NativePrices } from '../providers/native-prices.js';
+import { PositionPrices } from '../providers/position-prices.js';
 import { USD_CAPTURE_WINDOW_MS } from './accounting.js';
 
 const log = logger.child({ component: 'trading.pnl' });
@@ -19,6 +20,7 @@ export class PnlTracker {
     private readonly store: Store,
     private readonly adapters: Record<Chain, ChainAdapter>,
     private readonly prices: NativePrices,
+    private readonly referencePrices?: PositionPrices,
   ) {}
 
   get updating(): boolean {
@@ -84,7 +86,13 @@ export class PnlTracker {
     if (!this.requestedQuotes || this.stopped) return;
     this.requestedQuotes = false;
     if (this.config.listenOnly) return;
-    for (const position of this.store.positions()) {
+    const positions = this.store.positions();
+    const referenceQuotes = this.referencePrices
+      ? await this.referencePrices.quotes(
+          positions.filter((p) => !this.store.activeOperation(p.chain)),
+        )
+      : null;
+    for (const position of positions) {
       if (this.stopped) return;
       if (this.store.activeOperation(position.chain)) {
         log.info('pnl.quote_skipped', {
@@ -99,12 +107,15 @@ export class PnlTracker {
         { chain: position.chain, positionId: position.id, token: position.address },
         async () => {
           try {
-            const settings = this.store.settings().chains[position.chain];
-            const quote = await this.adapters[position.chain].quoteSell(
-              position.address,
-              position.remainingTokenRaw,
-              settings,
-            );
+            const settings = this.store.positionSettings(position);
+            const quote = referenceQuotes
+              ? referenceQuotes.get(position.id)
+              : await this.adapters[position.chain].quoteSell(
+                  position.address,
+                  position.remainingTokenRaw,
+                  settings,
+                );
+            if (!quote) throw new Error('Current reference price is missing or stale');
             const nativeUsd = quote.nativeUsd ?? (await this.prices.get(position.chain)).value;
             const current = this.store.position(position.id);
             if (

@@ -155,6 +155,7 @@ export const chainSettingsSchema = z
     jitoTipNative: amount.nullable().default(null),
     // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
     mevProtection: z.boolean().default(true),
+    wrapMyEth: z.boolean().default(false),
     consistency: z
       .object({
         overall: percent.default(30),
@@ -189,11 +190,43 @@ export const settingsSchema = z.object({
 });
 export type Settings = z.infer<typeof settingsSchema>;
 export type ChainSettings = z.infer<typeof chainSettingsSchema>;
+export const channelRulesSchema = z.object({
+  solana: chainSettingsSchema.default(() => chainSettingsSchema.parse({})),
+  robinhood: chainSettingsSchema.default(() => chainSettingsSchema.parse({})),
+});
+export type ChannelRules = z.infer<typeof channelRulesSchema>;
 export type ExitSettings = z.infer<typeof exitSchema>;
 export type TrailRule = z.infer<typeof trailSchema>;
 export type TrailStage = z.infer<typeof trailStageSchema>;
+export type ChannelMode = 'spydefi' | 'general';
+export interface CallChannel {
+  id: string;
+  target: string;
+  channelId: string | null;
+  title: string;
+  username: string | null;
+  mode: ChannelMode;
+  defaultChain: Chain | null;
+  enabled: boolean;
+  activatedAt: number;
+  status: 'unresolved' | 'ready' | 'pending' | 'error';
+  error: string | null;
+  settingsKey?: string;
+  settings?: ChannelRules;
+  blockedCallers?: string[];
+}
+export interface SourceInfo {
+  sourceId?: string;
+  sourceName?: string;
+  mode?: ChannelMode;
+}
+export interface ConsistencyRates {
+  overall: number;
+  recent: number;
+  chain: number;
+}
 
-export interface ChannelPost {
+export interface ChannelPost extends SourceInfo {
   channelId: string;
   messageId: number;
   date: number;
@@ -201,7 +234,7 @@ export interface ChannelPost {
   urls: string[];
   revision: number;
 }
-export interface CallSignal {
+export interface CallSignal extends SourceInfo {
   id: string;
   channelId: string;
   messageId: number;
@@ -212,7 +245,7 @@ export interface CallSignal {
   address: string;
   caller: string;
   callerId: string | null;
-  consistency: { overall: number; recent: number; chain: number };
+  consistency: ConsistencyRates | null;
   advertisedMarketCapUsd: number | null;
   tokenName?: string;
 }
@@ -220,7 +253,7 @@ export interface CallObservation {
   decision: 'pending' | 'skipped';
   reason: string;
   observedAt: number;
-  thresholds: CallSignal['consistency'];
+  thresholds: ConsistencyRates | null;
 }
 export interface CallHistoryItem {
   id: string;
@@ -256,6 +289,16 @@ export interface Quote {
   nativeUsd: number | null;
   priceImpactPercent: number | null;
   receivedAt: number;
+  source?: string;
+  estimated?: boolean;
+}
+export interface PreparedQuote {
+  provider: 'jupiter' | 'uniswap';
+  response: unknown;
+  receivedAt: number;
+  inputRaw: string;
+  slippagePercent: number;
+  priorityFee: string | null;
 }
 export interface TrailState {
   active: boolean;
@@ -265,6 +308,10 @@ export interface TrailState {
 }
 export interface Position {
   id: string;
+  entryOperationId?: string;
+  sourceId?: string;
+  sourceName?: string;
+  executionSettings?: ChainSettings;
   chain: Chain;
   address: string;
   symbol: string;
@@ -289,6 +336,7 @@ export interface Position {
   lastValueNativeRaw: string | null;
   lastValueUsd: number | null;
   lastError: string | null;
+  fundsError?: string;
 }
 export interface SwapResult {
   tokenRaw: string;
@@ -297,6 +345,7 @@ export interface SwapResult {
   feeNativeRaw: string;
   signature: string;
   nativeUsd: number | null;
+  fundsError?: string;
 }
 export type OperationStatus = 'active' | 'confirmed' | 'failed' | 'review';
 export interface EvmStep {
@@ -349,7 +398,7 @@ export interface Operation {
   id: string;
   chain: Chain;
   address: string;
-  kind: 'buy' | 'sell' | 'unwrap' | 'withdraw';
+  kind: 'buy' | 'sell' | 'wrap' | 'unwrap' | 'withdraw';
   status: OperationStatus;
   positionId: string | null;
   signal: CallSignal | null;
@@ -358,14 +407,20 @@ export interface Operation {
   withdrawal?: { recipient: string; requestedBy: number };
   amountRaw: string;
   token: TokenInfo;
+  approvalAmountRaw?: string;
   settings: ChainSettings;
   steps: TradeStep[];
   quote: Quote | null;
+  preparedQuote?: PreparedQuote;
+  wrapAmountRaw?: string;
+  wrapWarningSent?: boolean;
+  funding?: { sourceId?: string };
   swapHash: string | null;
   outputRaw: string | null;
   minimumNativeRaw: string | null;
   createdAt: number;
   error: string | null;
+  retryCount?: number;
 }
 
 export class PendingTrade extends Error {

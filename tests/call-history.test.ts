@@ -98,7 +98,7 @@ test('actual purchase outcomes take precedence over capture observations', () =>
 test('filter rejection reasons use the threshold recorded when the call arrived', () => {
   const item = history();
   item.observation!.reason = 'recent consistency is below the threshold';
-  item.observation!.thresholds.recent = 40;
+  item.observation!.thresholds!.recent = 40;
   const result = recentCallMessage(item, 'SpyDefiLive', true).text;
   assert.match(result, /Skipped/);
   assert.match(result, /Recent consistency 35% was below the 40% minimum at capture/);

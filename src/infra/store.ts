@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import { logger } from '../logging/logger.js';
 import { logSignalDetected, logSignalSkipped, logTradeOutcome } from '../logging/trades.js';
 import { pnlFill, USD_CAPTURE_WINDOW_MS } from '../pnl/accounting.js';
@@ -8,6 +8,7 @@ import type { PnlFill, PnlMark } from '../pnl/types.js';
 import { exitReasonLabel } from '../trading/exit-reason.js';
 import {
   chainSettingsSchema,
+  channelRulesSchema,
   settingsSchema,
   emptyTrail,
   formatAmount,
@@ -23,6 +24,8 @@ import {
   type Position,
   type Settings,
   type SwapResult,
+  type CallChannel,
+  type ChainSettings,
 } from '../domain.js';
 
 type Row = Record<string, unknown>;
@@ -38,7 +41,7 @@ export class Store {
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 4)
+    if (Number(version?.user_version ?? 0) > 6)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -54,6 +57,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, chain TEXT NOT NULL, address TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, payload TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations (chain) WHERE status IN ('active', 'review');
       CREATE TABLE IF NOT EXISTS token_entries (chain TEXT NOT NULL, address TEXT NOT NULL, operation_id TEXT NOT NULL, bought INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chain, address));
+      CREATE TABLE IF NOT EXISTS token_exits (chain TEXT NOT NULL, address TEXT NOT NULL, closed_at INTEGER NOT NULL, position_id TEXT NOT NULL, PRIMARY KEY (chain, address));
+      CREATE TABLE IF NOT EXISTS call_channels (id TEXT PRIMARY KEY, channel_id TEXT UNIQUE, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE NOT NULL, text TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS notification_deliveries (notification_id INTEGER NOT NULL REFERENCES notifications(id), recipient_id INTEGER NOT NULL, PRIMARY KEY (notification_id, recipient_id));
       CREATE TABLE IF NOT EXISTS pnl_fills (operation_id TEXT PRIMARY KEY, position_id TEXT NOT NULL, chain TEXT NOT NULL, confirmed_at INTEGER NOT NULL, payload TEXT NOT NULL);
@@ -66,15 +71,305 @@ export class Store {
         this.db.exec('ALTER TABLE signals ADD COLUMN source_post TEXT');
       if (!columns.some((column) => column.name === 'observation'))
         this.db.exec('ALTER TABLE signals ADD COLUMN observation TEXT');
+      const channelColumns = this.db.prepare('PRAGMA table_info(call_channels)').all();
+      if (!channelColumns.some((column) => column.name === 'settings_key'))
+        this.db.exec('ALTER TABLE call_channels ADD COLUMN settings_key TEXT');
+      this.db.exec(
+        'CREATE UNIQUE INDEX IF NOT EXISTS channel_settings_keys ON call_channels (settings_key) WHERE settings_key IS NOT NULL',
+      );
       this.db.exec(
         "CREATE INDEX IF NOT EXISTS operations_by_signal ON operations (json_extract(payload, '$.signal.id'), created_at DESC)",
       );
+      if (Number(version?.user_version ?? 0) < 5) this.restoreEntryLinks();
+      if (Number(version?.user_version ?? 0) < 6) this.restoreChannelRules();
       this.restoreSolanaEntryPrices();
       this.restorePnlFills();
-      this.db.exec('PRAGMA user_version = 4');
+      this.db.exec('PRAGMA user_version = 6');
     });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));
+  }
+  private decodeChannel(row: Row | undefined): CallChannel | null {
+    const channel = decode<CallChannel>(row);
+    if (channel) {
+      channel.settings = channelRulesSchema.parse(channel.settings ?? {});
+      channel.blockedCallers ??= [];
+    }
+    return channel;
+  }
+  private restoreChannelRules(): void {
+    const rows = this.db.prepare('SELECT payload FROM call_channels').all();
+    const previous = rows.length ? this.settings() : null;
+    for (const row of rows) {
+      const channel = decode<CallChannel>(row)!;
+      channel.settings ??= structuredClone(previous!.chains);
+      channel.blockedCallers ??= [...previous!.blockedCallers];
+      this.saveCallChannel(channel);
+    }
+    for (const row of this.db.prepare('SELECT payload FROM positions').all()) {
+      const position = decode<Position>(row)!;
+      const buyId = position.entryOperationId ?? this.positionEntryFill(position.id)?.operationId;
+      const buy = buyId ? this.operation(buyId) : null;
+      if (!buy) continue;
+      position.sourceId ??= buy.signal?.sourceId ?? (buy.signal ? 'spydefi' : undefined);
+      position.sourceName ??= buy.signal?.sourceName;
+      position.executionSettings ??= structuredClone(buy.settings);
+      this.db
+        .prepare('UPDATE positions SET payload = ? WHERE id = ?')
+        .run(JSON.stringify(position), position.id);
+    }
+  }
+  private restoreEntryLinks(): void {
+    for (const row of this.db.prepare('SELECT payload FROM positions').all()) {
+      const position = decode<Position>(row)!;
+      let operationId = position.entryOperationId;
+      if (!operationId) {
+        const linked = this.db
+          .prepare(
+            "SELECT id FROM operations WHERE status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy' AND json_extract(payload, '$.positionId') = ?",
+          )
+          .all(position.id);
+        if (linked.length === 1) operationId = String(linked[0]!.id);
+      }
+      if (!operationId) {
+        const fills = this.db
+          .prepare(
+            "SELECT operation_id FROM pnl_fills WHERE position_id = ? AND json_extract(payload, '$.kind') = 'buy'",
+          )
+          .all(position.id);
+        if (fills.length === 1) operationId = String(fills[0]!.operation_id);
+        else {
+          const positions = this.db
+            .prepare('SELECT id FROM positions WHERE chain = ? AND address = ?')
+            .all(position.chain, position.address);
+          const buys = this.db
+            .prepare(
+              "SELECT id FROM operations WHERE chain = ? AND address = ? AND status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy'",
+            )
+            .all(position.chain, position.address);
+          if (positions.length === 1 && buys.length === 1) operationId = String(buys[0]!.id);
+        }
+      }
+      if (!operationId) continue;
+      const operation = this.operation(operationId);
+      if (
+        !operation ||
+        operation.kind !== 'buy' ||
+        operation.status !== 'confirmed' ||
+        operation.chain !== position.chain ||
+        operation.address !== position.address ||
+        (operation.positionId !== null && operation.positionId !== position.id)
+      )
+        continue;
+      position.entryOperationId = operationId;
+      operation.positionId = position.id;
+      this.db
+        .prepare('UPDATE positions SET payload = ? WHERE id = ?')
+        .run(JSON.stringify(position), position.id);
+      this.db
+        .prepare('UPDATE operations SET payload = ? WHERE id = ?')
+        .run(JSON.stringify(operation), operation.id);
+      if (position.closedAt !== null && BigInt(position.remainingTokenRaw) === 0n) {
+        const sold = this.db
+          .prepare(
+            "SELECT 1 FROM operations WHERE status = 'confirmed' AND json_extract(payload, '$.kind') = 'sell' AND json_extract(payload, '$.positionId') = ?",
+          )
+          .get(position.id);
+        if (sold) this.releaseEntry(position);
+      }
+    }
+  }
+  seedCallChannels(source: string): void {
+    if (!this.metadata('channels:spydefi-target'))
+      this.setMetadata('channels:spydefi-target', source.toLowerCase());
+    if (this.metadata('channels:initialized')) return;
+    this.transaction(() => {
+      this.saveCallChannel({
+        id: 'spydefi',
+        target: source,
+        channelId: null,
+        title: source,
+        username: source,
+        mode: 'spydefi',
+        defaultChain: null,
+        enabled: true,
+        activatedAt: 0,
+        status: 'unresolved',
+        error: null,
+        settings: structuredClone(this.settings().chains),
+        blockedCallers: [...this.settings().blockedCallers],
+      });
+      this.db
+        .prepare(
+          "UPDATE signals SET payload = json_set(payload, '$.sourceId', 'spydefi', '$.mode', 'spydefi') WHERE state = 'pending' AND json_extract(payload, '$.sourceId') IS NULL",
+        )
+        .run();
+      this.db
+        .prepare(
+          "UPDATE operations SET payload = json_set(payload, '$.signal.sourceId', 'spydefi', '$.signal.mode', 'spydefi') WHERE status IN ('active','review') AND json_extract(payload, '$.kind') = 'buy' AND json_type(payload, '$.signal') = 'object' AND json_extract(payload, '$.signal.sourceId') IS NULL",
+        )
+        .run();
+      this.setMetadata('channels:initialized', 'true');
+    });
+  }
+  callChannels(): CallChannel[] {
+    return this.db
+      .prepare('SELECT payload FROM call_channels ORDER BY rowid')
+      .all()
+      .map((row) => this.decodeChannel(row)!);
+  }
+  callChannel(id: string): CallChannel | null {
+    return this.decodeChannel(
+      this.db.prepare('SELECT payload FROM call_channels WHERE id = ?').get(id),
+    );
+  }
+  callChannelForSettings(key: string): CallChannel | null {
+    return this.decodeChannel(
+      this.db.prepare('SELECT payload FROM call_channels WHERE settings_key = ?').get(key),
+    );
+  }
+  saveCallChannel(channel: CallChannel): void {
+    const existing = this.callChannel(channel.id);
+    channel.settings = channelRulesSchema.parse(channel.settings ?? existing?.settings ?? {});
+    channel.blockedCallers ??= existing?.blockedCallers ?? [];
+    channel.settingsKey ??= existing?.settingsKey;
+    while (
+      !channel.settingsKey ||
+      this.db
+        .prepare('SELECT id FROM call_channels WHERE settings_key = ? AND id != ?')
+        .get(channel.settingsKey, channel.id) ||
+      (this.metadata(`channel-settings-key:${channel.settingsKey}`) !== null &&
+        this.metadata(`channel-settings-key:${channel.settingsKey}`) !== channel.id)
+    )
+      channel.settingsKey = randomBytes(3).toString('hex');
+    this.setMetadata(`channel-settings-key:${channel.settingsKey}`, channel.id);
+    this.db
+      .prepare(
+        'INSERT INTO call_channels (id,channel_id,settings_key,payload) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET channel_id=excluded.channel_id,settings_key=excluded.settings_key,payload=excluded.payload',
+      )
+      .run(channel.id, channel.channelId, channel.settingsKey, JSON.stringify(channel));
+  }
+  tradingSettings(chain: Chain, sourceId?: string): ChainSettings {
+    if (!sourceId) return this.settings().chains[chain];
+    const channel = this.callChannel(sourceId);
+    if (!channel) throw new Error('Source channel no longer exists');
+    return channel.settings![chain];
+  }
+  callerBlocklist(sourceId?: string): string[] {
+    if (!sourceId) return this.settings().blockedCallers;
+    const channel = this.callChannel(sourceId);
+    if (!channel) throw new Error('Source channel no longer exists');
+    return channel.blockedCallers!;
+  }
+  updateChannelRules(
+    sourceId: string,
+    chain: Chain,
+    action: (settings: ChainSettings) => void,
+  ): void {
+    this.transaction(() => {
+      const channel = this.callChannel(sourceId);
+      if (!channel) throw new Error('Channel no longer exists');
+      const settings = structuredClone(channel.settings![chain]);
+      action(settings);
+      channel.settings![chain] = chainSettingsSchema.parse(settings);
+      this.saveCallChannel(channel);
+    });
+    logger
+      .child({ component: 'trading.settings' })
+      .debug('channel.settings_updated', { sourceId, chain });
+  }
+  entriesEnabled(chain: Chain): boolean {
+    const channels = this.callChannels();
+    if (!channels.length && !this.metadata('channels:initialized'))
+      return this.settings().chains[chain].enabled;
+    return channels.some(
+      (channel) =>
+        channel.enabled && channel.status === 'ready' && channel.settings![chain].enabled,
+    );
+  }
+  disableAllEntries(): void {
+    this.transaction(() => {
+      const defaults = this.settings();
+      defaults.chains.solana.enabled = false;
+      defaults.chains.robinhood.enabled = false;
+      this.saveSettings(defaults);
+      for (const channel of this.callChannels()) {
+        channel.settings!.solana.enabled = false;
+        channel.settings!.robinhood.enabled = false;
+        this.saveCallChannel(channel);
+      }
+    });
+  }
+  positionSettings(position: Position): ChainSettings {
+    const source = position.sourceId ? this.callChannel(position.sourceId) : null;
+    if (source) return source.settings![position.chain];
+    if (position.executionSettings) return chainSettingsSchema.parse(position.executionSettings);
+    const buyId = position.entryOperationId ?? this.positionEntryFill(position.id)?.operationId;
+    const buy = buyId ? this.operation(buyId) : null;
+    return buy ? structuredClone(buy.settings) : this.settings().chains[position.chain];
+  }
+  removeCallChannel(id: string): void {
+    this.transaction(() => {
+      const channel = this.callChannel(id);
+      if (channel) {
+        for (const row of this.db
+          .prepare(
+            "SELECT payload FROM positions WHERE closed = 0 AND json_extract(payload, '$.sourceId') = ?",
+          )
+          .all(id)) {
+          const position = decode<Position>(row)!;
+          position.executionSettings = structuredClone(channel.settings![position.chain]);
+          position.executionSettings.exits = structuredClone(position.exits);
+          this.savePosition(position);
+        }
+      }
+      this.db.prepare('DELETE FROM call_channels WHERE id = ?').run(id);
+      for (const row of this.db
+        .prepare(
+          "SELECT id FROM signals WHERE state = 'pending' AND json_extract(payload, '$.sourceId') = ?",
+        )
+        .all(id))
+        this.skipSignal(String(row.id), 'Source channel was removed');
+    });
+  }
+  lastExit(chain: Chain, address: string): number | null {
+    const row = this.db
+      .prepare('SELECT closed_at FROM token_exits WHERE chain = ? AND address = ?')
+      .get(chain, normalizeAddress(chain, address));
+    return row ? Number(row.closed_at) : null;
+  }
+  entryRejection(signal: CallSignal): string | null {
+    if (signal.sourceId) {
+      const channel = this.callChannel(signal.sourceId);
+      if (!channel?.enabled || channel.status !== 'ready' || channel.channelId !== signal.channelId)
+        return 'Source channel is disabled, removed or unavailable';
+      if (!channel.settings![signal.chain].enabled)
+        return 'Entries for this channel and chain are disabled';
+      if (signal.date < channel.activatedAt) return 'Call predates channel activation';
+    }
+    if (this.hasEntry(signal.chain, signal.address))
+      return 'Token is already purchased or reserved';
+    const closedAt = this.lastExit(signal.chain, signal.address);
+    if (
+      closedAt !== null &&
+      (signal.date <= closedAt ||
+        (signal.detectedAt !== undefined && signal.detectedAt <= closedAt))
+    )
+      return 'Re-entry requires a new call posted after the last confirmed full exit';
+    return null;
+  }
+  private releaseEntry(position: Position): void {
+    const address = normalizeAddress(position.chain, position.address);
+    this.db
+      .prepare(
+        'INSERT INTO token_exits (chain,address,closed_at,position_id) VALUES (?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET closed_at=MAX(token_exits.closed_at,excluded.closed_at),position_id=CASE WHEN excluded.closed_at >= token_exits.closed_at THEN excluded.position_id ELSE token_exits.position_id END',
+      )
+      .run(position.chain, address, position.closedAt!, position.id);
+    this.db
+      .prepare(
+        'DELETE FROM token_entries WHERE chain = ? AND address = ? AND bought = 1 AND operation_id = ?',
+      )
+      .run(position.chain, address, position.entryOperationId ?? '');
   }
   private restorePnlFills(): void {
     const rows = this.db
@@ -84,16 +379,7 @@ export class Store {
       .all();
     for (const row of rows) {
       const operation = decodeOperation(row)!;
-      const position =
-        operation.kind === 'sell'
-          ? operation.positionId
-            ? this.position(operation.positionId)
-            : null
-          : decode<Position>(
-              this.db
-                .prepare('SELECT payload FROM positions WHERE chain = ? AND address = ? LIMIT 1')
-                .get(operation.chain, operation.address),
-            );
+      const position = operation.positionId ? this.position(operation.positionId) : null;
       if (!position) continue;
       this.savePnlFill(
         pnlFill(
@@ -116,9 +402,9 @@ export class Store {
       const operation = decodeOperation(
         this.db
           .prepare(
-            "SELECT payload FROM operations WHERE chain = 'solana' AND address = ? AND status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy' ORDER BY created_at DESC LIMIT 1",
+            "SELECT payload FROM operations WHERE chain = 'solana' AND address = ? AND status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy' AND json_extract(payload, '$.positionId') = ? LIMIT 1",
           )
-          .get(position.address),
+          .get(position.address, position.id),
       );
       const step = operation?.steps.find((candidate) => candidate.type === 'jupiter');
       const amount = step?.executionAmounts?.inputRaw ?? operation?.amountRaw;
@@ -236,6 +522,12 @@ export class Store {
     if (changed && signal && previousDetection === undefined) logSignalDetected(signal, post);
     return changed;
   }
+  alreadyRecorded(post: ChannelPost): boolean {
+    const row = this.db
+      .prepare('SELECT state,source_post FROM signals WHERE id = ?')
+      .get(`${post.channelId}:${post.messageId}`);
+    return row?.state === 'claimed' || row?.source_post === JSON.stringify(post);
+  }
   nextSignal(chain: Chain): CallSignal | null {
     return decode(
       this.db
@@ -305,8 +597,10 @@ export class Store {
   hasEntry(chain: Chain, address: string): boolean {
     return Boolean(
       this.db
-        .prepare('SELECT 1 FROM token_entries WHERE chain = ? AND address = ?')
-        .get(chain, normalizeAddress(chain, address)),
+        .prepare(
+          'SELECT 1 FROM token_entries WHERE chain = ? AND address = ? UNION ALL SELECT 1 FROM positions WHERE chain = ? AND address = ? AND closed = 0 LIMIT 1',
+        )
+        .get(chain, normalizeAddress(chain, address), chain, normalizeAddress(chain, address)),
     );
   }
   activeOperation(chain: Chain): Operation | null {
@@ -349,6 +643,7 @@ export class Store {
       swapHash: operation.swapHash,
       quote: operation.quote,
       reason: operation.error,
+      retryCount: operation.retryCount ?? 0,
       steps: operation.steps.map((step) => {
         if (step.type === 'jupiter')
           return {
@@ -394,7 +689,9 @@ export class Store {
     return this.transaction(() => {
       if (
         this.activeOperation(operation.chain) ||
-        (operation.kind === 'buy' && this.hasEntry(operation.chain, operation.address))
+        (operation.kind === 'buy' &&
+          (this.hasEntry(operation.chain, operation.address) ||
+            (operation.signal && this.entryRejection(operation.signal))))
       )
         return false;
       this.saveOperation(operation);
@@ -412,6 +709,11 @@ export class Store {
   }
   completeBuy(operation: Operation, position: Position, result: SwapResult): void {
     this.transaction(() => {
+      operation.positionId = position.id;
+      position.entryOperationId = operation.id;
+      position.sourceId = operation.signal?.sourceId;
+      position.sourceName = operation.signal?.sourceName;
+      position.executionSettings = structuredClone(operation.settings);
       operation.status = 'confirmed';
       this.saveOperation(operation);
       this.savePosition(position);
@@ -464,10 +766,12 @@ export class Store {
       if (BigInt(position.remainingTokenRaw) === 0n) position.closedAt = Date.now();
       this.db.prepare('DELETE FROM metadata WHERE key = ?').run(`pnl:mark:${position.id}`);
       position.lastError = null;
+      position.fundsError = undefined;
       operation.swapHash = result.signature.trim() || operation.swapHash;
       operation.status = 'confirmed';
       this.savePosition(position);
       this.saveOperation(operation);
+      if (position.closedAt !== null) this.releaseEntry(position);
       this.savePnlFill(pnlFill(operation, position, result, Date.now()));
       this.notify(
         `trade:${operation.id}`,
@@ -609,16 +913,19 @@ export class Store {
       .prepare('INSERT OR IGNORE INTO notifications (event_key,text) VALUES (?,?)')
       .run(eventKey, text);
   }
-  notifications(
-    recipientId?: number,
-  ): { id: number; text: string; solanaSignature: string | null }[] {
+  notifications(recipientId?: number): {
+    id: number;
+    text: string;
+    solanaSignature: string | null;
+    robinhoodHash: string | null;
+  }[] {
     return this.db
       .prepare(
         'SELECT id,event_key,text FROM notifications WHERE delivered = 0 AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM notification_deliveries WHERE notification_id = notifications.id AND recipient_id = ?)) ORDER BY id LIMIT 3',
       )
       .all(recipientId ?? null, recipientId ?? null)
       .map((row) => {
-        const operationId = /^(?:trade|fill|proceeds|withdraw):([^:]+)$/.exec(
+        const operationId = /^(?:trade|fill|proceeds|withdraw|wrap|unwrap):([^:]+)$/.exec(
           String(row.event_key),
         )?.[1];
         const operation = operationId
@@ -628,13 +935,16 @@ export class Store {
               )
               .get(operationId)
           : undefined;
-        const solanaSignature =
-          operation?.chain === 'solana' &&
-          typeof operation.signature === 'string' &&
-          operation.signature.length > 0
+        const signature =
+          typeof operation?.signature === 'string' && operation.signature.length > 0
             ? operation.signature
             : null;
-        return { id: Number(row.id), text: String(row.text), solanaSignature };
+        return {
+          id: Number(row.id),
+          text: String(row.text),
+          solanaSignature: operation?.chain === 'solana' ? signature : null,
+          robinhoodHash: operation?.chain === 'robinhood' ? signature : null,
+        };
       });
   }
   delivered(id: number, recipientId: number, recipients: readonly number[]): void {

@@ -2,6 +2,7 @@ import { InlineKeyboard } from 'grammy';
 import type { User } from 'grammy/types';
 import { z } from 'zod';
 import type { Store } from '../infra/store.js';
+import { unpackSettingsCallback } from './settings-scope.js';
 
 export const watcherUsernameSchema = z
   .string()
@@ -19,6 +20,7 @@ const watcherActions = new Set([
   'exit',
   'wallets',
   'positions',
+  'positionsrefresh',
   'position',
   'refresh',
   'history',
@@ -26,6 +28,9 @@ const watcherActions = new Set([
   'pnlquotes',
   'blocklist',
   'recent',
+  'channels',
+  'channelpick',
+  'channelview',
 ]);
 const watcherCommands = new Set([
   'start',
@@ -36,10 +41,11 @@ const watcherCommands = new Set([
   'pnl',
   'cancel',
   'help',
+  'channels',
 ]);
 
 export function watcherCallbackAllowed(data: string): boolean {
-  return watcherActions.has(data.split(':')[0] ?? '');
+  return watcherActions.has(unpackSettingsCallback(data).data.split(':')[0] ?? '');
 }
 
 export function watcherCommandAllowed(text: string): boolean {

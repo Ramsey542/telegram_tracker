@@ -26,11 +26,25 @@ const pairSchema = z.object({
   fdv: nullableNumber,
   liquidity: z.object({ usd: nullableNumber }).nullable().optional(),
 });
+export type DexPair = z.infer<typeof pairSchema>;
 export class MarketData {
   constructor(
     private readonly config: Config,
     private readonly http: HttpClient,
   ) {}
+  async pair(chain: string, address: string): Promise<DexPair | null> {
+    const result = await this.http.json(
+      'DEX Screener pair lookup',
+      `https://api.dexscreener.com/latest/dex/pairs/${encodeURIComponent(chain)}/${encodeURIComponent(address)}`,
+      z.object({ pairs: z.array(pairSchema).nullable() }),
+    );
+    return (
+      result.pairs?.find(
+        (pair) =>
+          pair.chainId === chain && pair.pairAddress.toLowerCase() === address.toLowerCase(),
+      ) ?? null
+    );
+  }
   async solana(mint: string) {
     const tokens = await this.http.json(
       'Jupiter token data',

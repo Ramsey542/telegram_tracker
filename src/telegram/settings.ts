@@ -259,6 +259,15 @@ export const toggles: Record<
     change: (s: ChainSettings) => void;
   }
 > = {
+  wrapMyEth: {
+    label: 'Wrap my ETH if WETH is insufficient',
+    group: 'buy',
+    chains: ['robinhood'],
+    value: (s) => s.wrapMyEth,
+    change: (s) => {
+      s.wrapMyEth = !s.wrapMyEth;
+    },
+  },
   mc: {
     label: '📊 Market cap filter',
     group: 'filters',

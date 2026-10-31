@@ -46,7 +46,7 @@ function decision(item: CallHistoryItem, listenOnly: boolean): { title: string; 
     const below = /^(overall|recent|chain) consistency is below the threshold$/i.exec(reason);
     const rate = below?.[1]?.toLowerCase() as 'overall' | 'recent' | 'chain' | undefined;
     const detail =
-      rate && item.signal
+      rate && item.signal?.consistency && item.observation.thresholds
         ? `${rate[0]!.toUpperCase()}${rate.slice(1)} consistency ${item.signal.consistency[rate]}% was below the ${item.observation.thresholds[rate]}% minimum at capture.`
         : (reasons[reason] ?? reason);
     return {
@@ -108,6 +108,7 @@ export function recentCallMessage(
     item.signal?.caller ?? /@([A-Za-z0-9_]+)\s+just\s+posted\b/i.exec(text)?.[1] ?? null;
   const address = item.signal?.address ?? /\bCA\s*:\s*([A-Za-z0-9]+)/i.exec(text)?.[1] ?? null;
   const name =
+    item.signal?.tokenName ??
     /@([A-Za-z0-9_]+)\s+just\s+posted\s+([\s\S]+?)\s+at\s*\$/i.exec(text)?.[2] ??
     item.operation?.symbol ??
     null;
@@ -115,17 +116,25 @@ export function recentCallMessage(
     /Caller\s+Consistency\s*:\s*([\s\S]*?)(?:Total\s+Calls|View\s+Call|$)/i.exec(text)?.[1] ?? '';
   const rates = (['overall', 'recent', 'chain'] as const).map((key) => {
     const raw =
-      item.signal?.consistency[key] ??
+      item.signal?.consistency?.[key] ??
       new RegExp(`\\b${key}\\s*:\\s*(\\d+(?:\\.\\d+)?)\\s*%`, 'i').exec(section)?.[1];
     return raw === undefined ? 'Unknown' : `${raw}%`;
   });
   const status = decision(item, listenOnly);
   const date = item.signal?.date ?? item.post?.date;
+  const general = item.signal?.mode === 'general' || item.post?.mode === 'general';
+  const sourceName = item.signal?.sourceName ?? item.post?.sourceName ?? (source || item.channelId);
+  const sourceUrl = source
+    ? `https://t.me/${source}/${item.messageId}`
+    : `https://t.me/c/${item.channelId.replace(/^-100/, '')}/${item.messageId}`;
   return joinMessages([
     message`🪙 ${bold(name ? clean(name, 64) : 'Token name unavailable')}`,
-    message`👤 ${bold('Caller:')} ${caller ? link(`@${clean(caller, 64)}`, `https://t.me/${caller}`) : 'Not identified'}`,
+    message`👤 ${bold('Caller:')} ${general ? clean(caller ?? sourceName) : caller ? link(`@${clean(caller, 64)}`, `https://t.me/${caller}`) : 'Not identified'}`,
+    message`${bold('Source:')} ${clean(sourceName)}`,
     message`⛓️ ${bold('Chain:')} ${chainLabel(chartChain(item))}`,
-    message`🎯 ${bold('Consistency:')} Overall ${rates[0]!} · Recent ${rates[1]!} · Chain ${rates[2]!}`,
+    general
+      ? message`${bold('Consistency:')} Not required for general call channels`
+      : message`🎯 ${bold('Consistency:')} Overall ${rates[0]!} · Recent ${rates[1]!} · Chain ${rates[2]!}`,
     ...(address ? [message`${bold('CA:')} ${code(clean(address, 128))}`] : []),
     message`${bold(status.title)}`,
     message`${bold('Reason:')} ${clean(status.reason, 400)}`,
@@ -135,6 +144,6 @@ export function recentCallMessage(
     ...(date !== undefined && Number.isFinite(date)
       ? [italic(`Posted: ${new Date(date).toISOString().slice(0, 16).replace('T', ' ')} UTC`)]
       : []),
-    link('🔗 View source post', `https://t.me/${source}/${item.messageId}`),
+    link('🔗 View source post', sourceUrl),
   ]);
 }

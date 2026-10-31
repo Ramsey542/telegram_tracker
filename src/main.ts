@@ -6,6 +6,7 @@ import { HttpClient } from './infra/http.js';
 import { Store } from './infra/store.js';
 import { acquireProcessLock } from './infra/process-lock.js';
 import { MarketData } from './providers/market.js';
+import { PositionPrices } from './providers/position-prices.js';
 import { NativePrices } from './providers/native-prices.js';
 import { PnlTracker } from './pnl/tracker.js';
 import { RiskFilters } from './providers/risk.js';
@@ -128,6 +129,8 @@ async function main(): Promise<void> {
     store = new Store(config.dataDirectory);
     const http = new HttpClient(config.httpTimeoutMs, config.jupiterRps);
     const market = new MarketData(config, http);
+    const nativePrices = new NativePrices(http);
+    const positionPrices = new PositionPrices(config, http, nativePrices);
     const filters = new RiskFilters(config, http);
     engine = new TradeEngine(
       config,
@@ -138,20 +141,30 @@ async function main(): Promise<void> {
       },
       filters,
       () => pnl?.refreshRates(),
+      positionPrices,
     );
     const activeEngine = engine;
-    pnl = new PnlTracker(config, store, engine.adapters, new NativePrices(http));
-    reader = new ChannelReader(config, wallets, store, (signal) => {
-      if (signal) activeEngine.observeSignal(signal);
-      void activeEngine.tick().catch((error) => log.error('engine.tick_failed', error));
-    });
+    pnl = new PnlTracker(config, store, engine.adapters, nativePrices, positionPrices);
+    reader = new ChannelReader(
+      config,
+      wallets,
+      store,
+      (signal) => {
+        if (signal) activeEngine.observeSignal(signal);
+        void activeEngine
+          .tick(Boolean(signal))
+          .catch((error) => log.error('engine.tick_failed', error));
+      },
+      market,
+    );
     const activeReader = reader;
     control = new ControlBot(
       config,
       store,
       engine,
-      (messageIds) => activeReader.hydrateHistory(messageIds),
+      (references) => activeReader.hydrateHistory(references),
       pnl,
+      activeReader.channels,
     );
     log.debug('wallets.ready', {
       solana: wallets.solana.publicKey.toBase58(),

@@ -20,19 +20,45 @@ import {
 } from '../domain.js';
 import type { ChainAdapter } from '../chains/types.js';
 import { Store } from '../infra/store.js';
-import { safeError } from '../infra/http.js';
+import { ApiError, safeError } from '../infra/http.js';
 import { RiskFilters } from '../providers/risk.js';
 import { evaluateExits } from './exits.js';
 import { exitReasonLabel } from './exit-reason.js';
 import { withdrawalAddress, withdrawalAmount } from './withdrawal.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { logTradeOutcome } from '../logging/trades.js';
+import { PositionPrices } from '../providers/position-prices.js';
+import { insufficientFunds } from './funds.js';
 
 const log = logger.child({ component: 'trading.engine' });
+const maxOperationRetries = 3;
+
+function retryFailureReason(error: unknown): string {
+  const summary = safeError(error);
+  if (!(error instanceof ApiError)) return summary;
+  let response = error.details.responseBody;
+  if (typeof response === 'string') {
+    try {
+      response = JSON.parse(response);
+    } catch {
+      return summary;
+    }
+  }
+  if (
+    !response ||
+    typeof response !== 'object' ||
+    !('detail' in response) ||
+    typeof response.detail !== 'string'
+  )
+    return summary;
+  return safeError(new Error(`${summary}: ${response.detail}`));
+}
 
 export class TradeEngine {
   private readonly busy = new Set<Chain>();
+  private readonly entryWake = new Set<Chain>();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly transactionTimers = new Map<Chain, ReturnType<typeof setTimeout>>();
   private stopped = false;
   constructor(
     private readonly config: Config,
@@ -40,6 +66,7 @@ export class TradeEngine {
     readonly adapters: Record<Chain, ChainAdapter>,
     private readonly filters: RiskFilters,
     private readonly onFill?: () => void,
+    private readonly prices?: PositionPrices,
   ) {}
   start(): void {
     log.debug('engine.started', {
@@ -55,16 +82,21 @@ export class TradeEngine {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
+    for (const timer of this.transactionTimers.values()) clearTimeout(timer);
+    this.transactionTimers.clear();
     while (this.busy.size > 0) await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  async tick(): Promise<void> {
+  async tick(preferEntries = false): Promise<void> {
     if (this.stopped) return;
     await withLogContext({ signalId: undefined, channelId: undefined, messageId: undefined }, () =>
-      Promise.all(chains.map((chain) => withLogContext({ chain }, () => this.tickChain(chain)))),
+      Promise.all(
+        chains.map((chain) =>
+          withLogContext({ chain }, () => this.tickChain(chain, preferEntries)),
+        ),
+      ),
     );
   }
-  readiness(chain: Chain, buying = true): string[] {
-    const settings = this.store.settings().chains[chain];
+  readiness(chain: Chain, buying = true, settings = this.store.settings().chains[chain]): string[] {
     const missing = this.adapters[chain].readiness(settings);
     if (buying && !settings.buySizeNative) missing.push('buy size');
     if (settings.slippagePercent === null) missing.push('slippage');
@@ -78,9 +110,11 @@ export class TradeEngine {
       );
   }
   observeSignal(signal: CallSignal): void {
-    const global = this.store.settings();
-    const settings = global.chains[signal.chain];
+    const settings = signal.sourceId
+      ? this.store.callChannel(signal.sourceId)?.settings?.[signal.chain]
+      : this.store.settings().chains[signal.chain];
     try {
+      if (!settings) throw new TradeRejected('Source channel no longer exists');
       this.validateSignal(signal, false);
       const blockedReason = this.config.listenOnly
         ? 'listen_only'
@@ -91,7 +125,8 @@ export class TradeEngine {
         decision: blockedReason ? 'skipped' : 'pending',
         reason: blockedReason ?? 'queued_for_evaluation',
         observedAt: Date.now(),
-        thresholds: structuredClone(settings.consistency),
+        thresholds:
+          signal.mode === 'general' || !settings ? null : structuredClone(settings.consistency),
       });
       log.info('entry.observed', {
         signalId: signal.id,
@@ -101,7 +136,7 @@ export class TradeEngine {
         decision: blockedReason ? 'skipped' : 'pending',
         reason: blockedReason ?? 'queued_for_evaluation',
         consistency: signal.consistency,
-        thresholds: settings.consistency,
+        thresholds: signal.mode === 'general' ? null : (settings?.consistency ?? null),
         filters: settings.filters,
         marketData: 'not_fetched_at_capture',
         buySizeNative: settings.buySizeNative,
@@ -111,7 +146,8 @@ export class TradeEngine {
         decision: 'skipped',
         reason: safeError(error),
         observedAt: Date.now(),
-        thresholds: structuredClone(settings.consistency),
+        thresholds:
+          signal.mode === 'general' || !settings ? null : structuredClone(settings.consistency),
       });
       log.info('entry.observed', {
         signalId: signal.id,
@@ -122,12 +158,16 @@ export class TradeEngine {
         reason: safeError(error),
         error: error instanceof TradeRejected ? undefined : error,
         consistency: signal.consistency,
-        thresholds: settings.consistency,
+        thresholds: signal.mode === 'general' ? null : (settings?.consistency ?? null),
       });
     }
   }
-  private async tickChain(chain: Chain): Promise<void> {
-    if (this.busy.has(chain)) return;
+  private async tickChain(chain: Chain, preferEntries = false): Promise<void> {
+    if (this.stopped) return;
+    if (this.busy.has(chain)) {
+      if (preferEntries) this.entryWake.add(chain);
+      return;
+    }
     this.busy.add(chain);
     try {
       const operation = this.store.activeOperation(chain);
@@ -144,6 +184,20 @@ export class TradeEngine {
         return;
       }
       if (operation) {
+        if (
+          operation.status === 'review' &&
+          (operation.retryCount ?? 0) >= maxOperationRetries &&
+          operation.error?.startsWith(
+            `Automatic retry limit reached (${maxOperationRetries} retries). Manual review required.`,
+          )
+        ) {
+          this.store.failOperation(
+            operation,
+            operation.error.replace(' Manual review required.', ''),
+            false,
+          );
+          return;
+        }
         log.debug('operation.poll', {
           chain,
           operationId: operation.id,
@@ -165,9 +219,9 @@ export class TradeEngine {
           );
         return;
       }
-      if (await this.monitor(chain)) return;
-      const global = this.store.settings();
-      if (!global.chains[chain].enabled) {
+      if (!preferEntries && (await this.monitor(chain))) return;
+      if (!this.store.entriesEnabled(chain)) {
+        if (preferEntries) await this.monitor(chain);
         log.debug('entries.waiting', {
           chain,
           reason: 'chain_disabled',
@@ -177,6 +231,7 @@ export class TradeEngine {
       for (let index = 0; index < 25; index++) {
         const signal = this.store.nextSignal(chain);
         if (!signal) {
+          if (preferEntries) await this.monitor(chain);
           log.debug('entries.waiting', { chain, reason: 'no_pending_calls' });
           return;
         }
@@ -190,7 +245,12 @@ export class TradeEngine {
             token: signal.address,
             reason: safeError(error),
             consistency: signal.consistency,
-            thresholds: this.store.settings().chains[chain].consistency,
+            thresholds:
+              signal.mode === 'general'
+                ? null
+                : signal.sourceId
+                  ? (this.store.callChannel(signal.sourceId)?.settings?.[chain].consistency ?? null)
+                  : this.store.settings().chains[chain].consistency,
             error: error instanceof TradeRejected ? undefined : error,
           });
           this.store.skipSignal(signal.id, safeError(error));
@@ -219,11 +279,17 @@ export class TradeEngine {
       );
     } finally {
       this.busy.delete(chain);
+      if (this.entryWake.delete(chain) && !this.stopped)
+        void withLogContext({ chain }, () => this.tickChain(chain, true)).catch((error) =>
+          log.error('entry.wake_failed', error, { chain }),
+        );
     }
   }
   private validateSignal(signal: CallSignal, requireReady = true): ChainSettings {
-    const global = this.store.settings();
-    const settings = global.chains[signal.chain];
+    if (signal.sourceId && !this.store.callChannel(signal.sourceId))
+      throw new TradeRejected('Source channel no longer exists');
+    const settings = this.store.tradingSettings(signal.chain, signal.sourceId);
+    const blockedCallers = this.store.callerBlocklist(signal.sourceId);
     const age = Date.now() - signal.date;
     log.debug('entry.filter_check', {
       signalId: signal.id,
@@ -234,14 +300,16 @@ export class TradeEngine {
       ageMs: age,
       maxAgeMs: this.config.maxSignalAgeMs,
       consistency: signal.consistency,
-      thresholds: settings.consistency,
-      blockedCallers: global.blockedCallers,
+      thresholds: signal.mode === 'general' ? null : settings.consistency,
+      source: signal.sourceName,
+      sourceMode: signal.mode ?? 'spydefi',
+      blockedCallers,
       duplicate: this.store.hasEntry(signal.chain, signal.address),
     });
     if (age > this.config.maxSignalAgeMs || age < -30_000)
       throw new TradeRejected('Call is outside the allowed age window');
     if (
-      global.blockedCallers.some(
+      blockedCallers.some(
         (caller) =>
           caller === signal.caller ||
           caller === `@${signal.caller}` ||
@@ -249,12 +317,17 @@ export class TradeEngine {
       )
     )
       throw new TradeRejected('Caller is blocked');
-    for (const name of ['overall', 'recent', 'chain'] as const)
-      if (signal.consistency[name] < settings.consistency[name])
-        throw new TradeRejected(`${name} consistency is below the threshold`);
-    if (this.store.hasEntry(signal.chain, signal.address))
-      throw new TradeRejected('Token is already purchased or reserved');
-    const missing = requireReady ? this.readiness(signal.chain) : [];
+    if (signal.mode !== 'general') {
+      if (!signal.consistency) throw new TradeRejected('Caller consistency is missing');
+      for (const name of ['overall', 'recent', 'chain'] as const)
+        if (signal.consistency[name] < settings.consistency[name])
+          throw new TradeRejected(`${name} consistency is below the threshold`);
+    }
+    const rejection = this.store.entryRejection(signal);
+    if (rejection) throw new TradeRejected(rejection);
+    if (requireReady && !settings.enabled)
+      throw new TradeRejected('Entries for this channel and chain are disabled');
+    const missing = requireReady ? this.readiness(signal.chain, true, settings) : [];
     if (missing.length) throw new TradeRejected(`Configure ${missing.join(', ')}`);
     return settings;
   }
@@ -266,35 +339,18 @@ export class TradeEngine {
       chain: signal.chain,
       buySizeNative: settings.buySizeNative,
     });
-    const token: TokenInfo =
-      signal.chain === 'solana'
-        ? {
-            chain: signal.chain,
-            address: signal.address,
-            symbol: signal.tokenName || signal.address.slice(0, 8),
-            decimals: null,
-            marketCapUsd: null,
-            liquidityUsd: null,
-            usdPrice: null,
-            fetchedAt: Date.now(),
-          }
-        : await this.adapters[signal.chain].tokenInfo(signal.address);
-    if (signal.chain !== 'solana') {
-      log.info('entry.market_data', { token });
-      await this.filters.check(token, settings);
-    }
+    const token: TokenInfo = {
+      chain: signal.chain,
+      address: signal.address,
+      symbol: signal.tokenName || signal.address.slice(0, 8),
+      decimals: null,
+      marketCapUsd: null,
+      liquidityUsd: null,
+      usdPrice: null,
+      fetchedAt: Date.now(),
+    };
     const amountRaw = parseAmount(settings.buySizeNative!, nativeDecimals[signal.chain]);
     if (amountRaw <= 0n) throw new TradeRejected('Buy size rounds to zero');
-    if (signal.chain !== 'solana') {
-      const balance = await this.adapters[signal.chain].balance();
-      log.info('entry.balance_check', {
-        nativeRaw: balance.nativeRaw,
-        amountRaw,
-        priorityFee: settings.priorityFee,
-      });
-      if (BigInt(balance.nativeRaw) <= amountRaw)
-        throw new TradeRejected('Insufficient native balance for the buy and network fees');
-    }
     const operation = this.operation(signal.chain, token, 'buy', amountRaw.toString());
     operation.signal = signal;
     operation.settings = structuredClone(settings);
@@ -340,11 +396,27 @@ export class TradeEngine {
       token: operation.address,
       kind: operation.kind,
       amountRaw: operation.amountRaw,
+      retryCount: operation.retryCount ?? 0,
+      maxRetries: maxOperationRetries,
     });
     try {
       const result = await this.adapters[operation.chain].advance(
         operation,
-        () => this.store.saveOperation(operation),
+        () => {
+          if (
+            operation.chain === 'robinhood' &&
+            operation.kind === 'buy' &&
+            BigInt(operation.wrapAmountRaw ?? '0') > 0n &&
+            !operation.wrapWarningSent
+          ) {
+            operation.wrapWarningSent = true;
+            this.store.notify(
+              `wrapping:${operation.id}`,
+              `WETH is below the buy size. Wrap my ETH is enabled: wrapping ${formatAmount(operation.wrapAmountRaw!, 18)} ETH before this buy. This adds a separate transaction and network fee.`,
+            );
+          }
+          this.store.saveOperation(operation);
+        },
         async () => {
           this.ensureTradingAllowed();
           if (operation.kind !== 'buy') return;
@@ -441,6 +513,13 @@ export class TradeEngine {
         const position = operation.positionId ? this.store.position(operation.positionId) : null;
         if (!position) throw new ReviewRequired('Confirmed sale has no matching position');
         this.store.completeSell(operation, position, result);
+        if (result.fundsError) {
+          this.fundsFailed(operation, result.fundsError);
+          this.store.notify(
+            `unwrap-funds:${operation.id}`,
+            `The ${position.symbol} sale is confirmed. Its proceeds remain in WETH because there was insufficient ETH to finish unwrapping. The confirmed sale has been recorded; it will not be sent again.`,
+          );
+        }
         this.onFill?.();
         log.info('position.sold', {
           positionId: position.id,
@@ -460,11 +539,20 @@ export class TradeEngine {
         this.store.saveOperation(operation);
         logTradeOutcome(operation, { ...result });
         this.store.notify(
-          `unwrap:${operation.id}`,
-          `Unwrapped ${formatAmount(operation.amountRaw, 18)} WETH to ETH.`,
+          `${operation.kind}:${operation.id}`,
+          operation.kind === 'wrap'
+            ? `Wrapped ${formatAmount(operation.amountRaw, 18)} ETH into WETH.\nTransaction: ${result.signature}`
+            : `Unwrapped ${formatAmount(operation.amountRaw, 18)} WETH to ETH.\nTransaction: ${result.signature}`,
         );
       }
     } catch (error) {
+      if (operation.chain === 'robinhood' && insufficientFunds(error)) {
+        const reason = retryFailureReason(error);
+        log.error('operation.insufficient_funds', error, { operationId: operation.id, reason });
+        this.store.failOperation(operation, reason, false);
+        this.fundsFailed(operation, reason);
+        return;
+      }
       if (error instanceof PendingTrade) {
         log.info('operation.pending', {
           operationId: operation.id,
@@ -474,6 +562,20 @@ export class TradeEngine {
         });
         operation.error = error.message;
         this.store.saveOperation(operation);
+        if (this.timer && !this.stopped && !this.transactionTimers.has(operation.chain)) {
+          const timer = setTimeout(() => {
+            this.transactionTimers.delete(operation.chain);
+            void withLogContext({ chain: operation.chain }, () =>
+              this.tickChain(operation.chain),
+            ).catch((error) =>
+              log.error('operation.confirmation_poll_failed', error, {
+                chain: operation.chain,
+                operationId: operation.id,
+              }),
+            );
+          }, this.config.transactionPollMs ?? 300);
+          this.transactionTimers.set(operation.chain, timer);
+        }
         return;
       }
       if (
@@ -481,15 +583,34 @@ export class TradeEngine {
         !(error instanceof ReviewRequired) &&
         operation.steps.length > 0
       ) {
-        log.error('operation.reconciliation_pending', error, {
+        const retryCount = operation.retryCount ?? 0;
+        if (retryCount >= maxOperationRetries) {
+          log.error('operation.retry_limit_reached', error, {
+            operationId: operation.id,
+            chain: operation.chain,
+            retryCount,
+            maxRetries: maxOperationRetries,
+          });
+          this.store.failOperation(
+            operation,
+            `Automatic retry limit reached (${maxOperationRetries} retries). Last error: ${retryFailureReason(error)}`,
+            false,
+          );
+          return;
+        }
+        operation.retryCount = retryCount + 1;
+        log.warn('operation.retry_scheduled', {
           operationId: operation.id,
           chain: operation.chain,
+          retryCount: operation.retryCount,
+          maxRetries: maxOperationRetries,
+          error,
         });
         operation.error = safeError(error);
         this.store.saveOperation(operation);
         this.store.notify(
           `pending:${operation.id}`,
-          `${operation.chain} operation is awaiting reconciliation: ${safeError(error)}`,
+          `${operation.chain} operation will retry automatically (${operation.retryCount}/${maxOperationRetries}): ${safeError(error)}`,
         );
         return;
       }
@@ -509,25 +630,77 @@ export class TradeEngine {
     this.ensureTradingAllowed();
     if (operation.kind !== 'buy') return;
     if (this.stopped) throw new TradeRejected('Bot is shutting down before swap submission');
-    const global = this.store.settings();
-    if (!global.chains[operation.chain].enabled)
-      throw new TradeRejected('Chain entries were disabled before signing');
+    if (operation.signal?.sourceId) {
+      const source = this.store.callChannel(operation.signal.sourceId);
+      if (
+        !source?.enabled ||
+        source.status !== 'ready' ||
+        source.channelId !== operation.signal.channelId ||
+        operation.signal.date < source.activatedAt
+      )
+        throw new TradeRejected('Source channel was disabled or changed before signing');
+    }
+    const settings = this.store.tradingSettings(operation.chain, operation.signal?.sourceId);
+    if (!settings.enabled) throw new TradeRejected('Channel entries were disabled before signing');
     if (operation.signal && Date.now() - operation.signal.date > this.config.maxSignalAgeMs)
       throw new TradeRejected('Call expired before swap submission');
     if (
       operation.signal &&
-      global.blockedCallers.some(
-        (caller) =>
-          caller.replace(/^@/, '') === operation.signal!.caller ||
-          caller === operation.signal!.callerId,
-      )
+      this.store
+        .callerBlocklist(operation.signal.sourceId)
+        .some(
+          (caller) =>
+            caller.replace(/^@/, '') === operation.signal!.caller ||
+            caller === operation.signal!.callerId,
+        )
     )
       throw new TradeRejected('Caller was blocked before signing');
   }
+  private fundsFailed(operation: Operation, reason: string): void {
+    const position = operation.positionId ? this.store.position(operation.positionId) : null;
+    const sourceId =
+      operation.signal?.sourceId ?? position?.sourceId ?? operation.funding?.sourceId;
+    if (position && BigInt(position.remainingTokenRaw) > 0n) {
+      position.fundsError = reason;
+      this.store.savePosition(position);
+    }
+    if (sourceId && this.store.callChannel(sourceId))
+      this.store.updateChannelRules(sourceId, 'robinhood', (settings) => {
+        settings.enabled = false;
+      });
+    else if (!sourceId) {
+      const settings = this.store.settings();
+      settings.chains.robinhood.enabled = false;
+      this.store.saveSettings(settings);
+    }
+    this.store.notify(
+      `funds:${operation.id}`,
+      `Robinhood funds error: ${reason}\nNew Robinhood buys for ${sourceId ? (this.store.callChannel(sourceId)?.title ?? 'this channel') : 'the default configuration'} are disabled. Position price monitoring continues. No automatic retry will be made for this operation.${position && BigInt(position.remainingTokenRaw) > 0n ? '\nFund the wallet, then use Resume exits after funding on this position to allow another automatic sale.' : ''}`,
+    );
+  }
+  resumeExits(positionId: string): void {
+    const position = this.store.position(positionId);
+    if (!position || position.closedAt !== null) throw new Error('Position is no longer open');
+    if (this.store.activeOperation(position.chain))
+      throw new Error('This chain has an operation in progress');
+    position.fundsError = undefined;
+    position.lastError = null;
+    this.store.savePosition(position);
+    void this.tick();
+  }
   private async monitor(chain: Chain): Promise<boolean> {
-    const settings = this.store.settings().chains[chain];
-    log.debug('positions.poll', { chain, count: this.store.positions(chain).length });
-    for (const position of this.store.positions(chain)) {
+    const positions = this.store.positions(chain);
+    log.debug('positions.poll', { chain, count: positions.length });
+    const active = positions.filter(
+      (position) =>
+        position.exits.stopLoss.enabled ||
+        position.exits.takeProfitEnabled ||
+        position.exits.trailingSl.enabled ||
+        position.exits.trailingTp.enabled,
+    );
+    const referenceQuotes = this.prices ? await this.prices.quotes(active) : null;
+    for (const position of positions) {
+      const settings = this.store.positionSettings(position);
       if (
         !position.exits.stopLoss.enabled &&
         !position.exits.takeProfitEnabled &&
@@ -546,8 +719,20 @@ export class TradeEngine {
         entryCostRaw(position);
         const quote = await withLogContext(
           { chain, positionId: position.id, token: position.address },
-          () =>
-            this.adapters[chain].quoteSell(position.address, position.remainingTokenRaw, settings),
+          async () => {
+            if (!referenceQuotes)
+              return this.adapters[chain].quoteSell(
+                position.address,
+                position.remainingTokenRaw,
+                settings,
+              );
+            const quote = referenceQuotes.get(position.id);
+            if (!quote)
+              throw new Error(
+                'Current reference price is missing or stale; this exit evaluation was skipped',
+              );
+            return quote;
+          },
         );
         log.info('position.quote_received', {
           chain,
@@ -588,6 +773,16 @@ export class TradeEngine {
           });
           continue;
         }
+        if (position.fundsError) {
+          log.info('exit.waiting', {
+            chain,
+            positionId: position.id,
+            token: position.address,
+            reason: 'funds_error_requires_owner_resume',
+            error: position.fundsError,
+          });
+          continue;
+        }
         log.info('exit.triggered', {
           chain,
           positionId: position.id,
@@ -606,6 +801,9 @@ export class TradeEngine {
           fetchedAt: Date.now(),
         };
         const operation = this.operation(chain, token, 'sell', decision.amountRaw);
+        operation.approvalAmountRaw = position.remainingTokenRaw;
+        operation.settings = structuredClone(settings);
+        operation.settings.exits = structuredClone(position.exits);
         operation.positionId = position.id;
         operation.exitKey = decision.key;
         operation.exitDescription = exitReasonLabel(decision.key, position.exits);
@@ -641,13 +839,50 @@ export class TradeEngine {
     return false;
   }
   async refresh(position: Position): Promise<Position> {
-    const settings = this.store.settings().chains[position.chain];
+    const snapshot = this.store.position(position.id);
+    if (!snapshot) throw new Error('Position no longer exists');
+    if (
+      this.stopped ||
+      snapshot.closedAt !== null ||
+      this.busy.has(snapshot.chain) ||
+      this.store.activeOperation(snapshot.chain)
+    ) {
+      log.info('position.refresh_skipped', {
+        chain: snapshot.chain,
+        positionId: snapshot.id,
+        token: snapshot.address,
+        reason: 'closed_position_or_trade_in_progress',
+      });
+      return snapshot;
+    }
+    position = snapshot;
+    const settings = this.store.positionSettings(position);
     try {
-      const quote = await this.adapters[position.chain].quoteSell(
-        position.address,
-        position.remainingTokenRaw,
-        settings,
-      );
+      const quote = this.prices
+        ? (await this.prices.quotes([position])).get(position.id)
+        : await this.adapters[position.chain].quoteSell(
+            position.address,
+            position.remainingTokenRaw,
+            settings,
+          );
+      if (!quote) throw new Error('Current reference price is missing or stale');
+      const current = this.store.position(position.id);
+      if (!current || this.stopped) return current ?? position;
+      if (
+        current.closedAt !== null ||
+        current.remainingTokenRaw !== quote.inputRaw ||
+        this.busy.has(current.chain) ||
+        this.store.activeOperation(current.chain)
+      ) {
+        log.info('position.refresh_skipped', {
+          chain: current.chain,
+          positionId: current.id,
+          token: current.address,
+          reason: 'holdings_changed_or_trade_in_progress',
+        });
+        return current;
+      }
+      position = current;
       const quotedValue = BigInt(quote.outputRaw);
       position.lastProfitPercent =
         Number(profitBps(quotedValue, BigInt(position.remainingTokenRaw), position)) / 100;
@@ -664,12 +899,30 @@ export class TradeEngine {
         nativeUsd: quote.nativeUsd,
         receivedAt: quote.receivedAt,
       });
+      log.info('position.refresh_quote', {
+        chain: position.chain,
+        positionId: position.id,
+        token: position.address,
+        quote,
+        profitPercent: position.lastProfitPercent,
+      });
     } catch (error) {
       log.error('position.refresh_failed', error, {
         chain: position.chain,
         positionId: position.id,
         token: position.address,
       });
+      const current = this.store.position(position.id);
+      if (
+        !current ||
+        current.closedAt !== null ||
+        current.remainingTokenRaw !== position.remainingTokenRaw ||
+        this.stopped ||
+        this.busy.has(current.chain) ||
+        this.store.activeOperation(current.chain)
+      )
+        return current ?? position;
+      position = current;
       position.lastError = safeError(error);
     }
     this.store.savePosition(position);
@@ -683,7 +936,8 @@ export class TradeEngine {
       throw new Error('Sell percentage must be between 0 and 100');
     if (this.busy.has(position.chain) || this.store.activeOperation(position.chain))
       throw new Error('This chain already has an operation in progress');
-    const missing = this.readiness(position.chain, false);
+    const settings = this.store.positionSettings(position);
+    const missing = this.readiness(position.chain, false, settings);
     if (missing.length) throw new Error(`Configure ${missing.join(', ')}`);
     const amount =
       (BigInt(position.remainingTokenRaw) * BigInt(Math.round(percentage * 100))) / 10_000n;
@@ -704,6 +958,9 @@ export class TradeEngine {
       amount.toString(),
     );
     operation.positionId = position.id;
+    operation.approvalAmountRaw = position.remainingTokenRaw;
+    operation.settings = structuredClone(settings);
+    operation.settings.exits = structuredClone(position.exits);
     operation.exitKey = 'manual';
     operation.exitDescription = exitReasonLabel('manual', position.exits);
     if (!this.store.claim(operation))
@@ -734,6 +991,34 @@ export class TradeEngine {
     );
     if (!this.store.claim(operation)) throw new Error('Robinhood has an operation in progress');
     void this.tick();
+  }
+  async wrap(amount: string, sourceId?: string): Promise<string> {
+    this.ensureTradingAllowed();
+    if (this.stopped) throw new Error('Bot is shutting down');
+    if (this.busy.has('robinhood') || this.store.activeOperation('robinhood'))
+      throw new Error('Robinhood has an operation in progress');
+    const amountRaw = parseAmount(amount, 18);
+    if (amountRaw <= 0n) throw new Error('Wrap amount must be greater than zero');
+    const operation = this.operation(
+      'robinhood',
+      {
+        chain: 'robinhood',
+        address: this.adapters.robinhood.address,
+        symbol: 'WETH',
+        decimals: 18,
+        marketCapUsd: null,
+        liquidityUsd: null,
+        usdPrice: null,
+        fetchedAt: Date.now(),
+      },
+      'wrap',
+      amountRaw.toString(),
+    );
+    operation.settings = structuredClone(this.store.tradingSettings('robinhood', sourceId));
+    operation.funding = { sourceId };
+    if (!this.store.claim(operation)) throw new Error('Robinhood has an operation in progress');
+    void this.tick();
+    return operation.id;
   }
   async withdraw(
     chain: Chain,
@@ -783,9 +1068,18 @@ export class TradeEngine {
     const operation = this.store.operation(id);
     if (!operation || operation.status !== 'review')
       throw new Error('No matching operation awaiting review');
-    operation.settings.priorityFee = this.store.settings().chains[operation.chain].priorityFee;
+    const position = operation.positionId ? this.store.position(operation.positionId) : null;
+    const source = operation.signal?.sourceId
+      ? this.store.callChannel(operation.signal.sourceId)
+      : null;
+    operation.settings.priorityFee = position
+      ? this.store.positionSettings(position).priorityFee
+      : source
+        ? this.store.tradingSettings(operation.chain, source.id).priorityFee
+        : operation.settings.priorityFee;
     operation.status = 'active';
     operation.error = null;
+    operation.retryCount = 0;
     this.store.saveOperation(operation);
     void this.tick();
   }

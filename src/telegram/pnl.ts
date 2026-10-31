@@ -64,6 +64,7 @@ export function pnlMessage(summary: PnlSummary, updating = false): MessageText {
       ? []
       : [`Oldest quote: ${new Date(summary.oldestQuoteAt).toISOString()}`]),
     italic('Open PNL includes allocated entry fees; future sell network fees are excluded.'),
+    italic('Open values use reference prices; actual sale proceeds can differ.'),
     ...(!summary.buys && !summary.sells ? ['', 'No confirmed trades in this period.'] : []),
     ...(missing
       ? ['', `${missing} sale(s) excluded: missing fill amounts, USD rates or entry history.`]

@@ -10,6 +10,7 @@ import { settingsSchema, type Settings } from '../src/domain.js';
 import { Store } from '../src/infra/store.js';
 import type { TradeEngine } from '../src/trading/engine.js';
 import { ControlBot } from '../src/telegram/bot.js';
+import { settingsCallback, unpackSettingsCallback } from '../src/telegram/settings-scope.js';
 import {
   BotAccess,
   watcherCallbackAllowed,
@@ -105,6 +106,48 @@ function botFixture(t: TestContext) {
   const metadata = metadataStore();
   const settings = settingsSchema.parse({});
   settings.chains.solana.consistency.overall = 42;
+  const firstRules = structuredClone(settings.chains);
+  const secondRules = structuredClone(settings.chains);
+  const sources = new Map([
+    [
+      'first',
+      {
+        id: 'first',
+        title: 'First channel',
+        enabled: true,
+        status: 'ready',
+        channelId: '-1001',
+        username: 'first_calls',
+        defaultChain: null,
+        target: 'first_calls',
+        activatedAt: 0,
+        error: null,
+        mode: 'spydefi' as const,
+        settingsKey: 'a1b2c3',
+        settings: firstRules,
+        blockedCallers: [] as string[],
+      },
+    ],
+    [
+      'second',
+      {
+        id: 'second',
+        title: 'Second channel',
+        enabled: false,
+        status: 'ready',
+        channelId: '-1002',
+        username: 'second_calls',
+        defaultChain: null,
+        target: 'second_calls',
+        activatedAt: 0,
+        error: null,
+        mode: 'general' as const,
+        settingsKey: 'd4e5f6',
+        settings: secondRules,
+        blockedCallers: [] as string[],
+      },
+    ],
+  ]);
   let writes = 0;
   const store = {
     ...metadata,
@@ -114,7 +157,31 @@ function botFixture(t: TestContext) {
       change(settings);
       return structuredClone(settings);
     },
+    tradingSettings: (chain: 'solana' | 'robinhood', sourceId?: string) =>
+      structuredClone(sourceId ? sources.get(sourceId)!.settings[chain] : settings.chains[chain]),
+    callerBlocklist: (sourceId?: string) =>
+      sourceId ? sources.get(sourceId)!.blockedCallers : settings.blockedCallers,
+    callChannel: (id: string) => (sources.has(id) ? structuredClone(sources.get(id)) : null),
+    callChannelForSettings: (key: string) =>
+      structuredClone([...sources.values()].find((source) => source.settingsKey === key) ?? null),
+    saveCallChannel: (source: { id: string; enabled: boolean }) => {
+      writes++;
+      Object.assign(sources.get(source.id)!, source);
+    },
+    removeCallChannel: (id: string) => {
+      writes++;
+      sources.delete(id);
+    },
+    updateChannelRules: (
+      sourceId: string,
+      chain: 'solana' | 'robinhood',
+      change: (rules: Settings['chains']['solana']) => void,
+    ) => {
+      writes++;
+      change(sources.get(sourceId)!.settings[chain]);
+    },
     positions: () => [],
+    callChannels: () => structuredClone([...sources.values()]),
     activeOperation: () => null,
   } as unknown as Store;
   const mutate = async () => {
@@ -193,7 +260,16 @@ function botFixture(t: TestContext) {
       : { update_id: updateId, message };
     await control.bot.handleUpdate(update);
   };
-  return { send, requests, settings, writes: () => writes };
+  return {
+    send,
+    requests,
+    settings: { ...settings, chains: firstRules },
+    globals: settings,
+    firstRules,
+    secondRules,
+    removeFirst: () => sources.delete('first'),
+    writes: () => writes,
+  };
 }
 
 test('forged watcher callbacks and text never reach trade or settings handlers', async (t) => {
@@ -219,6 +295,13 @@ test('forged watcher callbacks and text never reach trade or settings handlers',
     'unwrapyes',
     'reconcile:id',
     'resume',
+    'channeladd',
+    'channeltoggle:id',
+    'channelchain:id:robinhood',
+    'channelretry:id',
+    'channelremove:id',
+    'channelrmconfirm:id',
+    'channelremovechoose:0',
     'unknown',
   ]) {
     await fixture.send(456, action, true);
@@ -226,7 +309,7 @@ test('forged watcher callbacks and text never reach trade or settings handlers',
   await fixture.send(456, '0.5');
   assert.equal(fixture.writes(), 0);
   const denials = fixture.requests.filter((request) => request.method === 'answerCallbackQuery');
-  assert.equal(denials.length, 21);
+  assert.equal(denials.length, 28);
   assert.ok(denials.every((request) => request.payload.show_alert === true));
   assert.match(String(fixture.requests.at(-1)?.payload.text), /read.only/i);
   const requestCount = fixture.requests.length;
@@ -246,13 +329,115 @@ test('watcher views use current owner settings and cannot consume the owner pend
       (button) => !('callback_data' in button) || watcherCallbackAllowed(button.callback_data),
     ),
   );
-  await fixture.send(123, 'edit:solana:buySize', true);
+  await fixture.send(123, settingsCallback('a1b2c3', 'edit:solana:buySize'), true);
   await fixture.send(456, '/settings');
   await fixture.send(456, '0.9');
   assert.equal(fixture.writes(), 0);
   await fixture.send(123, '0.25');
   assert.equal(fixture.writes(), 1);
   assert.equal(fixture.settings.chains.solana.buySizeNative, '0.25');
+  assert.equal(fixture.globals.chains.solana.buySizeNative, null);
+});
+
+test('channel settings buttons edit their original source rather than the last opened channel', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, settingsCallback('d4e5f6', 'menu:solana:buy'), true);
+  await fixture.send(123, settingsCallback('a1b2c3', 'edit:solana:buySize'), true);
+  await fixture.send(123, '0.12');
+  assert.equal(fixture.firstRules.solana.buySizeNative, '0.12');
+  assert.equal(fixture.secondRules.solana.buySizeNative, null);
+  await fixture.send(123, settingsCallback('d4e5f6', 'edit:robinhood:buySize'), true);
+  await fixture.send(123, '0.03');
+  assert.equal(fixture.secondRules.robinhood.buySizeNative, '0.03');
+  assert.equal(fixture.firstRules.robinhood.buySizeNative, null);
+  assert.equal(fixture.globals.chains.solana.buySizeNative, null);
+  fixture.removeFirst();
+  await fixture.send(123, settingsCallback('a1b2c3', 'edit:solana:buySize'), true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /no longer exists/);
+  assert.equal(fixture.writes(), 2);
+});
+
+test('main-menu channel selection survives navigation and keeps edits scoped to the named channel', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, '/start');
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
+  await fixture.send(123, 'channelpick:second', true);
+  await fixture.send(123, '/settings');
+  const screen = fixture.requests.at(-1)!.payload;
+  assert.match(String(screen.text), /Selected channel: Second channel/);
+  assert.match(String(screen.text), /2 total · 1 on · 1 off/);
+  const callbacks = (screen.reply_markup as InlineKeyboard).inline_keyboard
+    .flat()
+    .flatMap((button) => ('callback_data' in button ? [button.callback_data] : []));
+  assert.ok(callbacks.includes(settingsCallback('d4e5f6', 'chain:solana')));
+  assert.ok(callbacks.includes(settingsCallback('d4e5f6', 'chain:robinhood')));
+  assert.ok(callbacks.includes('channeltoggle:second'));
+  assert.equal(fixture.writes(), 0);
+  await fixture.send(123, settingsCallback('a1b2c3', 'edit:solana:buySize'), true);
+  await fixture.send(123, '0.14');
+  assert.equal(fixture.firstRules.solana.buySizeNative, '0.14');
+  assert.equal(fixture.secondRules.solana.buySizeNative, null);
+  await fixture.send(123, 'home', true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
+  fixture.removeFirst();
+  await fixture.send(123, '/settings');
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: Second channel/);
+});
+
+test('channel toggles and removal target the named channel while watchers can only select views', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, 'channelpick:second', true);
+  await fixture.send(456, '/settings');
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
+  await fixture.send(456, 'channelpick:second', true);
+  const screen = fixture.requests.at(-1)!.payload;
+  assert.match(String(screen.text), /Selected channel: Second channel/);
+  const callbacks = (screen.reply_markup as InlineKeyboard).inline_keyboard
+    .flat()
+    .flatMap((button) => ('callback_data' in button ? [button.callback_data] : []));
+  assert.ok(!callbacks.includes('channeltoggle:second'));
+  await fixture.send(456, 'channeltoggle:second', true);
+  await fixture.send(456, 'channelremovechoose:0', true);
+  assert.equal(fixture.writes(), 0);
+  await fixture.send(123, 'channeltoggle:first', true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /2 total · 0 on · 2 off/);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
+  await fixture.send(123, 'channelremovechoose:0', true);
+  const removal = fixture.requests.at(-1)!.payload;
+  const removalActions = (removal.reply_markup as InlineKeyboard).inline_keyboard
+    .flat()
+    .flatMap((button) => ('callback_data' in button ? [button.callback_data] : []));
+  assert.ok(removalActions.includes('channelremove:second'));
+  assert.ok(!removalActions.includes('channelpick:second'));
+  await fixture.send(123, 'channelremove:second', true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Second channel/);
+  await fixture.send(123, 'channelrmconfirm:second', true);
+  await fixture.send(456, '/settings');
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
+});
+
+test('watchers can view channel rules but cannot use scoped write actions', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(456, settingsCallback('d4e5f6', 'menu:solana:buy'), true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Second channel settings/);
+  for (const action of [
+    'edit:solana:buySize',
+    'enable:solana',
+    'exittoggle:solana:tp',
+    'block:add',
+  ])
+    await fixture.send(456, settingsCallback('d4e5f6', action), true);
+  assert.equal(fixture.writes(), 0);
+  assert.equal(fixture.requests.at(-1)?.payload.show_alert, true);
+});
+
+test('channel context fits the longest trailing-stage callback in Telegram without losing its source', () => {
+  const action = 'exitdel:robinhood:sl:12345678-1234-1234-1234-123456789012';
+  const encoded = settingsCallback('a1b2c3', action);
+  assert.equal(Buffer.byteLength(encoded, 'utf8'), 64);
+  assert.deepEqual(unpackSettingsCallback(encoded), { key: 'a1b2c3', data: action });
+  assert.equal(watcherCallbackAllowed(encoded), false);
+  assert.throws(() => settingsCallback('a1b2c3', `${action}x`), /too long/);
 });
 
 test('notification receipts survive restarts and a slow watcher does not block owner delivery', () => {

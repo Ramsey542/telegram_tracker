@@ -144,7 +144,7 @@ test('Solana take profit and its minimum output use swap cost instead of wallet 
   value.entryFeeNativeRaw = '7204000';
   const decision = evaluateExits(value, quote('1500000000'));
   assert.equal(decision?.amountRaw, '900000000');
-  assert.equal(decision?.minimumNativeRaw, '1350000000');
+  assert.equal(decision?.minimumNativeRaw, '1309500000');
   assert.equal(value.lastProfitPercent, 50);
 });
 

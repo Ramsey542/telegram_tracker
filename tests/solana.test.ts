@@ -444,7 +444,7 @@ test('price impact and take-profit bounds prevent signing an unsuitable order', 
   await assert.rejects(advance(value, buy), /Price impact/);
   const sell = operation('sell');
   sell.minimumNativeRaw = '100000001';
-  await assert.rejects(advance(value, sell), /Exit price changed/);
+  await assert.rejects(advance(value, sell), /more than 3% below the target/);
   assert.equal(value.signing.mock.callCount(), 0);
   assert.equal(value.executions.length, 0);
 });

@@ -19,6 +19,8 @@ export function logSignalDetected(signal: CallSignal, post: ChannelPost): void {
     token: signal.address,
     symbol: signal.tokenName ?? null,
     caller: signal.caller,
+    source: signal.sourceName ?? null,
+    sourceMode: signal.mode ?? 'spydefi',
     detectedAt: iso(signal.detectedAt),
     publishedAt: iso(signal.date),
     revision: post.revision,

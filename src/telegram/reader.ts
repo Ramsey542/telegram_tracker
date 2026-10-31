@@ -8,7 +8,10 @@ import { StringSession } from 'teleproto/sessions';
 import { type NewMessageEvent, type EditedMessageEvent } from 'teleproto/events';
 import { channelEvents } from './channel-events.js';
 import type { Config } from '../config.js';
-import { chains, type ChannelPost, type CallSignal } from '../domain.js';
+import { chains, type ChannelPost, type CallSignal, type CallChannel } from '../domain.js';
+import { ChannelRegistry } from './channel-registry.js';
+import { parseGeneralCall } from './generic-parser.js';
+import type { MarketData } from '../providers/market.js';
 import type { Wallets } from '../wallets.js';
 import { atomicWrite } from '../wallets.js';
 import { Store } from '../infra/store.js';
@@ -25,14 +28,26 @@ export class ChannelReader {
   private timer: ReturnType<typeof setInterval> | null = null;
   private polling = false;
   private ready = false;
+  private stopped = false;
+  private readonly ingesting = new Set<Promise<void>>();
+  private readonly pollRetryAt = new Map<string, number>();
+  readonly channels: ChannelRegistry;
   constructor(
     private readonly config: Config,
     private readonly wallets: Wallets,
     private readonly store: Store,
     private readonly wake: (signal?: CallSignal) => void,
-  ) {}
-  private async request<T>(clientMethod: string, action: () => Promise<T>): Promise<T> {
-    const fields = { requestId: randomUUID(), clientMethod, source: this.config.sourceChannel };
+    private readonly market?: MarketData,
+  ) {
+    this.store.seedCallChannels(config.sourceChannel);
+    this.channels = new ChannelRegistry(store);
+  }
+  private async request<T>(
+    clientMethod: string,
+    action: () => Promise<T>,
+    source = this.config.sourceChannel,
+  ): Promise<T> {
+    const fields = { requestId: randomUUID(), clientMethod, source };
     const started = Date.now();
     apiLog.debug('api.request', fields);
     try {
@@ -115,6 +130,11 @@ export class ChannelReader {
     } finally {
       input.close();
     }
+    const account = await this.request('getMe', () => client.getMe());
+    if (account.id.toString() !== String(this.config.ownerId))
+      throw new Error(
+        'Telegram channel reader is logged into a different account. Set TELEGRAM_PHONE to the owner phone, back up the Telegram session file, and log in again.',
+      );
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', this.wallets.encryptionKey, iv);
     const ciphertext = Buffer.concat([cipher.update(session.save(), 'utf8'), cipher.final()]);
@@ -126,82 +146,78 @@ export class ChannelReader {
         ciphertext: ciphertext.toString('base64'),
       }),
     );
-    const entity = await this.request('getEntity', () =>
-      client.getEntity(this.config.sourceChannel),
-    );
-    if (!(entity instanceof Api.Channel) || !entity.broadcast)
-      throw new Error('Configured Telegram source is not a broadcast channel');
-    if (entity.left)
-      await this.request('channels.JoinChannel', () =>
-        client.invoke(new Api.channels.JoinChannel({ channel: utils.getInputChannel(entity) })),
-      );
-    const channelId = utils.getPeerId(entity).toString();
+    this.channels.attach(client);
     this.ready = true;
-    log.debug('reader.channel_resolved', { channelId, source: this.config.sourceChannel });
     const ingest = async (event: NewMessageEvent | EditedMessageEvent): Promise<void> => {
-      if (event.message.peerId && utils.getPeerId(event.message.peerId).toString() === channelId) {
-        try {
-          this.record(event.message, channelId);
-        } catch (error) {
-          log.error('reader.ingest_failed', error, { channelId, messageId: event.message.id });
-          throw error;
-        }
+      if (!event.message.peerId || this.stopped) return;
+      const source = this.channels.source(utils.getPeerId(event.message.peerId).toString());
+      if (!source) return;
+      const work = this.record(event.message, source.channel);
+      this.ingesting.add(work);
+      try {
+        await work;
+      } catch (error) {
+        log.error('reader.ingest_failed', error, {
+          channelId: source.channel.channelId,
+          messageId: event.message.id,
+        });
+      } finally {
+        this.ingesting.delete(work);
       }
     };
-    for (const event of channelEvents(channelId)) client.addEventHandler(ingest, event);
-    const cursorKey = `cursor:${channelId}`;
-    if (this.store.metadata(cursorKey) === null) {
-      const messages = await this.request('getMessages', () =>
-        client.getMessages(entity, { limit: 1 }),
-      );
-      this.store.setMetadata(cursorKey, String(messages[0]?.id ?? 0));
-      log.debug('reader.cursor_initialized', {
-        channelId,
-        cursor: messages[0]?.id ?? 0,
-        reason: 'start_with_new_posts_only',
-      });
-    }
+    for (const event of channelEvents()) client.addEventHandler(ingest, event);
     const poll = async (): Promise<void> => {
-      if (this.polling) return;
+      if (this.polling || this.stopped) return;
       this.polling = true;
-      const started = Date.now();
-      let captured = 0;
       try {
-        let cursor = Number(this.store.metadata(cursorKey) ?? '0');
-        for (let page = 0; page < 5; page++) {
-          const messages = await this.request('getMessages', () =>
-            client.getMessages(entity, {
-              minId: cursor,
-              reverse: true,
-              limit: 100,
-            }),
-          );
-          for (const message of messages) {
-            if (!(message instanceof Api.Message) || message.id <= cursor) continue;
-            this.record(message, channelId);
-            captured++;
-            cursor = message.id;
-            this.store.setMetadata(cursorKey, String(cursor));
+        await this.channels.refresh();
+        for (const source of this.channels.list()) {
+          if (this.stopped) break;
+          if (Date.now() < (this.pollRetryAt.get(source.channel.id) ?? 0)) continue;
+          const channelId = source.channel.channelId!;
+          const cursorKey = `cursor:${channelId}`;
+          let cursor = Number(this.store.metadata(cursorKey) ?? '0');
+          try {
+            for (let page = 0; page < 5 && !this.stopped; page++) {
+              const messages = await this.request(
+                'getMessages',
+                () =>
+                  client.getMessages(source.entity, { minId: cursor, reverse: true, limit: 100 }),
+                source.channel.title,
+              );
+              for (const message of messages) {
+                if (!(message instanceof Api.Message) || message.id <= cursor || this.stopped)
+                  continue;
+                await this.record(message, source.channel);
+                cursor = message.id;
+                this.store.setMetadata(cursorKey, String(cursor));
+              }
+              if (messages.length < 100) break;
+            }
+            this.store.setMetadata(`reader:last-success:${source.channel.id}`, String(Date.now()));
+            this.store.setMetadata('reader:last-success', String(Date.now()));
+            this.pollRetryAt.delete(source.channel.id);
+            const current = this.store.callChannel(source.channel.id);
+            if (current?.error) {
+              current.error = null;
+              this.store.saveCallChannel(current);
+            }
+          } catch (error) {
+            this.pollRetryAt.set(source.channel.id, Date.now() + 30_000);
+            const current = this.store.callChannel(source.channel.id);
+            if (current) {
+              current.error = safeError(error);
+              this.store.saveCallChannel(current);
+            }
+            log.error('reader.poll_failed', error, { channelId, source: source.channel.title });
+            this.store.notify(
+              `reader:${source.channel.id}:${Math.floor(Date.now() / 300_000)}`,
+              `Cannot read ${source.channel.title}: ${safeError(error)}`,
+            );
           }
-          if (messages.length < 100) break;
         }
-        this.store.setMetadata('reader:last-success', String(Date.now()));
-        log.debug('reader.poll_success', {
-          channelId,
-          cursor,
-          captured,
-          durationMs: Date.now() - started,
-        });
       } catch (error) {
-        log.error('reader.poll_failed', error, {
-          channelId,
-          source: this.config.sourceChannel,
-          durationMs: Date.now() - started,
-        });
-        this.store.notify(
-          `reader:${Math.floor(Date.now() / 300_000)}`,
-          `Telegram reader issue: ${safeError(error)}`,
-        );
+        log.error('reader.refresh_failed', error);
       } finally {
         this.polling = false;
       }
@@ -211,14 +227,14 @@ export class ChannelReader {
       void poll();
     }, 10_000);
     const enabled = chains
-      .filter((chain) => this.store.settings().chains[chain].enabled)
+      .filter((chain) => this.store.entriesEnabled(chain))
       .map((chain) => (chain === 'solana' ? 'Solana' : 'Robinhood'));
     this.store.notify(
       `reader-start:${process.pid}`,
-      `Connected to ${this.config.sourceChannel}. ${this.config.listenOnly ? 'LISTEN ONLY: all trading is blocked.' : `Enabled buy chains: ${enabled.join(', ') || 'none'}. Each chain is controlled in its own settings.`}`,
+      `Telegram reader connected. Monitored channels: ${this.channels.list().length}. ${this.config.listenOnly ? 'LISTEN ONLY: all trading is blocked.' : `Enabled buy chains: ${enabled.join(', ') || 'none'}. Each chain is controlled in its own settings.`}`,
     );
   }
-  private sourcePost(message: Api.Message, channelId: string): ChannelPost {
+  private sourcePost(message: Api.Message, source: CallChannel): ChannelPost {
     const urls: string[] = [];
     for (const entity of message.entities ?? []) {
       if (entity instanceof Api.MessageEntityTextUrl) urls.push(entity.url);
@@ -230,7 +246,10 @@ export class ChannelReader {
         for (const button of row.buttons)
           if (button.type instanceof Api.InlineButtonTypeUrl) urls.push(button.type.url);
     return {
-      channelId,
+      channelId: source.channelId!,
+      sourceId: source.id,
+      sourceName: source.title,
+      mode: source.mode,
       messageId: message.id,
       date: message.date * 1000,
       text: message.message,
@@ -238,29 +257,61 @@ export class ChannelReader {
       revision: message.editDate ?? message.date,
     };
   }
-  async hydrateHistory(messageIds: number[]): Promise<void> {
+  async hydrateHistory(references: { channelId: string; messageId: number }[]): Promise<void> {
     const client = this.client;
-    if (!client || !this.ready || messageIds.length === 0) return;
-    const messages = await this.request('getMessages', () =>
-      client.getMessages(this.config.sourceChannel, { ids: messageIds }),
-    );
-    for (const message of messages) {
-      if (!(message instanceof Api.Message) || !message.peerId) continue;
-      this.store.saveSourcePost(
-        this.sourcePost(message, utils.getPeerId(message.peerId).toString()),
+    if (!client || !this.ready || references.length === 0) return;
+    for (const channelId of new Set(references.map((ref) => ref.channelId))) {
+      const source = this.channels.source(channelId);
+      if (!source) continue;
+      const messages = await this.request(
+        'getMessages',
+        () =>
+          client.getMessages(source.entity, {
+            ids: references
+              .filter((ref) => ref.channelId === channelId)
+              .map((ref) => ref.messageId),
+          }),
+        source.channel.title,
       );
+      for (const message of messages)
+        if (message instanceof Api.Message)
+          this.store.saveSourcePost(this.sourcePost(message, source.channel));
     }
   }
-  private record(message: Api.Message, channelId: string): void {
+  private async record(message: Api.Message, source: CallChannel): Promise<void> {
     const detectedAt = Date.now();
-    const post = this.sourcePost(message, channelId);
-    const parsed = parseCall(post);
+    const post = this.sourcePost(message, source);
+    if (this.store.alreadyRecorded(post)) return;
+    let parsed;
+    try {
+      parsed =
+        source.mode === 'spydefi'
+          ? parseCall(post)
+          : await parseGeneralCall(post, source, (chain, address) => {
+              if (!this.market) throw new Error('Pair lookup is unavailable');
+              return this.market.pair(chain, address);
+            });
+    } catch (error) {
+      signalLog.error('signal.extraction_failed', error, {
+        source: source.title,
+        channelId: source.channelId,
+        messageId: post.messageId,
+      });
+      parsed = { ok: false as const, reason: `Contract extraction failed: ${safeError(error)}` };
+    }
+    if (this.stopped) return;
+    if (parsed.ok)
+      Object.assign(parsed.signal, {
+        sourceId: source.id,
+        sourceName: source.title,
+        mode: source.mode,
+      });
     withLogContext(
       {
-        source: this.config.sourceChannel,
-        channelId,
+        source: source.title,
+        channelId: source.channelId!,
         messageId: message.id,
-        signalId: `${channelId}:${message.id}`,
+        signalId: `${source.channelId}:${message.id}`,
       },
       () => {
         const changed = this.store.recordPost(
@@ -292,10 +343,13 @@ export class ChannelReader {
     );
   }
   async stop(): Promise<void> {
+    this.stopped = true;
     this.ready = false;
     log.debug('reader.stopping');
     if (this.timer) clearInterval(this.timer);
     await this.client?.disconnect();
-    while (this.polling) await new Promise((resolve) => setTimeout(resolve, 100));
+    await this.channels.stop();
+    while (this.polling || this.ingesting.size > 0)
+      await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }

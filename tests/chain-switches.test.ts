@@ -145,6 +145,7 @@ for (const enabled of chains) {
       assert.equal(value.store.activeOperation(enabled)?.status, 'active');
       if (enabled === 'solana')
         assert.deepEqual(value.reads(), { tokenReads: 0, balanceReads: 0, filterChecks: 1 });
+      else assert.deepEqual(value.reads(), { tokenReads: 1, balanceReads: 0, filterChecks: 1 });
     } finally {
       value.close();
     }

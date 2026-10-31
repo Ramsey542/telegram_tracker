@@ -16,7 +16,9 @@ const envSchema = z.object({
     .regex(/^@?[A-Za-z][A-Za-z0-9_]{3,}$/)
     .default('SpyDefiLive'),
   DATA_DIRECTORY: z.string().default('.data'),
-  POSITION_POLL_SECONDS: z.coerce.number().min(2).max(300).default(10),
+  POSITION_POLL_SECONDS: z.coerce.number().min(0.5).max(300).default(10),
+  PRICE_MAX_BLOCK_LAG: z.coerce.number().int().min(1).max(10000).default(150),
+  TRANSACTION_POLL_MILLISECONDS: z.coerce.number().int().min(100).max(5000).default(300),
   MAX_SIGNAL_AGE_SECONDS: z.coerce.number().min(10).max(3600).default(120),
   HTTP_TIMEOUT_SECONDS: z.coerce.number().min(3).max(120).default(15),
   JUPITER_REQUESTS_PER_SECOND: z.coerce.number().min(0.5).max(150).default(1),
@@ -48,6 +50,8 @@ export interface Config {
   sourceChannel: string;
   dataDirectory: string;
   pollMs: number;
+  priceMaxBlockLag?: number;
+  transactionPollMs?: number;
   maxSignalAgeMs: number;
   httpTimeoutMs: number;
   solanaRpc: string;
@@ -96,6 +100,8 @@ export function loadConfig(): Config {
     sourceChannel: value.TELEGRAM_SOURCE_CHANNEL.replace(/^@/, ''),
     dataDirectory: resolve(value.DATA_DIRECTORY),
     pollMs: value.POSITION_POLL_SECONDS * 1000,
+    priceMaxBlockLag: value.PRICE_MAX_BLOCK_LAG,
+    transactionPollMs: value.TRANSACTION_POLL_MILLISECONDS,
     maxSignalAgeMs: value.MAX_SIGNAL_AGE_SECONDS * 1000,
     httpTimeoutMs: value.HTTP_TIMEOUT_SECONDS * 1000,
     solanaRpc,

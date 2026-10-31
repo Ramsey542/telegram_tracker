@@ -234,7 +234,7 @@ test('a filtered-out signal gets one skipped outcome without executing a trade',
   const value = fixture(t);
   try {
     const signal = value.signal();
-    signal.consistency.recent = 0;
+    signal.consistency!.recent = 0;
     value.store.recordPost(value.post, signal, null);
     value.setNow(300);
     await value.tick();

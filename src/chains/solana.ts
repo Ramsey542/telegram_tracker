@@ -184,6 +184,7 @@ export class SolanaAdapter implements ChainAdapter {
     });
     const order = await this.http.json('Jupiter quote', `${baseUrl}/order?${query}`, orderSchema, {
       headers: { 'x-api-key': this.config.jupiterKey },
+      retry: false,
     });
     if (
       order.inputMint !== address ||
@@ -193,7 +194,7 @@ export class SolanaAdapter implements ChainAdapter {
     )
       throw new Error('Jupiter quote does not match the requested sale');
     const nativeUsdValue = order.outUsdValue ?? order.swapUsdValue;
-    return {
+    const quote: Quote = {
       inputRaw: amountRaw,
       outputRaw: order.outAmount,
       minOutputRaw: order.otherAmountThreshold,
@@ -204,6 +205,7 @@ export class SolanaAdapter implements ChainAdapter {
       priceImpactPercent: priceImpact(order),
       receivedAt: Date.now(),
     };
+    return quote;
   }
   async advance(
     operation: Operation,
@@ -410,7 +412,7 @@ export class SolanaAdapter implements ChainAdapter {
       operation.minimumNativeRaw !== null &&
       BigInt(order.outAmount) < BigInt(operation.minimumNativeRaw)
     )
-      throw new TradeRejected('Exit price changed; waiting for the configured profit');
+      throw new TradeRejected('Exit execution quote is more than 3% below the target price');
     const expiresAt = order.expireAt == null ? null : Date.parse(order.expireAt);
     if (
       (expiresAt !== null && (!Number.isFinite(expiresAt) || Date.now() >= expiresAt)) ||

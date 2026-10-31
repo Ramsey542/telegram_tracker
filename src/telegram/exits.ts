@@ -189,10 +189,10 @@ export function exitPanel(
 ): { text: MessageText; keyboard: InlineKeyboard } {
   const mode = selectedMode(exits, kind);
   const keyboard = new InlineKeyboard()
-    .text(exitEnabled(exits, kind) ? 'Disable' : 'Enable', `exittoggle:${chain}:${kind}`)
+    .text(exitEnabled(exits, kind) ? '🔴 Disable' : '🟢 Enable', `exittoggle:${chain}:${kind}`)
     .row()
-    .text(`${mode === 'hard' ? '> ' : ''}Hard`, `exitmode:${chain}:${kind}:hard`)
-    .text(`${mode === 'trailing' ? '> ' : ''}Trailing`, `exitmode:${chain}:${kind}:trailing`)
+    .text(`🎯 ${mode === 'hard' ? '> ' : ''}Hard`, `exitmode:${chain}:${kind}:hard`)
+    .text(`📈 ${mode === 'trailing' ? '> ' : ''}Trailing`, `exitmode:${chain}:${kind}:trailing`)
     .row();
   const lines: (string | MessageText)[] = [
     bold(title(kind)),
@@ -216,12 +216,12 @@ export function exitPanel(
           `+${target.profitPercent}%: ${target.sellPercent === 'rest' ? 'sell remaining tokens' : `sell ${target.sellPercent}% of original tokens`}`,
         );
         if (exits.takeProfits.length > 1)
-          keyboard.text(`Remove +${target.profitPercent}%`, `deltp:${chain}:${target.id}`).row();
+          keyboard.text(`➖ Remove +${target.profitPercent}%`, `deltp:${chain}:${target.id}`).row();
       }
     }
-    keyboard.text('Set percentage', `exitset:${chain}:${kind}`).row();
+    keyboard.text('✏️ Set percentage', `exitset:${chain}:${kind}`).row();
     if (kind === 'tp' && exits.takeProfits.length)
-      keyboard.text('Add another target', `exitaddhard:${chain}:tp`).row();
+      keyboard.text('➕ Add another target', `exitaddhard:${chain}:tp`).row();
   } else {
     const rule = trailRule(exits, kind);
     if (rule.stages?.length) {
@@ -231,15 +231,15 @@ export function exitPanel(
         lines.push(
           message`${bold(`Stage ${index + 1}:`)} activate +${stage.activationPercent}%, trail ${stage.drawdownPercent}%, sell ${stage.sellPercent === 'rest' ? 'remaining tokens' : `${stage.sellPercent}% of remaining`}`,
         );
-        keyboard.text(`Remove stage ${index + 1}`, `exitdel:${chain}:${kind}:${stage.id}`).row();
+        keyboard.text(`➖ Remove stage ${index + 1}`, `exitdel:${chain}:${kind}:${stage.id}`).row();
       }
     } else if (exitReady(exits, kind, 'trailing')) {
       lines.push(
         `Saved stage: activate +${rule.activationPercent}%, trail ${rule.drawdownPercent}%, sell ${rule.sellPercent}% of remaining.`,
       );
-      keyboard.text('Remove saved stage', `exitdel:${chain}:${kind}:saved`).row();
+      keyboard.text('➖ Remove saved stage', `exitdel:${chain}:${kind}:saved`).row();
     } else lines.push('No trailing stages yet.');
-    keyboard.text('Add stage', `exitset:${chain}:${kind}`).row();
+    keyboard.text('➕ Add stage', `exitset:${chain}:${kind}`).row();
     lines.push(
       '',
       italic(
@@ -260,7 +260,7 @@ export function exitPanel(
       'Applies to new positions. Use Apply current exit settings on an open position to update it.',
     ),
   );
-  return { text: joinMessages(lines), keyboard: keyboard.text('Back', `menu:${chain}:exits`) };
+  return { text: joinMessages(lines), keyboard: keyboard.text('⬅️ Back', `menu:${chain}:exits`) };
 }
 export function exitPrompt(kind: ExitKind, mode: ExitMode, append = false): MessageText {
   if (mode === 'trailing')

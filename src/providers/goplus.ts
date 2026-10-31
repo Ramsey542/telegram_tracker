@@ -34,11 +34,17 @@ const securitySchema = z.object({
   sell_tax: flag,
 });
 const reportsSchema = z.record(z.string(), securitySchema);
+type SecurityReport = z.infer<typeof securitySchema>;
+const reportLifetimeMs = 30_000;
+const rateLimitCooldownMs = 60_000;
 
 export class GoPlusClient {
   private cached: { token: string; refreshAt: number } | null = null;
   private issuing: Promise<string> | null = null;
   private lastTimestamp = 0;
+  private cooldownUntil = 0;
+  private readonly reports = new Map<string, { report: SecurityReport; fetchedAt: number }>();
+  private readonly pendingReports = new Map<string, Promise<SecurityReport>>();
   private readonly appKey: string;
   private readonly appSecret: string;
   constructor(
@@ -56,8 +62,53 @@ export class GoPlusClient {
       `GoPlus returned code ${response.code}: ${response.message?.trim() || statusMessages[response.code] || 'Request failed'}`,
       { service: 'GoPlus', endpoint, code: response.code, responseBody: response },
     );
+    if (response.code === 4029) this.deferRequests(error);
     log.error('api.provider_failed', error, { endpoint, code: response.code });
     return error;
+  }
+  private deferRequests(error: ApiError): void {
+    const now = Date.now();
+    const retryAfter = error.details.retryAfter;
+    const value = typeof retryAfter === 'string' ? retryAfter.trim() : '';
+    const providerRetryAt = /^\d+(?:\.\d+)?$/.test(value)
+      ? now + Number(value) * 1000
+      : Date.parse(value);
+    this.cooldownUntil = Math.max(
+      this.cooldownUntil,
+      now + rateLimitCooldownMs,
+      Number.isFinite(providerRetryAt) ? providerRetryAt : 0,
+    );
+    error.details.retryAt = this.cooldownUntil;
+    log.warn('goplus.cooldown_started', {
+      endpoint: error.details.endpoint,
+      status: error.details.status,
+      code: error.details.code,
+      retryAt: this.cooldownUntil,
+      cooldownMs: this.cooldownUntil - now,
+    });
+  }
+  private async request(
+    service: string,
+    endpoint: string,
+    options: { method?: 'GET' | 'POST'; body?: unknown; headers?: Record<string, string> } = {},
+  ): Promise<Envelope> {
+    if (Date.now() < this.cooldownUntil)
+      throw new ApiError(
+        `GoPlus requests paused after rate limiting; retry in ${Math.ceil((this.cooldownUntil - Date.now()) / 1000)} seconds`,
+        { service, endpoint, code: 4029, retryAt: this.cooldownUntil },
+      );
+    let response: Envelope;
+    try {
+      response = await this.http.json(service, endpoint, envelopeSchema, {
+        ...options,
+        retry: false,
+      });
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 429) this.deferRequests(error);
+      throw error;
+    }
+    if (response.code === 4029) throw this.failure(endpoint, response);
+    return response;
   }
   private async issueToken(): Promise<string> {
     const endpoint = 'https://api.gopluslabs.io/api/v1/token';
@@ -65,9 +116,8 @@ export class GoPlusClient {
     this.lastTimestamp = time;
     const sign = createHash('sha1').update(`${this.appKey}${time}${this.appSecret}`).digest('hex');
     registerSecrets([sign]);
-    const response = await this.http.json('GoPlus authentication', endpoint, envelopeSchema, {
+    const response = await this.request('GoPlus authentication', endpoint, {
       method: 'POST',
-      retry: false,
       body: { app_key: this.appKey, time, sign },
     });
     if (response.code !== 1) throw this.failure(endpoint, response);
@@ -105,15 +155,47 @@ export class GoPlusClient {
   private invalidate(token: string): void {
     if (this.cached?.token === token) this.cached = null;
   }
-  async security(address: string): Promise<z.infer<typeof securitySchema>> {
+  async security(address: string): Promise<SecurityReport> {
     if (!/^0x[a-fA-F0-9]{40}$/.test(address))
       throw new Error('GoPlus requires a valid Robinhood token address');
+    address = address.toLowerCase();
+    const now = Date.now();
+    for (const [token, saved] of this.reports)
+      if (now - saved.fetchedAt >= reportLifetimeMs) this.reports.delete(token);
+    const saved = this.reports.get(address);
+    if (saved) {
+      log.info('goplus.report_reused', {
+        token: address,
+        networkRequest: false,
+        ageMs: now - saved.fetchedAt,
+        validForMs: reportLifetimeMs - (now - saved.fetchedAt),
+      });
+      return structuredClone(saved.report);
+    }
+    let pending = this.pendingReports.get(address);
+    if (!pending) {
+      pending = this.fetchSecurity(address)
+        .then((report) => {
+          this.reports.set(address, { report, fetchedAt: Date.now() });
+          log.info('goplus.report_received', {
+            token: address,
+            networkRequest: true,
+            validForMs: reportLifetimeMs,
+          });
+          return report;
+        })
+        .finally(() => this.pendingReports.delete(address));
+      this.pendingReports.set(address, pending);
+    }
+    return structuredClone(await pending);
+  }
+  private async fetchSecurity(address: string): Promise<SecurityReport> {
     const endpoint = `https://api.gopluslabs.io/api/v1/token_security/4663?contract_addresses=${address}`;
     for (let attempt = 0; attempt < 2; attempt++) {
       const token = await this.token();
       let response: Envelope;
       try {
-        response = await this.http.json('GoPlus token security', endpoint, envelopeSchema, {
+        response = await this.request('GoPlus token security', endpoint, {
           headers: token ? { Authorization: token } : {},
         });
       } catch (error) {

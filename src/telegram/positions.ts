@@ -1,6 +1,36 @@
 import { formatAmount, nativeDecimals, nativeSymbol, type Position } from '../domain.js';
 import { USD_SCALE } from '../pnl/accounting.js';
 import type { PnlFill } from '../pnl/types.js';
+import { InlineKeyboard } from 'grammy';
+
+export function positionPage(positions: Position[], requestedPage: number) {
+  const pages = Math.max(1, Math.ceil(positions.length / 10));
+  const page = Math.min(
+    Math.max(0, Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 0),
+    pages - 1,
+  );
+  const visible = positions.slice(page * 10, page * 10 + 10);
+  const keyboard = new InlineKeyboard();
+  visible.forEach((position, index) => {
+    const symbol = Array.from(position.symbol.replace(/[\x00-\x1f\x7f]/g, ' '))
+      .slice(0, 18)
+      .join('');
+    const pnl =
+      position.lastProfitPercent === null
+        ? '--'
+        : `${position.lastProfitPercent >= 0 ? '+' : ''}${position.lastProfitPercent.toFixed(1)}%`;
+    keyboard.text(
+      `🪙 ${symbol} (${nativeSymbol[position.chain]}) ${pnl}`,
+      `position:${position.id}:${page}`,
+    );
+    if (index % 2 === 1) keyboard.row();
+  });
+  keyboard.row();
+  if (page > 0) keyboard.text('⬅️ Previous', `positions:${page - 1}`);
+  if (page + 1 < pages) keyboard.text('➡️ Next', `positions:${page + 1}`);
+  keyboard.row().text('🔄 Refresh PNL', `positionsrefresh:${page}`).row().text('⬅️ Back', 'home');
+  return { visible, page, pages, keyboard };
+}
 
 function priceRatio(numerator: bigint, denominator: bigint): string {
   const whole = numerator / denominator;

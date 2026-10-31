@@ -15,6 +15,9 @@ import { positionEntryPrice } from '../src/telegram/positions.js';
 import { PnlTracker } from '../src/pnl/tracker.js';
 import type { Config } from '../src/config.js';
 import type { ChainAdapter } from '../src/chains/types.js';
+import { TradeEngine } from '../src/trading/engine.js';
+import type { RiskFilters } from '../src/providers/risk.js';
+import type { Quote } from '../src/domain.js';
 
 const now = Date.parse('2026-10-28T18:00:00Z');
 const yesterday = Date.parse('2026-10-27T12:00:00Z');
@@ -481,3 +484,50 @@ test('USD display preserves sign, sub-cent results and Telegram text styles', ()
   assert.ok(rendered.entities.some((entity) => entity.type === 'bold'));
   assert.doesNotMatch(rendered.text, /NaN|Infinity/);
 });
+
+for (const changedHoldings of [false, true]) {
+  test(`manual position refresh preserves concurrent ${changedHoldings ? 'sale quantities' : 'exit state'}`, async (context) => {
+    context.mock.method(globalThis, 'fetch', async () =>
+      assert.fail('Position refresh tests must remain offline'),
+    );
+    const directory = mkdtempSync(join(tmpdir(), 'position-refresh-'));
+    const store = new Store(directory);
+    try {
+      const current = position();
+      store.savePosition(current);
+      let resolveQuote!: (quote: Quote) => void;
+      const pending = new Promise<Quote>((resolve) => {
+        resolveQuote = resolve;
+      });
+      const adapter = { quoteSell: async () => pending } as unknown as ChainAdapter;
+      const engine = new TradeEngine(
+        {} as Config,
+        store,
+        { solana: adapter, robinhood: adapter },
+        {} as RiskFilters,
+      );
+      const refresh = engine.refresh(current);
+      const updated = store.position(current.id)!;
+      updated.trailingTp.peakNativeRaw = '9000000000';
+      updated.exitFills.existing = '1';
+      if (changedHoldings) updated.remainingTokenRaw = '50';
+      store.savePosition(updated);
+      resolveQuote({
+        inputRaw: '100',
+        outputRaw: '1100000000',
+        minOutputRaw: '1000000000',
+        nativeUsd: 100,
+        priceImpactPercent: null,
+        receivedAt: Date.now(),
+      });
+      const result = await refresh;
+      assert.equal(result.remainingTokenRaw, changedHoldings ? '50' : '100');
+      assert.equal(store.position(current.id)!.trailingTp.peakNativeRaw, '9000000000');
+      assert.equal(store.position(current.id)!.exitFills.existing, '1');
+      assert.equal(store.pnlMarks().length, changedHoldings ? 0 : 1);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}

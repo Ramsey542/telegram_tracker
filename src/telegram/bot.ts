@@ -3,13 +3,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Config } from '../config.js';
 import {
   chains,
-  chainSettingsSchema,
   emptyTrail,
   formatAmount,
   nativeDecimals,
   nativeSymbol,
   type Chain,
   type ChainSettings,
+  type CallChannel,
 } from '../domain.js';
 import { Store } from '../infra/store.js';
 import { safeError } from '../infra/http.js';
@@ -44,7 +44,16 @@ import {
 } from './access.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { recentCallMessage } from './call-history.js';
-import { positionEntryPrice } from './positions.js';
+import { channelDetails, channelList, channelStatus } from './channels.js';
+import type { ChannelRegistry } from './channel-registry.js';
+import {
+  settingsAction,
+  settingsCallback,
+  settingsKeyboard,
+  unpackSettingsCallback,
+} from './settings-scope.js';
+import { positionEntryPrice, positionPage } from './positions.js';
+import type { Position } from '../domain.js';
 import { pnlChain, pnlMessage, pnlPeriod } from './pnl.js';
 import { pnlWindow } from '../pnl/periods.js';
 import { summarizePnl } from '../pnl/accounting.js';
@@ -64,7 +73,7 @@ import {
 const log = logger.child({ component: 'telegram.control' });
 
 type PendingInput =
-  | { kind: 'field'; chain: Chain; field: string }
+  | { kind: 'field'; chain: Chain; field: string; sourceId?: string }
   | {
       kind: 'exit';
       chain: Chain;
@@ -72,11 +81,16 @@ type PendingInput =
       mode: ExitMode;
       enableAfter: boolean;
       append: boolean;
+      sourceId?: string;
     }
-  | { kind: 'block'; remove: boolean }
+  | { kind: 'block'; remove: boolean; sourceId?: string }
+  | { kind: 'channel_add' }
+  | { kind: 'wrap_amount'; sourceId?: string }
   | { kind: 'withdraw_address'; chain: Chain }
   | { kind: 'withdraw_amount'; chain: Chain; recipient: string };
 interface InteractionState {
+  wrapping?: { id: string; amount: string; expires: number; sourceId?: string };
+  settingsSourceId: string | null;
   pending: PendingInput | null;
   sale: { id: string; percentage: number; balance: string; expires: number } | null;
   withdrawal: {
@@ -113,6 +127,9 @@ const groupValue = (value: string | undefined): EditableField['group'] => {
 export class ControlBot {
   readonly bot: Bot;
   private readonly interactions = new Map<number, InteractionState>();
+  private readonly viewVersions = new Map<number, number>();
+  private readonly positionQuotes = new Map<string, Promise<Position>>();
+  private readonly refreshTasks = new Set<Promise<void>>();
   private notifier: ReturnType<typeof setInterval> | null = null;
   private readonly sending = new Set<number>();
   private readonly notificationCooldown = new Map<number, number>();
@@ -123,8 +140,11 @@ export class ControlBot {
     private readonly config: Config,
     private readonly store: Store,
     private readonly engine: TradeEngine,
-    private readonly hydrateHistory?: (messageIds: number[]) => Promise<void>,
+    private readonly hydrateHistory?: (
+      references: { channelId: string; messageId: number }[],
+    ) => Promise<void>,
     private readonly pnlTracker?: PnlTracker,
+    private readonly channelRegistry?: ChannelRegistry,
   ) {
     this.access = new BotAccess(config.ownerId, config.watcherUsername ?? '', store);
     const timing = telegramTiming(config.httpTimeoutMs);
@@ -158,6 +178,9 @@ export class ControlBot {
             return;
           }
         }
+        if (ctx.from)
+          this.viewVersions.set(ctx.from.id, (this.viewVersions.get(ctx.from.id) ?? 0) + 1);
+        if (ctx.message?.text?.startsWith('/')) this.interaction(ctx).settingsSourceId = null;
         await withLogContext(
           { updateId: ctx.update.update_id, userId: ctx.from?.id, accessRole: role },
           async () => {
@@ -177,6 +200,7 @@ export class ControlBot {
     this.bot.command('positions', (ctx) => this.positions(ctx, 0));
     this.bot.command('history', (ctx) => this.history(ctx));
     this.bot.command('pnl', (ctx) => this.pnl(ctx));
+    this.bot.command('channels', (ctx) => this.callChannels(ctx));
     this.bot.command('cancel', async (ctx) => {
       if (ctx.from) this.interactions.delete(ctx.from.id);
       await this.home(ctx);
@@ -192,11 +216,13 @@ export class ControlBot {
           '📊 /positions · Inspect positions or sell',
           '📜 /history · Recent trades',
           '/pnl - Daily, weekly and monthly USD profit and loss',
+          '/channels - Add and manage monitored call channels',
           '✖️ /cancel · Cancel the current input',
           '',
           message`💰 ${bold('Before enabling a chain')}`,
           'Set buy size and slippage. Priority fees are automatic unless you set an override. All three consistency thresholds start at 30%. Entry filters and exits start disabled.',
-          'Enable a chain to buy matching calls automatically. Disable it to stop new buys; configured exits for existing positions continue.',
+          'Open Channels and choose a source to return to its main menu. Configure its Solana or Robinhood settings, then enable the chain and channel. Disabling a channel stops new calls and buys from that source; configured exits for its existing positions continue.',
+          'Each channel has independent buy sizes, filters, fees, slippage and exits. SpyDefi feeds require consistency rates; general call channels do not. Obvious update and performance posts are ignored.',
           '',
           message`🎯 ${bold('Profit and sell percentages')}`,
           'Solana exits compare fresh SOL quotes against the confirmed swap entry price. USD PNL includes recorded swap and network fees. Confirmed sale proceeds are net of sell network fees; fills follow your slippage setting.',
@@ -244,16 +270,40 @@ export class ControlBot {
   private isWatcher(ctx: Context): boolean {
     return this.access.role(ctx.from, ctx.chat?.type) === 'watcher';
   }
+  private settingsSource(ctx: Context) {
+    const id = this.interaction(ctx).settingsSourceId;
+    return id ? this.store.callChannel(id) : null;
+  }
+  private currentSettings(ctx: Context, chain: Chain): ChainSettings {
+    return this.store.tradingSettings(chain, this.interaction(ctx).settingsSourceId ?? undefined);
+  }
+  private selectedChannel(ctx: Context): CallChannel | null {
+    const selectedId = this.store.metadata(`control:selected-channel:${ctx.from!.id}`);
+    const selected = selectedId ? this.store.callChannel(selectedId) : null;
+    if (selected) return selected;
+    const sources = this.store.callChannels();
+    return sources.find((source) => source.mode === 'spydefi') ?? sources[0] ?? null;
+  }
+  private selectChannel(ctx: Context, id: string): void {
+    if (!this.store.callChannel(id)) throw new Error('Channel no longer exists');
+    this.store.setMetadata(`control:selected-channel:${ctx.from!.id}`, id);
+  }
   private interaction(ctx: Context): InteractionState {
     if (!ctx.from) throw new Error('Telegram user is missing');
     let state = this.interactions.get(ctx.from.id);
     if (!state) {
-      state = { pending: null, sale: null, withdrawal: null };
+      state = { pending: null, sale: null, withdrawal: null, settingsSourceId: null };
       this.interactions.set(ctx.from.id, state);
     }
     return state;
   }
   private async reply(ctx: Context, text: string | MessageText): Promise<void> {
+    const source = this.settingsSource(ctx);
+    if (source)
+      text = joinMessages(
+        [bold(`${source.title} settings · ${channelStatus(source.enabled)}`), text],
+        '\n\n',
+      );
     const rendered = renderMessage(
       this.isWatcher(ctx) ? joinMessages([bold('Watcher access: read only'), text], '\n\n') : text,
     );
@@ -267,6 +317,14 @@ export class ControlBot {
     text: string | MessageText,
     keyboard: InlineKeyboard,
   ): Promise<void> {
+    const source = this.settingsSource(ctx);
+    if (source) {
+      text = joinMessages(
+        [bold(`${source.title} settings · ${channelStatus(source.enabled)}`), text],
+        '\n\n',
+      );
+      keyboard = settingsKeyboard(keyboard, source.settingsKey!);
+    }
     const watcher = this.isWatcher(ctx);
     const rendered = renderMessage(
       watcher ? joinMessages([bold('Watcher access: read only'), text], '\n\n') : text,
@@ -288,16 +346,31 @@ export class ControlBot {
     await ctx.reply(rendered.text, options);
   }
   private async home(ctx: Context): Promise<void> {
+    this.interaction(ctx).settingsSourceId = null;
     this.interaction(ctx).pending = null;
     this.interaction(ctx).withdrawal = null;
-    const settings = this.store.settings();
-    const reader = this.store.metadata('reader:last-success');
+    const sources = this.store.callChannels();
+    const selected = this.selectedChannel(ctx);
+    const reader = this.store.metadata(
+      selected ? `reader:last-success:${selected.id}` : 'reader:last-success',
+    );
+    const enabled = sources.filter((channel) => channel.enabled).length;
     const pending = chains
       .map((chain) => this.store.activeOperation(chain))
       .filter((operation) => operation !== null);
     const text = joinMessages([
       message`🔎 ${bold('SpyDefi tracker')}`,
       '',
+      ...(selected
+        ? [
+            message`${bold('Selected channel:')} ${selected.title} · ${channelStatus(selected.enabled)}`,
+            `Channel access: ${selected.status}`,
+            ...(selected.mode === 'general'
+              ? [`Default chain: ${selected.defaultChain ?? 'None'}`]
+              : []),
+            '',
+          ]
+        : ['No channels configured. Add one from Channels.', '']),
       ...(this.config.listenOnly
         ? [
             message`👀 ${bold('LISTEN ONLY')}`,
@@ -305,14 +378,19 @@ export class ControlBot {
             '',
           ]
         : []),
-      message`📡 ${bold('Source:')} @${this.config.sourceChannel}`,
+      message`📡 ${bold('Channels:')} ${sources.length} total · ${enabled} on · ${sources.length - enabled} off`,
       message`🕒 ${bold('Reader checked:')} ${reader ? new Date(Number(reader)).toISOString() : 'Connecting…'}`,
       message`📊 ${bold('Open positions:')} ${this.store.positions().length}`,
       '',
-      ...chains.flatMap((chain) => [
-        bold(chainName(chain)),
-        message`Entries: ${onOff(settings.chains[chain].enabled)} · Buy size: ${settings.chains[chain].buySizeNative ?? 'Unset'} ${nativeSymbol[chain]}`,
-      ]),
+      ...(selected
+        ? chains.flatMap((chain) => {
+            const rules = selected.settings![chain];
+            return [
+              bold(chainName(chain)),
+              `New entries: ${channelStatus(rules.enabled)} · Buy size: ${rules.buySizeNative ?? 'Unset'} ${nativeSymbol[chain]}`,
+            ];
+          })
+        : []),
       ...(pending.length
         ? [
             '',
@@ -324,36 +402,69 @@ export class ControlBot {
           ]
         : []),
     ]);
-    const keyboard = new InlineKeyboard()
-      .text('🟣 Solana settings', 'chain:solana')
-      .text('🟢 Robinhood settings', 'chain:robinhood')
-      .row()
+    const keyboard = new InlineKeyboard();
+    if (selected) {
+      keyboard
+        .text(
+          `🟣 Solana · ${channelStatus(selected.settings!.solana.enabled)}`,
+          settingsCallback(selected.settingsKey!, 'chain:solana'),
+        )
+        .text(
+          `🪶 Robinhood · ${channelStatus(selected.settings!.robinhood.enabled)}`,
+          settingsCallback(selected.settingsKey!, 'chain:robinhood'),
+        )
+        .row();
+    }
+    keyboard
       .text('👛 Wallets', 'wallets')
       .text('📊 Positions', 'positions:0')
       .row()
-      .text('🚫 Caller blocklist', 'blocklist')
-      .text('📜 History', 'history')
-      .row()
-      .text('📞 Recent calls', 'recent')
-      .text('PNL', 'pnl:day:all:0');
+      .text('📜 History', 'history');
+    if (selected)
+      keyboard.text('🚫 Caller blocklist', settingsCallback(selected.settingsKey!, 'blocklist'));
+    keyboard.row().text('📞 Recent calls', 'recent').text('💵 PNL', 'pnl:day:all:0');
     for (const operation of pending)
       if (operation.status === 'review')
         keyboard.row().text(`🔄 Reconcile ${operation.chain}`, `reconcile:${operation.id}`);
-    await this.display(ctx, text, keyboard);
+    keyboard.row().text('📺 Channels', 'channels:0');
+    if (selected)
+      keyboard.text(
+        selected.enabled ? '🔴 Disable channel' : '🟢 Enable channel',
+        `channeltoggle:${selected.id}`,
+      );
+    const channelSummary = joinMessages([
+      '',
+      bold('All channels'),
+      ...(sources.length
+        ? sources.map((source) => `${channelStatus(source.enabled)} · ${source.title}`)
+        : ['No channels configured.']),
+      '',
+      italic('Selecting a channel changes the menu. All enabled channels keep running.'),
+    ]);
+    await this.display(ctx, joinMessages([text, channelSummary]), keyboard);
   }
   private async chainMenu(ctx: Context, chain: Chain): Promise<void> {
-    const settings = this.store.settings().chains[chain];
-    const missing = this.engine.readiness(chain);
+    const source = this.settingsSource(ctx);
+    const settings = this.currentSettings(ctx, chain);
+    const missing = this.engine.readiness(chain, true, settings);
     const tpTargets = exitPlanLines(settings.exits, 'tp', selectedMode(settings.exits, 'tp'));
     const slTargets = exitPlanLines(settings.exits, 'sl', selectedMode(settings.exits, 'sl'));
     const text = joinMessages([
       bold(`${chainName(chain)} settings`),
       '',
-      message`⚙️ ${bold('Chain entries:')} ${onOff(settings.enabled)}`,
+      message`⚙️ ${bold('Chain entries:')} ${channelStatus(settings.enabled)}`,
       message`💰 ${bold('Buy size:')} ${settings.buySizeNative ?? 'Unset'} ${nativeSymbol[chain]}`,
       '',
-      message`🎯 ${bold('Minimum consistency')}`,
-      `Overall: ${settings.consistency.overall}% · Recent: ${settings.consistency.recent}% · Chain: ${settings.consistency.chain}%`,
+      ...(source?.mode === 'general'
+        ? [
+            'Consistency is not required for this channel.',
+            `Default chain: ${source.defaultChain ?? 'None'}`,
+            'The default is used only when a call has no chain hint. It applies to this channel across both chain settings.',
+          ]
+        : [
+            bold('Minimum consistency'),
+            `Overall: ${settings.consistency.overall}% · Recent: ${settings.consistency.recent}% · Chain: ${settings.consistency.chain}%`,
+          ]),
       '',
       bold(exitSummary(settings.exits, 'tp')),
       ...(tpTargets.length ? tpTargets.map(italic) : [italic('No take-profit targets set.')]),
@@ -364,19 +475,24 @@ export class ControlBot {
       missing.length
         ? message`📝 ${bold('Still needed:')} ${missing.join(', ')}`
         : settings.enabled
-          ? this.config.listenOnly
-            ? message`👀 ${bold('Chain enabled. Listen-only mode blocks trading.')}`
-            : message`✅ ${bold('Enabled: matching calls are bought automatically.')}`
+          ? source && !source.enabled
+            ? 'Rules are enabled, but channel monitoring is off.'
+            : this.config.listenOnly
+              ? message`👀 ${bold('Chain enabled. Listen-only mode blocks trading.')}`
+              : message`✅ ${bold('Enabled: matching calls are bought automatically.')}`
           : message`✅ ${bold('Ready to enable entries.')}`,
       ...(this.config.listenOnly ? [message`👀 ${bold('Listen only: trading is blocked.')}`] : []),
+      ...(source && !source.enabled
+        ? ['Channel monitoring is disabled. Enable it from the channel overview to receive calls.']
+        : []),
       '',
       italic(
-        'Market cap and token safety are under Entry filters. Configure and enable exits before using them.',
+        'These settings belong only to this channel and chain. Changes apply to future entries; existing positions retain their exit rules until explicitly updated.',
       ),
     ]);
-    const keyboard = new InlineKeyboard()
-      .text('💰 Buy size', `menu:${chain}:buy`)
-      .text('🎯 Consistency', `menu:${chain}:consistency`)
+    const keyboard = new InlineKeyboard().text('💰 Buy size', `menu:${chain}:buy`);
+    if (source?.mode !== 'general') keyboard.text('🎯 Consistency', `menu:${chain}:consistency`);
+    keyboard
       .row()
       .text('🛡️ Entry filters', `menu:${chain}:filters`)
       .text('📈 SL / TP / trailing', `menu:${chain}:exits`)
@@ -386,9 +502,17 @@ export class ControlBot {
       .text(
         settings.enabled ? '⏸️ Disable chain entries' : '▶️ Enable chain entries',
         `enable:${chain}`,
-      )
-      .row()
-      .text('⬅️ Back', 'home');
+      );
+    if (source?.mode === 'general')
+      keyboard
+        .row()
+        .text('🟣 Default: Solana', `channelchain:${source.id}:solana`)
+        .text('🪶 Default: Robinhood', `channelchain:${source.id}:robinhood`)
+        .row()
+        .text('🚫 No default chain', `channelchain:${source.id}:none`);
+    if (source && (source.status !== 'ready' || source.error))
+      keyboard.row().text('🔄 Retry channel access', `channelretry:${source.id}`);
+    keyboard.row().text('⬅️ Back', 'home');
     await this.display(ctx, text, keyboard);
   }
   private async pnl(
@@ -408,34 +532,34 @@ export class ControlBot {
     const key = `${period}:${chain}:${offset}`;
     const keyboard = new InlineKeyboard();
     for (const [value, label] of [
-      ['day', 'Daily'],
-      ['week', 'Weekly'],
-      ['month', 'Monthly'],
+      ['day', '📅 Daily'],
+      ['week', '🗓️ Weekly'],
+      ['month', '📆 Monthly'],
     ] as const)
       keyboard.text(value === period ? `[${label}]` : label, `pnl:${value}:${chain}:0`);
     keyboard.row();
     for (const [value, label] of [
-      ['all', 'All chains'],
-      ['solana', 'Solana'],
-      ['robinhood', 'Robinhood'],
+      ['all', '🌐 All chains'],
+      ['solana', '🟣 Solana'],
+      ['robinhood', '🟢 Robinhood'],
     ] as const)
       keyboard.text(value === chain ? `[${label}]` : label, `pnl:${period}:${value}:${offset}`);
-    keyboard.row().text('Previous', `pnl:${period}:${chain}:${offset + 1}`);
+    keyboard.row().text('⬅️ Previous', `pnl:${period}:${chain}:${offset + 1}`);
     if (offset > 0)
       keyboard
-        .text('Next', `pnl:${period}:${chain}:${offset - 1}`)
-        .text('Current', `pnl:${period}:${chain}:0`);
+        .text('➡️ Next', `pnl:${period}:${chain}:${offset - 1}`)
+        .text('📍 Current', `pnl:${period}:${chain}:0`);
     keyboard.row().text('🔄 Refresh view', `pnl:${key}`);
     if (!this.config.listenOnly && this.pnlTracker)
-      keyboard.text('Update open quotes', `pnlquotes:${key}`);
+      keyboard.text('🔄 Update open quotes', `pnlquotes:${key}`);
     await this.display(
       ctx,
       pnlMessage(summary, this.pnlTracker?.updating ?? false),
-      keyboard.row().text('Back', 'home'),
+      keyboard.row().text('⬅️ Back', 'home'),
     );
   }
   private async exitHome(ctx: Context, chain: Chain): Promise<void> {
-    const exits = this.store.settings().chains[chain].exits;
+    const exits = this.currentSettings(ctx, chain).exits;
     await this.display(
       ctx,
       joinMessages([
@@ -451,15 +575,15 @@ export class ControlBot {
         ),
       ]),
       new InlineKeyboard()
-        .text(`Take profit: ${exitEnabled(exits, 'tp') ? 'On' : 'Off'}`, `exit:${chain}:tp`)
+        .text(`🎯 Take profit: ${exitEnabled(exits, 'tp') ? 'On' : 'Off'}`, `exit:${chain}:tp`)
         .row()
-        .text(`Stop loss: ${exitEnabled(exits, 'sl') ? 'On' : 'Off'}`, `exit:${chain}:sl`)
+        .text(`🛑 Stop loss: ${exitEnabled(exits, 'sl') ? 'On' : 'Off'}`, `exit:${chain}:sl`)
         .row()
-        .text('Back', `chain:${chain}`),
+        .text('⬅️ Back', `chain:${chain}`),
     );
   }
   private async exitDetails(ctx: Context, chain: Chain, target: ExitKind): Promise<void> {
-    const exits = this.store.settings().chains[chain].exits;
+    const exits = this.currentSettings(ctx, chain).exits;
     if (this.isWatcher(ctx)) {
       const targets = exitPlanLines(exits, target);
       await this.display(
@@ -470,7 +594,7 @@ export class ControlBot {
           '',
           ...(targets.length ? targets : ['No targets configured.']),
         ]),
-        new InlineKeyboard().text('Back', `menu:${chain}:exits`),
+        new InlineKeyboard().text('⬅️ Back', `menu:${chain}:exits`),
       );
       return;
     }
@@ -485,7 +609,15 @@ export class ControlBot {
     enableAfter = false,
     append = false,
   ): Promise<void> {
-    this.interaction(ctx).pending = { kind: 'exit', chain, target, mode, enableAfter, append };
+    this.interaction(ctx).pending = {
+      kind: 'exit',
+      chain,
+      target,
+      mode,
+      enableAfter,
+      append,
+      sourceId: this.interaction(ctx).settingsSourceId ?? undefined,
+    };
     await this.reply(ctx, exitPrompt(target, mode, append));
   }
   private async toggleExit(
@@ -494,21 +626,23 @@ export class ControlBot {
     target: ExitKind,
     desired?: boolean,
   ): Promise<void> {
-    const exits = this.store.settings().chains[chain].exits;
+    const exits = this.currentSettings(ctx, chain).exits;
     const enabled = desired ?? !exitEnabled(exits, target);
     if (enabled && !exitReady(exits, target)) {
       await this.promptExit(ctx, chain, target, selectedMode(exits, target), true);
       return;
     }
-    this.updateChain(chain, (settings) => setExitEnabled(settings.exits, target, enabled));
+    this.updateChain(ctx, chain, (settings) => setExitEnabled(settings.exits, target, enabled));
     await this.exitDetails(ctx, chain, target);
   }
   private async group(ctx: Context, chain: Chain, group: EditableField['group']): Promise<void> {
+    if (group === 'consistency' && this.settingsSource(ctx)?.mode === 'general')
+      throw new Error('Consistency checks do not apply to general call channels');
     if (group === 'exits') {
       await this.exitHome(ctx, chain);
       return;
     }
-    const settings = this.store.settings().chains[chain];
+    const settings = this.currentSettings(ctx, chain);
     const keyboard = new InlineKeyboard();
     const title = {
       buy: '💰 Buy size',
@@ -544,7 +678,14 @@ export class ControlBot {
         italic(
           chain === 'solana'
             ? 'Jupiter builds and submits Solana buys and sells through its managed execution service. QuickNode reads receipts and reconciles pending trades. QuickNode dashboard MEV settings do not apply to Jupiter submissions.'
-            : 'Protected swaps require a UniswapX route. ETH is wrapped for the buy, and sale proceeds are unwrapped back to ETH. No public AMM fallback while protection is on.',
+            : 'Robinhood buys spend WETH. Wrap my ETH, under Buy size, can wrap a shortage before buying; this adds a transaction. Protected swaps require UniswapX. Sale proceeds are unwrapped back to ETH.',
+        ),
+      );
+    if (group === 'buy' && chain === 'robinhood')
+      lines.push(
+        '',
+        italic(
+          'Buys use WETH directly. Wrap my ETH allows one WETH balance read and wraps only the shortage, adding a transaction and fee. With this switch off, insufficient WETH fails the buy and disables new Robinhood buys for this channel. Prepare WETH upfront in Wallets.',
         ),
       );
     await this.display(ctx, joinMessages(lines), keyboard.text('⬅️ Back', `chain:${chain}`));
@@ -563,11 +704,11 @@ export class ControlBot {
       try {
         const balance = await this.engine.adapters[chain].balance();
         lines.push(
-          message`💰 ${bold('Balance:')} ${formatAmount(balance.nativeRaw, nativeDecimals[chain])} ${nativeSymbol[chain]}`,
+          message`💰 ${bold(chain === 'robinhood' ? 'ETH balance:' : 'SOL balance:')} ${formatAmount(balance.nativeRaw, nativeDecimals[chain])} ${nativeSymbol[chain]}`,
         );
         if (balance.wrappedRaw !== null)
           lines.push(
-            message`🔄 ${bold('Wrapped balance:')} ${formatAmount(balance.wrappedRaw, 18)} WETH`,
+            message`🔄 ${bold('WETH balance:')} ${formatAmount(balance.wrappedRaw, 18)} WETH`,
           );
       } catch (error) {
         log.error('control.balance_failed', error, { chain });
@@ -575,12 +716,20 @@ export class ControlBot {
       }
       lines.push('');
     }
+    lines.push(
+      italic(
+        'Robinhood buys spend WETH. ETH pays network fees. Use Wrap Robinhood ETH to prepare WETH; Wrap my ETH in channel buy settings allows automatic top-ups when needed.',
+      ),
+      '',
+    );
     await this.display(
       ctx,
       joinMessages(lines),
       new InlineKeyboard()
-        .text('Withdraw SOL', 'withdraw:solana')
-        .text('Withdraw Robinhood ETH', 'withdraw:robinhood')
+        .text('💸 Withdraw SOL', 'withdraw:solana')
+        .text('💸 Withdraw Robinhood ETH', 'withdraw:robinhood')
+        .row()
+        .text('Wrap Robinhood ETH', 'wrap')
         .row()
         .text('🔄 Unwrap idle Robinhood WETH', 'unwrap')
         .row()
@@ -588,12 +737,15 @@ export class ControlBot {
         .text('⬅️ Back', 'home'),
     );
   }
-  private async positions(ctx: Context, page: number): Promise<void> {
+  private async positions(ctx: Context, requestedPage: number, updating = false): Promise<void> {
     const positions = this.store.positions();
-    const start = Math.max(0, page) * 5;
-    const visible = positions.slice(start, start + 5);
-    const keyboard = new InlineKeyboard();
-    const lines: (string | MessageText)[] = [message`📊 ${bold('Open positions')}`, ''];
+    const { visible, page, pages, keyboard } = positionPage(positions, requestedPage);
+    const lines: (string | MessageText)[] = [
+      message`📊 ${bold('Open positions')}`,
+      `Page ${page + 1} of ${pages} | ${positions.length} open positions`,
+      ...(updating ? [italic('Refreshing quotes and PNL...')] : []),
+      '',
+    ];
     for (const position of visible) {
       lines.push(
         bold(`${label(position.symbol)} (${nativeSymbol[position.chain]})`),
@@ -601,18 +753,41 @@ export class ControlBot {
         `${formatAmount(position.remainingTokenRaw, position.decimals)} tokens | ${position.lastProfitPercent === null ? 'Value not refreshed' : `${position.lastProfitPercent.toFixed(2)}% in ${nativeSymbol[position.chain]}`}`,
         '',
       );
-      keyboard.text(`⚙️ ${label(position.symbol)} · Manage`, `position:${position.id}`).row();
     }
     if (positions.length === 0) lines.push(italic('No open positions yet.'));
-    if (page > 0) keyboard.text('⬅️ Previous', `positions:${page - 1}`);
-    if (start + 5 < positions.length) keyboard.text('Next ➡️', `positions:${page + 1}`);
-    await this.display(ctx, joinMessages(lines), keyboard.row().text('⬅️ Back', 'home'));
+    await this.display(ctx, joinMessages(lines), keyboard);
   }
-  private async position(ctx: Context, id: string, refresh = false): Promise<void> {
-    let position = this.store.position(id);
+  private queuePositionRefresh(
+    ctx: Context,
+    positions: Position[],
+    render: () => Promise<void>,
+  ): void {
+    const userId = ctx.from?.id;
+    const version = userId === undefined ? undefined : this.viewVersions.get(userId);
+    const work = Promise.all(
+      positions.map((position) => {
+        let quote = this.positionQuotes.get(position.id);
+        if (!quote) {
+          quote = this.engine
+            .refresh(position)
+            .finally(() => this.positionQuotes.delete(position.id));
+          this.positionQuotes.set(position.id, quote);
+        }
+        return quote;
+      }),
+    )
+      .then(async () => {
+        if (!this.stopping && userId !== undefined && this.viewVersions.get(userId) === version)
+          await render();
+      })
+      .catch((error) => log.error('control.positions_refresh_failed', error))
+      .finally(() => this.refreshTasks.delete(work));
+    this.refreshTasks.add(work);
+  }
+  private async position(ctx: Context, id: string, updating = false, page = 0): Promise<void> {
+    const position = this.store.position(id);
     if (!position) throw new Error('Position not found');
-    if (refresh && position.closedAt === null) position = await this.engine.refresh(position);
-    const keyboard = new InlineKeyboard().text('🔄 Refresh value', `refresh:${id}`).row();
+    const keyboard = new InlineKeyboard().text('🔄 Refresh PNL', `refresh:${id}:${page}`).row();
     if (position.closedAt === null)
       keyboard
         .text('💸 Sell 25%', `sell:${id}:25`)
@@ -622,15 +797,30 @@ export class ControlBot {
         .text('⚙️ Apply current exit settings', `apply:${id}`)
         .row();
     const exits = position.exits;
+    if (position.fundsError) keyboard.text('Resume exits after funding', `resumefunds:${id}`).row();
     const currentValue =
       position.lastValueNativeRaw === null
         ? ''
-        : message`💰 ${bold('Quoted remaining value:')} ${formatAmount(position.lastValueNativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}${position.lastValueUsd === null ? '' : ` (approximately $${position.lastValueUsd.toFixed(2)})`}`;
+        : message`💰 ${bold('Estimated remaining value:')} ${formatAmount(position.lastValueNativeRaw, nativeDecimals[position.chain])} ${nativeSymbol[position.chain]}${position.lastValueUsd === null ? '' : ` (approximately $${position.lastValueUsd.toFixed(2)})`}`;
     await this.display(
       ctx,
       joinMessages([
         message`📊 ${bold(`${label(position.symbol)} (${nativeSymbol[position.chain]})`)}`,
         code(position.address),
+        ...(position.sourceName || position.sourceId
+          ? [
+              message`${bold('Source:')} ${position.sourceName ?? this.store.callChannel(position.sourceId!)?.title ?? 'Removed channel'}`,
+            ]
+          : []),
+        ...(updating ? [italic('Refreshing quote and PNL...')] : []),
+        ...(position.fundsError
+          ? [
+              message`${bold('Funds error:')} ${position.fundsError}`,
+              italic(
+                'Price monitoring continues. Fund the wallet, then resume exits to allow another automatic sale.',
+              ),
+            ]
+          : []),
         '',
         message`${bold('Entry price:')} ${positionEntryPrice(position, this.store.positionEntryFill(position.id))}`,
         message`🪙 ${bold('Remaining:')} ${formatAmount(position.remainingTokenRaw, position.decimals)} tokens`,
@@ -661,7 +851,7 @@ export class ControlBot {
           ? ['', message`⚠️ ${bold('Last issue')}\n${position.lastError}`]
           : []),
       ]),
-      keyboard.text('⬅️ Back', 'positions:0'),
+      keyboard.text('⬅️ Back', `positions:${page}`),
     );
   }
   private async history(ctx: Context): Promise<void> {
@@ -691,7 +881,7 @@ export class ControlBot {
     );
   }
   private async blocklist(ctx: Context): Promise<void> {
-    const entries = this.store.settings().blockedCallers;
+    const entries = this.store.callerBlocklist(this.interaction(ctx).settingsSourceId ?? undefined);
     await this.display(
       ctx,
       joinMessages([
@@ -712,6 +902,24 @@ export class ControlBot {
         .text('⬅️ Back', 'home'),
     );
   }
+  private async callChannels(ctx: Context, page = 0, removing = false): Promise<void> {
+    this.interaction(ctx).settingsSourceId = null;
+    const panel = channelList(
+      this.store.callChannels(),
+      page,
+      this.selectedChannel(ctx)?.id,
+      removing,
+    );
+    await this.display(ctx, panel.text, panel.keyboard);
+  }
+  private async callChannel(ctx: Context, id: string): Promise<void> {
+    this.interaction(ctx).settingsSourceId = null;
+    const channel = this.store.callChannel(id);
+    if (!channel) throw new Error('Channel no longer exists');
+    this.selectChannel(ctx, id);
+    const panel = channelDetails(channel, this.store.metadata(`reader:last-success:${id}`));
+    await this.display(ctx, panel.text, panel.keyboard);
+  }
   private async recent(ctx: Context, requestedPage: number): Promise<void> {
     let calls = this.store.signalHistory();
     const pageSize = 3;
@@ -724,7 +932,9 @@ export class ControlBot {
       .filter((call) => call.post === null);
     if (missing.length && this.hydrateHistory) {
       try {
-        await this.hydrateHistory(missing.map((call) => call.messageId));
+        await this.hydrateHistory(
+          missing.map((call) => ({ channelId: call.channelId, messageId: call.messageId })),
+        );
         calls = this.store.signalHistory();
       } catch (error) {
         log.error('control.call_details_failed', error, {
@@ -737,7 +947,7 @@ export class ControlBot {
     const visible = calls.slice(page * pageSize, (page + 1) * pageSize);
     const keyboard = new InlineKeyboard();
     if (page > 0) keyboard.text('⬅️ Previous', `recent:${page - 1}`);
-    if (page + 1 < pages) keyboard.text('Next ➡️', `recent:${page + 1}`);
+    if (page + 1 < pages) keyboard.text('➡️ Next', `recent:${page + 1}`);
     keyboard.row().text('🔄 Refresh', `recent:${page}`).text('⬅️ Back', 'home');
     await this.display(
       ctx,
@@ -748,7 +958,12 @@ export class ControlBot {
         visible.length
           ? joinMessages(
               visible.map((call) =>
-                recentCallMessage(call, this.config.sourceChannel, this.config.listenOnly),
+                recentCallMessage(
+                  call,
+                  this.store.callChannels().find((channel) => channel.channelId === call.channelId)
+                    ?.username ?? '',
+                  this.config.listenOnly,
+                ),
               ),
               '\n\n',
             )
@@ -760,20 +975,113 @@ export class ControlBot {
       keyboard,
     );
   }
-  private updateChain(chain: Chain, action: (settings: ChainSettings) => void): void {
-    this.store.updateSettings((settings) => {
-      const updated = structuredClone(settings.chains[chain]);
-      action(updated);
-      settings.chains[chain] = chainSettingsSchema.parse(updated);
-    });
+  private updateChain(ctx: Context, chain: Chain, action: (settings: ChainSettings) => void): void {
+    const sourceId = this.interaction(ctx).settingsSourceId;
+    if (!sourceId)
+      throw new Error('Open Channels and select the channel whose rules you want to edit');
+    this.store.updateChannelRules(sourceId, chain, action);
   }
   private async callback(ctx: Context, data: string): Promise<void> {
-    const [action, value, option, detail] = data.split(':');
     const state = this.interaction(ctx);
+    const scoped = unpackSettingsCallback(data);
+    state.settingsSourceId = null;
+    if (scoped.key) {
+      const source = this.store.callChannelForSettings(scoped.key);
+      if (!source)
+        throw new Error('This channel no longer exists. Open Channels to select another source.');
+      state.settingsSourceId = source.id;
+      this.selectChannel(ctx, source.id);
+      data = scoped.data;
+    } else if (settingsAction(data)) {
+      const action = data.split(':')[0];
+      if (!['chain', 'menu', 'exit', 'blocklist'].includes(action ?? ''))
+        throw new Error('Settings are managed per channel. Open Channels and select a source.');
+      const source = this.selectedChannel(ctx);
+      if (!source) throw new Error('Open Channels and select a source to view its settings');
+      state.settingsSourceId = source.id;
+    }
+    const [action, value, option, detail] = data.split(':');
     if (action !== 'confirm') state.sale = null;
     if (action !== 'withdrawconfirm') state.withdrawal = null;
+    if (action !== 'wrapconfirm') state.wrapping = undefined;
     state.pending = null;
     switch (action) {
+      case 'channels':
+        await this.callChannels(ctx, Number(value) || 0);
+        return;
+      case 'channelremovechoose':
+        await this.callChannels(ctx, Number(value) || 0, true);
+        return;
+      case 'channelpick':
+        if (!value) throw new Error('Missing channel');
+        this.selectChannel(ctx, value);
+        await this.home(ctx);
+        return;
+      case 'channelview':
+        if (value) await this.callChannel(ctx, value);
+        return;
+      case 'channeladd':
+        state.pending = { kind: 'channel_add' };
+        await this.reply(
+          ctx,
+          message`${bold('Add a call channel')}\n\nSend a public channel @username or t.me link, or a private channel invite link. Only broadcast channels are supported.\n\nNew channels start with independent, disabled rules. Configure buy size, filters, slippage and exits under its Solana or Robinhood rules. Then enable that chain and channel monitoring.\n\n${italic('Send /cancel to cancel.')}`,
+        );
+        return;
+      case 'channelretry':
+        if (!value || !this.channelRegistry) throw new Error('Channel reader is unavailable');
+        await this.channelRegistry.retry(value);
+        this.selectChannel(ctx, value);
+        await this.home(ctx);
+        return;
+      case 'channeltoggle':
+      case 'channelchain': {
+        if (!value) throw new Error('Missing channel');
+        const channel = this.store.callChannel(value);
+        if (!channel) throw new Error('Channel no longer exists');
+        if (action === 'channeltoggle') {
+          channel.enabled = !channel.enabled;
+          if (channel.enabled) channel.activatedAt = Math.max(Date.now(), channel.activatedAt + 1);
+        } else {
+          if (channel.mode !== 'general')
+            throw new Error('SpyDefi identifies its chain from the call');
+          channel.defaultChain = option === 'none' ? null : chainValue(option);
+          channel.activatedAt = Math.max(Date.now(), channel.activatedAt + 1);
+        }
+        this.store.saveCallChannel(channel);
+        if (channel.enabled) {
+          channel.status = 'unresolved';
+          this.store.saveCallChannel(channel);
+          void this.channelRegistry
+            ?.refresh()
+            .catch((error) =>
+              log.error('control.channel_refresh_failed', error, { channelId: channel.channelId }),
+            );
+        }
+        this.selectChannel(ctx, channel.id);
+        await this.home(ctx);
+        return;
+      }
+      case 'channelremove': {
+        const channel = value ? this.store.callChannel(value) : null;
+        if (!channel) throw new Error('Channel no longer exists');
+        await this.display(
+          ctx,
+          message`${bold('Remove this call channel?')}\n\n${bold(channel.title)}\nMonitoring and future entries from this source will stop. Existing positions keep their exit rules.`,
+          new InlineKeyboard()
+            .text('✅ Confirm removal', `channelrmconfirm:${value}`)
+            .row()
+            .text('✖️ Cancel', 'channels:0'),
+        );
+        return;
+      }
+      case 'channelrmconfirm':
+        if (!value) return;
+        this.store.removeCallChannel(value);
+        void this.channelRegistry
+          ?.refresh()
+          .catch((error) => log.error('control.channel_refresh_failed', error));
+        await this.callChannels(ctx);
+        return;
       case 'home':
         await this.home(ctx);
         return;
@@ -790,7 +1098,7 @@ export class ControlBot {
       case 'exitmode': {
         const chain = chainValue(value);
         const target = exitKind(option);
-        this.updateChain(chain, (settings) =>
+        this.updateChain(ctx, chain, (settings) =>
           setExitMode(settings.exits, target, exitMode(detail)),
         );
         await this.exitDetails(ctx, chain, target);
@@ -810,7 +1118,7 @@ export class ControlBot {
           target,
           action === 'exitaddhard'
             ? 'hard'
-            : selectedMode(this.store.settings().chains[chain].exits, target),
+            : selectedMode(this.currentSettings(ctx, chain).exits, target),
           false,
           action === 'exitaddhard',
         );
@@ -820,7 +1128,9 @@ export class ControlBot {
         const chain = chainValue(value);
         const target = exitKind(option);
         if (!detail) throw new Error('Missing stage');
-        this.updateChain(chain, (settings) => removeTrailingStage(settings.exits, target, detail));
+        this.updateChain(ctx, chain, (settings) =>
+          removeTrailingStage(settings.exits, target, detail),
+        );
         await this.exitDetails(ctx, chain, target);
         return;
       }
@@ -829,7 +1139,12 @@ export class ControlBot {
         const field = option ? editableFields[option] : undefined;
         if (!field || !option || (field.chains && !field.chains.includes(chain)))
           throw new Error('Unknown setting');
-        state.pending = { kind: 'field', chain, field: option };
+        state.pending = {
+          kind: 'field',
+          chain,
+          field: option,
+          sourceId: state.settingsSourceId ?? undefined,
+        };
         await this.reply(
           ctx,
           message`${bold(`${field.label} (${nativeSymbol[chain]})`)}\n\n${field.hint}\n\n${italic('Send /cancel to cancel.')}`,
@@ -842,26 +1157,26 @@ export class ControlBot {
         if (!toggle || (toggle.chains && !toggle.chains.includes(chain)))
           throw new Error('Unknown switch');
         if (toggle.group === 'exits') {
-          const desired = !toggle.value(this.store.settings().chains[chain]);
+          const desired = !toggle.value(this.currentSettings(ctx, chain));
           const target = option === 'tp' || option === 'ttp' ? 'tp' : 'sl';
           const mode = option === 'tsl' || option === 'ttp' ? 'trailing' : 'hard';
-          if (selectedMode(this.store.settings().chains[chain].exits, target) !== mode)
-            this.updateChain(chain, (settings) => setExitMode(settings.exits, target, mode));
+          if (selectedMode(this.currentSettings(ctx, chain).exits, target) !== mode)
+            this.updateChain(ctx, chain, (settings) => setExitMode(settings.exits, target, mode));
           await this.toggleExit(ctx, chain, target, desired);
           return;
         }
-        this.updateChain(chain, toggle.change);
+        this.updateChain(ctx, chain, toggle.change);
         await this.group(ctx, chain, toggle.group);
         return;
       }
       case 'enable': {
         const chain = chainValue(value);
-        if (!this.store.settings().chains[chain].enabled) {
-          const missing = this.engine.readiness(chain);
+        if (!this.currentSettings(ctx, chain).enabled) {
+          const missing = this.engine.readiness(chain, true, this.currentSettings(ctx, chain));
           if (missing.length) throw new Error(`Configure ${missing.join(', ')}`);
           await this.engine.adapters[chain].verifyNetwork();
         }
-        this.updateChain(chain, (settings) => {
+        this.updateChain(ctx, chain, (settings) => {
           settings.enabled = !settings.enabled;
         });
         void this.engine
@@ -875,7 +1190,7 @@ export class ControlBot {
         return;
       case 'deltp': {
         const chain = chainValue(value);
-        this.updateChain(chain, (settings) => {
+        this.updateChain(ctx, chain, (settings) => {
           settings.exits.takeProfits = settings.exits.takeProfits.filter(
             (tier) => tier.id !== option,
           );
@@ -890,12 +1205,30 @@ export class ControlBot {
       case 'positions':
         await this.positions(ctx, Number(value) || 0);
         return;
+      case 'positionsrefresh': {
+        const page = Number(value) || 0;
+        const { visible } = positionPage(this.store.positions(), page);
+        await this.positions(ctx, page, true);
+        this.queuePositionRefresh(ctx, visible, () => this.positions(ctx, page));
+        return;
+      }
       case 'position':
-        if (value) await this.position(ctx, value);
+        if (value) await this.position(ctx, value, false, Number(option) || 0);
         return;
-      case 'refresh':
-        if (value) await this.position(ctx, value, true);
+      case 'resumefunds':
+        if (!value) throw new Error('Position not found');
+        this.engine.resumeExits(value);
+        await this.position(ctx, value);
         return;
+      case 'refresh': {
+        if (!value) return;
+        const page = Number(option) || 0;
+        const position = this.store.position(value);
+        if (!position) throw new Error('Position not found');
+        await this.position(ctx, value, true, page);
+        this.queuePositionRefresh(ctx, [position], () => this.position(ctx, value, false, page));
+        return;
+      }
       case 'history':
         await this.history(ctx);
         return;
@@ -911,7 +1244,11 @@ export class ControlBot {
         await this.blocklist(ctx);
         return;
       case 'block':
-        state.pending = { kind: 'block', remove: value === 'remove' };
+        state.pending = {
+          kind: 'block',
+          remove: value === 'remove',
+          sourceId: state.settingsSourceId ?? undefined,
+        };
         await this.reply(
           ctx,
           message`🚫 ${bold(value === 'remove' ? 'Remove blocked callers' : 'Block callers')}\n\nSend caller handles or numeric channel IDs, separated by spaces or newlines.\n\n${italic('Send /cancel to cancel.')}`,
@@ -934,7 +1271,7 @@ export class ControlBot {
         };
         await this.display(
           ctx,
-          message`💸 ${bold('Confirm sale')}\n\nSell ${bold(`${percentage}%`)} of the remaining ${bold(label(position.symbol))} on ${chainName(position.chain)}?\n\n${italic('Slippage and MEV settings for this chain apply.')}`,
+          message`💸 ${bold('Confirm sale')}\n\nSell ${bold(`${percentage}%`)} of the remaining ${bold(label(position.symbol))} on ${chainName(position.chain)}?\n\n${italic('This position uses the execution settings linked to its source channel.')}`,
           new InlineKeyboard()
             .text('✅ Confirm sale', `confirm:${value}:${percentage}`)
             .row()
@@ -965,9 +1302,14 @@ export class ControlBot {
         if (!value) return;
         const position = this.store.position(value);
         if (!position || position.closedAt !== null) throw new Error('No open position');
+        const source = position.sourceId ? this.store.callChannel(position.sourceId) : null;
+        if (position.sourceId && !source)
+          throw new Error(
+            'The source channel was removed. This position keeps its saved exit rules.',
+          );
         await this.display(
           ctx,
-          message`⚙️ ${bold('Apply current exit settings?')}\n\nReplace the exit rules for ${bold(label(position.symbol))} with your current ${nativeSymbol[position.chain]} settings?\n\n⚠️ ${italic('Existing trailing peaks will reset.')}`,
+          message`⚙️ ${bold('Apply current exit settings?')}\n\nReplace the exit rules for ${bold(label(position.symbol))} with the ${nativeSymbol[position.chain]} exit settings from ${bold(source?.title ?? 'the saved entry settings')}?\n\n⚠️ ${italic('Existing trailing peaks will reset.')}`,
           new InlineKeyboard()
             .text('✅ Apply exit settings', `applyyes:${value}`)
             .row()
@@ -980,7 +1322,11 @@ export class ControlBot {
         const position = this.store.position(value);
         if (!position || position.closedAt !== null || this.store.activeOperation(position.chain))
           throw new Error('Position is unavailable or has an active operation');
-        position.exits = structuredClone(this.store.settings().chains[position.chain].exits);
+        if (position.sourceId && !this.store.callChannel(position.sourceId))
+          throw new Error(
+            'The source channel was removed. This position keeps its saved exit rules.',
+          );
+        position.exits = structuredClone(this.store.positionSettings(position).exits);
         position.trailingSl = emptyTrail();
         position.trailingTp = emptyTrail();
         position.trailingStages = {};
@@ -1019,6 +1365,28 @@ export class ControlBot {
         );
         return;
       }
+      case 'wrap':
+        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap ETH');
+        if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks wrapping');
+        state.pending = { kind: 'wrap_amount', sourceId: this.selectedChannel(ctx)?.id };
+        await this.reply(
+          ctx,
+          message`${bold('Wrap Robinhood ETH')}\n\nSend the ETH amount to convert into WETH. Keep ETH for network fees. WETH is used directly for buys.\n\n${italic('Send /cancel to cancel.')}`,
+        );
+        return;
+      case 'wrapconfirm': {
+        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap ETH');
+        const wrapping = state.wrapping;
+        state.wrapping = undefined;
+        if (!wrapping || wrapping.id !== value || wrapping.expires < Date.now())
+          throw new Error('Wrap confirmation expired. Start again from Wallets.');
+        const id = await this.engine.wrap(wrapping.amount, wrapping.sourceId);
+        await this.reply(
+          ctx,
+          message`${bold('Wrap queued')}\nAmount: ${wrapping.amount} ETH\nOperation: ${code(id)}\nConfirmation will be reported here.`,
+        );
+        return;
+      }
       case 'unwrap':
         await this.display(
           ctx,
@@ -1054,6 +1422,35 @@ export class ControlBot {
       await this.reply(ctx, message`⚙️ Use /settings to choose a setting to edit.`);
       return;
     }
+    if ('sourceId' in pending) state.settingsSourceId = pending.sourceId ?? null;
+    if (pending.kind === 'wrap_amount') {
+      if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap ETH');
+      const amount = formatAmount(withdrawalAmount('robinhood', text), 18);
+      state.pending = null;
+      state.wrapping = {
+        id: this.store.newId(),
+        amount,
+        expires: Date.now() + 120_000,
+        sourceId: pending.sourceId,
+      };
+      await this.display(
+        ctx,
+        message`${bold('Confirm ETH wrapping')}\n\nConvert ${bold(`${amount} ETH`)} into WETH on Robinhood Chain.\nThis also prepares Permit2 token approval up to this amount if needed, so later buys can use signed permissions. Wrapping and any required approval each incur a network fee.\n\n${italic('Confirmation expires in two minutes.')}`,
+        new InlineKeyboard()
+          .text('Confirm wrap', `wrapconfirm:${state.wrapping.id}`)
+          .row()
+          .text('Cancel', 'wallets'),
+      );
+      return;
+    }
+    if (pending.kind === 'channel_add') {
+      if (!this.channelRegistry) throw new Error('Channel reader is unavailable');
+      const channel = await this.channelRegistry.add(text);
+      state.pending = null;
+      this.selectChannel(ctx, channel.id);
+      await this.home(ctx);
+      return;
+    }
     if (pending.kind === 'withdraw_address' || pending.kind === 'withdraw_amount') {
       if (ctx.from?.id !== this.config.ownerId)
         throw new Error('Only the owner can withdraw funds');
@@ -1085,14 +1482,14 @@ export class ControlBot {
         ctx,
         message`${bold('Confirm withdrawal')}\n\nNetwork: ${pending.chain === 'solana' ? 'Solana mainnet' : 'Robinhood Chain'}\nFrom: ${code(this.engine.adapters[pending.chain].address)}\nDestination: ${code(pending.recipient)}\nAmount: ${bold(`${amount} ${nativeSymbol[pending.chain]}`)}\n\nNetwork fees are charged in addition to this amount. Verify the full destination and network before confirming.\n\n${italic('Confirmation expires in two minutes.')}`,
         new InlineKeyboard()
-          .text('Confirm withdrawal', `withdrawconfirm:${state.withdrawal.id}`)
+          .text('✅ Confirm withdrawal', `withdrawconfirm:${state.withdrawal.id}`)
           .row()
-          .text('Cancel', 'wallets'),
+          .text('✖️ Cancel', 'wallets'),
       );
       return;
     }
     if (pending.kind === 'exit') {
-      this.updateChain(pending.chain, (settings) => {
+      this.updateChain(ctx, pending.chain, (settings) => {
         if (pending.mode === 'hard')
           saveHardExit(settings.exits, pending.target, text, this.store.newId(), pending.append);
         else saveTrailingStage(settings.exits, pending.target, text, this.store.newId());
@@ -1108,13 +1505,13 @@ export class ControlBot {
     }
     if (pending.kind === 'field') {
       const updated = applyField(
-        this.store.settings().chains[pending.chain],
+        this.currentSettings(ctx, pending.chain),
         pending.chain,
         pending.field,
         text,
       );
-      this.store.updateSettings((settings) => {
-        settings.chains[pending.chain] = updated;
+      this.updateChain(ctx, pending.chain, (settings) => {
+        Object.assign(settings, updated);
       });
       state.pending = null;
       await this.reply(ctx, message`✅ ${bold('Setting saved')}`);
@@ -1128,11 +1525,12 @@ export class ControlBot {
       .map((value) => value.replace(/^@/, ''));
     if (!callers.length || callers.some((value) => !/^(?:[a-z][a-z0-9_]{3,}|-?\d+)$/.test(value)))
       throw new Error('Use valid caller handles or numeric channel IDs');
-    this.store.updateSettings((settings) => {
-      settings.blockedCallers = pending.remove
-        ? settings.blockedCallers.filter((caller) => !callers.includes(caller.replace(/^@/, '')))
-        : [...new Set([...settings.blockedCallers, ...callers])];
-    });
+    const source = this.settingsSource(ctx);
+    if (!source) throw new Error('Open Channels to select a source before editing its blocklist');
+    source.blockedCallers = pending.remove
+      ? source.blockedCallers!.filter((caller) => !callers.includes(caller.replace(/^@/, '')))
+      : [...new Set([...source.blockedCallers!, ...callers])];
+    this.store.saveCallChannel(source);
     state.pending = null;
     await this.blocklist(ctx);
   }
@@ -1140,6 +1538,7 @@ export class ControlBot {
     this.stopping = false;
     await this.bot.init();
     await this.bot.api.setMyCommands([
+      { command: 'channels', description: 'Manage monitored call channels' },
       { command: 'settings', description: '⚙️ Configure trading and filters' },
       { command: 'wallets', description: '👛 Wallet addresses and balances' },
       { command: 'positions', description: '📊 Positions, profit and manual sales' },
@@ -1157,9 +1556,7 @@ export class ControlBot {
       })
       .catch((error) => {
         log.error('control.polling_failed', error);
-        this.store.updateSettings((settings) => {
-          for (const chain of chains) settings.chains[chain].enabled = false;
-        });
+        this.store.disableAllEntries();
         log.warn('chain.entries_disabled', { chains, reason: 'telegram_control_polling_failed' });
       });
     log.debug('control.started', {
@@ -1191,10 +1588,15 @@ export class ControlBot {
             );
             const keyboard = notification.solanaSignature
               ? new InlineKeyboard().url(
-                  'View on Solscan',
+                  '🔗 View on Solscan',
                   `https://solscan.io/tx/${encodeURIComponent(notification.solanaSignature)}`,
                 )
-              : undefined;
+              : notification.robinhoodHash
+                ? new InlineKeyboard().url(
+                    'View on Blockscout',
+                    `https://robinhoodchain.blockscout.com/tx/${encodeURIComponent(notification.robinhoodHash)}`,
+                  )
+                : undefined;
             await this.bot.api.sendMessage(recipientId, rendered.text, {
               entities: rendered.entities,
               reply_markup: keyboard,
@@ -1221,6 +1623,7 @@ export class ControlBot {
     this.stopping = true;
     if (this.notifier) clearInterval(this.notifier);
     if (this.bot.isRunning()) await this.bot.stop();
-    while (this.sending.size > 0) await delay(100);
+    while (this.sending.size > 0 || this.refreshTasks.size > 0 || this.positionQuotes.size > 0)
+      await delay(100);
   }
 }
