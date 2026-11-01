@@ -285,6 +285,13 @@ export class TradeEngine {
         );
     }
   }
+  private validateSpyDefiLabels(signal: CallSignal, settings: ChainSettings): void {
+    if (signal.mode === 'general') return;
+    if (settings.filters.buyOnlyFirstCaller && signal.firstCaller !== true)
+      throw new TradeRejected('Buy Only First Caller is enabled: FIRST CALLER label is missing');
+    if (settings.filters.justLaunched && signal.justLaunched !== true)
+      throw new TradeRejected('Just Launched is enabled: JUST LAUNCHED label is missing');
+  }
   private validateSignal(signal: CallSignal, requireReady = true): ChainSettings {
     if (signal.sourceId && !this.store.callChannel(signal.sourceId))
       throw new TradeRejected('Source channel no longer exists');
@@ -303,6 +310,8 @@ export class TradeEngine {
       thresholds: signal.mode === 'general' ? null : settings.consistency,
       source: signal.sourceName,
       sourceMode: signal.mode ?? 'spydefi',
+      firstCaller: signal.firstCaller ?? false,
+      justLaunched: signal.justLaunched ?? false,
       blockedCallers,
       duplicate:
         this.store.hasEntry(signal.chain, signal.address) ||
@@ -320,6 +329,7 @@ export class TradeEngine {
     )
       throw new TradeRejected('Caller is blocked');
     if (signal.mode !== 'general') {
+      this.validateSpyDefiLabels(signal, settings);
       if (!signal.consistency) throw new TradeRejected('Caller consistency is missing');
       for (const name of ['overall', 'recent', 'chain'] as const)
         if (signal.consistency[name] < settings.consistency[name])
@@ -659,6 +669,7 @@ export class TradeEngine {
     }
     const settings = this.store.tradingSettings(operation.chain, operation.signal?.sourceId);
     if (!settings.enabled) throw new TradeRejected('Channel entries were disabled before signing');
+    if (operation.signal) this.validateSpyDefiLabels(operation.signal, settings);
     if (operation.signal && Date.now() - operation.signal.date > this.config.maxSignalAgeMs)
       throw new TradeRejected('Call expired before swap submission');
     if (

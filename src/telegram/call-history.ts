@@ -135,6 +135,11 @@ export function recentCallMessage(
     general
       ? message`${bold('Consistency:')} Not required for general call channels`
       : message`🎯 ${bold('Consistency:')} Overall ${rates[0]!} · Recent ${rates[1]!} · Chain ${rates[2]!}`,
+    ...(general
+      ? []
+      : [
+          message`${bold('First Caller:')} ${item.signal?.firstCaller === undefined ? 'Unknown' : item.signal.firstCaller ? 'Yes' : 'No'} | ${bold('Just Launched:')} ${item.signal?.justLaunched === undefined ? 'Unknown' : item.signal.justLaunched ? 'Yes' : 'No'}`,
+        ]),
     ...(address ? [message`${bold('CA:')} ${code(clean(address, 128))}`] : []),
     message`${bold(status.title)}`,
     message`${bold('Reason:')} ${clean(status.reason, 400)}`,

@@ -77,6 +77,36 @@ test('consistency extraction uses the labeled section instead of the banner', ()
   assert.equal(parsed.signal.callerId, '-1001551999484');
   assert.equal(parsed.signal.tokenName, 'Example');
 });
+
+test('SpyDefi identifies independent First Caller and Just Launched headings', () => {
+  for (const [heading, firstCaller, justLaunched] of [
+    ['', false, false],
+    ['\u{1f43a} FIRST CALLER', true, false],
+    ['\u{1f195} JUST LAUNCHED', false, true],
+    ['\u{1f43a}** FIRST CALLER**\n\u{1f195}** JUST LAUNCHED**', true, true],
+    ['  first\u00a0caller \r\n_Just Launched_', true, true],
+    ['NOT FIRST CALLER\nNOT JUST LAUNCHED', false, false],
+  ] as const) {
+    const value = post();
+    value.text = `${heading}\n\n${value.text}`;
+    const parsed = parseCall(value);
+    assert.ok(parsed.ok);
+    assert.equal(parsed.signal.firstCaller, firstCaller);
+    assert.equal(parsed.signal.justLaunched, justLaunched);
+  }
+});
+
+test('SpyDefi does not infer labels from total calls, token names or message body', () => {
+  const value = post();
+  value.text = value.text
+    .replace('Example', 'FIRST CALLER JUST LAUNCHED')
+    .replace('Total Calls For Project: 31', 'Total Calls For Project: 1');
+  value.text += '\nFIRST CALLER\nJUST LAUNCHED';
+  const parsed = parseCall(value);
+  assert.ok(parsed.ok);
+  assert.equal(parsed.signal.firstCaller, false);
+  assert.equal(parsed.signal.justLaunched, false);
+});
 test('an EVM address and a footer cannot imply Robinhood', () => {
   const value = post();
   value.text = value.text.replace(mint, '0x787873c9ae96855bdb032f6ff1ef76a5e1fc8adc');
@@ -104,6 +134,8 @@ test('money parsing retains exact 18 decimal precision', () => {
 test('exits and entry filters have no active defaults', () => {
   const settings = settingsSchema.parse({});
   for (const chain of ['solana', 'robinhood'] as const) {
+    assert.equal(settings.chains[chain].filters.buyOnlyFirstCaller, false);
+    assert.equal(settings.chains[chain].filters.justLaunched, false);
     const value = settings.chains[chain];
     assert.equal(value.buySizeNative, null);
     assert.equal(value.filters.marketCapEnabled, false);

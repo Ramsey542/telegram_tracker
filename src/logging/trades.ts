@@ -25,6 +25,8 @@ export function logSignalDetected(signal: CallSignal, post: ChannelPost): void {
     publishedAt: iso(signal.date),
     revision: post.revision,
     consistency: signal.consistency,
+    firstCaller: signal.mode === 'general' ? null : (signal.firstCaller ?? false),
+    justLaunched: signal.mode === 'general' ? null : (signal.justLaunched ?? false),
     advertisedMarketCapUsd: signal.advertisedMarketCapUsd,
     message: post.text,
   });

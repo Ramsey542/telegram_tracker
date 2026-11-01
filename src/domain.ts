@@ -108,6 +108,8 @@ export const exitSchema = z
 
 export const filterSchema = z
   .object({
+    buyOnlyFirstCaller: z.boolean().default(false),
+    justLaunched: z.boolean().default(false),
     marketCapEnabled: z.boolean().default(false),
     minMarketCapUsd: positive.nullable().default(null),
     maxMarketCapUsd: positive.nullable().default(null),
@@ -246,6 +248,8 @@ export interface CallSignal extends SourceInfo {
   caller: string;
   callerId: string | null;
   consistency: ConsistencyRates | null;
+  firstCaller?: boolean;
+  justLaunched?: boolean;
   advertisedMarketCapUsd: number | null;
   tokenName?: string;
 }

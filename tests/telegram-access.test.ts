@@ -357,6 +357,41 @@ test('channel settings buttons edit their original source rather than the last o
   assert.equal(fixture.writes(), 2);
 });
 
+test('SpyDefi label switches are scoped, hidden from general channels and read only for watchers', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, settingsCallback('a1b2c3', 'menu:solana:filters'), true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Buy Only First Caller/);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Just Launched/);
+  await fixture.send(123, settingsCallback('a1b2c3', 'toggle:solana:firstCaller'), true);
+  await fixture.send(123, settingsCallback('a1b2c3', 'toggle:solana:justLaunched'), true);
+  assert.equal(fixture.firstRules.solana.filters.buyOnlyFirstCaller, true);
+  assert.equal(fixture.firstRules.solana.filters.justLaunched, true);
+  assert.equal(fixture.firstRules.robinhood.filters.buyOnlyFirstCaller, false);
+  assert.equal(fixture.firstRules.robinhood.filters.justLaunched, false);
+  assert.equal(fixture.writes(), 2);
+  await fixture.send(456, settingsCallback('a1b2c3', 'menu:solana:filters'), true);
+  const watcherScreen = fixture.requests.at(-1)!.payload;
+  assert.match(String(watcherScreen.text), /Buy Only First Caller/);
+  assert.ok(
+    (watcherScreen.reply_markup as InlineKeyboard).inline_keyboard
+      .flat()
+      .every((button) => !('callback_data' in button) || !button.callback_data.includes('toggle:')),
+  );
+  await fixture.send(456, settingsCallback('a1b2c3', 'toggle:solana:firstCaller'), true);
+  assert.equal(fixture.firstRules.solana.filters.buyOnlyFirstCaller, true);
+  assert.equal(fixture.writes(), 2);
+  await fixture.send(123, settingsCallback('d4e5f6', 'menu:solana:filters'), true);
+  assert.doesNotMatch(String(fixture.requests.at(-1)?.payload.text), /Buy Only First Caller/);
+  assert.doesNotMatch(String(fixture.requests.at(-1)?.payload.text), /Just Launched/);
+  for (const filter of ['firstCaller', 'justLaunched']) {
+    await fixture.send(123, settingsCallback('d4e5f6', `toggle:solana:${filter}`), true);
+    assert.match(String(fixture.requests.at(-1)?.payload.text), /only available for SpyDefi/);
+  }
+  assert.equal(fixture.secondRules.solana.filters.buyOnlyFirstCaller, false);
+  assert.equal(fixture.secondRules.solana.filters.justLaunched, false);
+  assert.equal(fixture.writes(), 2);
+});
+
 test('main-menu channel selection survives navigation and keeps edits scoped to the named channel', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(123, '/start');

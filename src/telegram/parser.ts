@@ -7,6 +7,19 @@ export function parseCall(post: ChannelPost): ParsedCall {
   const callerMatch = /@([A-Za-z0-9_]+)\s+just\s+posted\b/i.exec(post.text);
   if (!addressMatch?.[1] || !callerMatch?.[1])
     return { ok: false, reason: 'Message is not a supported call' };
+  const headings = new Set(
+    post.text
+      .slice(0, callerMatch.index)
+      .normalize('NFKC')
+      .replace(/[\u200b-\u200d\ufeff]/g, '')
+      .split(/\r?\n/)
+      .map((line) =>
+        line
+          .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')
+          .replace(/\s+/g, ' ')
+          .toUpperCase(),
+      ),
+  );
   const chartChains = new Set<string>();
   const chartAddresses: string[] = [];
   for (const raw of post.urls) {
@@ -92,6 +105,8 @@ export function parseCall(post: ChannelPost): ParsedCall {
       caller: callerMatch[1].toLowerCase(),
       callerId,
       consistency: { overall, recent, chain: chainRate },
+      firstCaller: headings.has('FIRST CALLER'),
+      justLaunched: headings.has('JUST LAUNCHED'),
       advertisedMarketCapUsd,
       tokenName: /\bjust\s+posted\s+([\s\S]+?)\s+at\s*\$/i
         .exec(post.text)?.[1]

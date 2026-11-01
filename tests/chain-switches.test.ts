@@ -39,6 +39,7 @@ function fixture(enabled: Chain) {
   let balanceReads = 0;
   let filterChecks = 0;
   let disableBeforeSigning = false;
+  let beforeSigning: (() => void) | undefined;
   const adapter = (chain: Chain): ChainAdapter => ({
     chain,
     address: 'offline-wallet',
@@ -69,6 +70,7 @@ function fixture(enabled: Chain) {
         store.updateSettings((value) => {
           value.chains[chain].enabled = false;
         });
+      beforeSigning?.();
       beforeSpend();
       signed.push(chain);
       throw new PendingTrade('Waiting for an offline fixture receipt');
@@ -84,7 +86,11 @@ function fixture(enabled: Chain) {
       },
     } as unknown as RiskFilters,
   );
-  const addSignal = (chain: Chain, messageId = 1): CallSignal => {
+  const addSignal = (
+    chain: Chain,
+    messageId = 1,
+    labels: Partial<Pick<CallSignal, 'firstCaller' | 'justLaunched' | 'mode' | 'consistency'>> = {},
+  ): CallSignal => {
     const signal: CallSignal = {
       id: `-1001:${messageId}`,
       channelId: '-1001',
@@ -99,6 +105,7 @@ function fixture(enabled: Chain) {
       callerId: null,
       consistency: { overall: 50, recent: 50, chain: 50 },
       advertisedMarketCapUsd: 1000,
+      ...labels,
     };
     store.recordPost(
       {
@@ -124,11 +131,119 @@ function fixture(enabled: Chain) {
     disableBeforeSigning() {
       disableBeforeSigning = true;
     },
+    beforeSigning(change: () => void) {
+      beforeSigning = change;
+    },
     close() {
       store.close();
       rmSync(directory, { recursive: true, force: true });
     },
   };
+}
+
+for (const chain of chains) {
+  for (const [filter, label, reason] of [
+    ['buyOnlyFirstCaller', 'firstCaller', 'FIRST CALLER label is missing'],
+    ['justLaunched', 'justLaunched', 'JUST LAUNCHED label is missing'],
+  ] as const) {
+    test(`${chain} rejects a missing ${label} label before requests or token reservation`, async () => {
+      for (const present of [false, undefined]) {
+        const value = fixture(chain);
+        try {
+          value.store.updateSettings((settings) => {
+            settings.chains[chain].filters[filter] = true;
+          });
+          const signal = value.addSignal(chain, 1, { [label]: present });
+          value.engine.observeSignal(signal);
+          assert.ok(value.store.signalHistory()[0]?.observation?.reason.includes(reason));
+          await value.engine.tick();
+          assert.ok(value.store.signalHistory()[0]?.reason?.includes(reason));
+          assert.deepEqual(value.attempted, []);
+          assert.deepEqual(value.reads(), { tokenReads: 0, balanceReads: 0, filterChecks: 0 });
+          assert.equal(value.store.hasEntry(chain, signal.address), false);
+        } finally {
+          value.close();
+        }
+      }
+    });
+
+    test(`${chain} accepts ${label} without requiring the other disabled label`, async () => {
+      const value = fixture(chain);
+      try {
+        value.store.updateSettings((settings) => {
+          settings.chains[chain].filters[filter] = true;
+        });
+        value.addSignal(chain, 1, { [label]: true });
+        await value.engine.tick();
+        assert.deepEqual(value.signed, [chain]);
+      } finally {
+        value.close();
+      }
+    });
+
+    test(`${chain} rechecks the ${label} requirement before signing`, async () => {
+      const value = fixture(chain);
+      try {
+        const signal = value.addSignal(chain);
+        value.beforeSigning(() =>
+          value.store.updateSettings((settings) => {
+            settings.chains[chain].filters[filter] = true;
+          }),
+        );
+        await value.engine.tick();
+        assert.deepEqual(value.signed, []);
+        assert.ok(value.store.history()[0]?.error?.includes(reason));
+        assert.equal(value.store.hasEntry(chain, signal.address), false);
+      } finally {
+        value.close();
+      }
+    });
+  }
+
+  test(`${chain} requires both SpyDefi labels when both filters are enabled`, async () => {
+    for (const [firstCaller, justLaunched] of [
+      [true, true],
+      [true, false],
+      [false, true],
+    ]) {
+      const value = fixture(chain);
+      try {
+        value.store.updateSettings((settings) => {
+          settings.chains[chain].filters.buyOnlyFirstCaller = true;
+          settings.chains[chain].filters.justLaunched = true;
+        });
+        value.addSignal(chain, 1, { firstCaller, justLaunched });
+        await value.engine.tick();
+        assert.deepEqual(value.signed, firstCaller && justLaunched ? [chain] : []);
+      } finally {
+        value.close();
+      }
+    }
+  });
+
+  test(`${chain} SpyDefi label filters do not bypass consistency or affect general calls`, async () => {
+    for (const mode of ['spydefi', 'general'] as const) {
+      const value = fixture(chain);
+      try {
+        value.store.updateSettings((settings) => {
+          settings.chains[chain].filters.buyOnlyFirstCaller = true;
+          settings.chains[chain].filters.justLaunched = true;
+        });
+        value.addSignal(chain, 1, {
+          mode,
+          firstCaller: mode === 'spydefi',
+          justLaunched: mode === 'spydefi',
+          consistency: mode === 'spydefi' ? { overall: 41, recent: 25, chain: 40 } : null,
+        });
+        await value.engine.tick();
+        assert.deepEqual(value.signed, mode === 'general' ? [chain] : []);
+        if (mode === 'spydefi')
+          assert.match(value.store.signalHistory()[0]?.reason ?? '', /recent consistency/);
+      } finally {
+        value.close();
+      }
+    }
+  });
 }
 
 for (const enabled of chains) {

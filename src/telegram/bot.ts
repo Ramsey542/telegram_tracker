@@ -636,6 +636,7 @@ export class ControlBot {
     await this.exitDetails(ctx, chain, target);
   }
   private async group(ctx: Context, chain: Chain, group: EditableField['group']): Promise<void> {
+    const sourceMode = this.settingsSource(ctx)?.mode;
     if (group === 'consistency' && this.settingsSource(ctx)?.mode === 'general')
       throw new Error('Consistency checks do not apply to general call channels');
     if (group === 'exits') {
@@ -659,12 +660,24 @@ export class ControlBot {
       keyboard.text(field.label, `edit:${chain}:${key}`).row();
     }
     for (const [key, toggle] of Object.entries(toggles)) {
-      if (toggle.group !== group || (toggle.chains && !toggle.chains.includes(chain))) continue;
+      if (
+        toggle.group !== group ||
+        (toggle.chains && !toggle.chains.includes(chain)) ||
+        (toggle.modes && (!sourceMode || !toggle.modes.includes(sourceMode)))
+      )
+        continue;
       lines.push(message`${bold(`${toggle.label}:`)} ${onOff(toggle.value(settings))}`);
       keyboard
         .text(`${toggle.label}: ${onOff(toggle.value(settings))}`, `toggle:${chain}:${key}`)
         .row();
     }
+    if (group === 'filters' && sourceMode === 'spydefi')
+      lines.push(
+        '',
+        italic(
+          'Buy Only First Caller requires the FIRST CALLER heading. Just Launched requires the JUST LAUNCHED heading. When both are on, both labels are required. Consistency and other enabled filters still apply.',
+        ),
+      );
     if (group === 'filters')
       lines.push(
         '',
@@ -1156,6 +1169,9 @@ export class ControlBot {
         const toggle = option ? toggles[option] : undefined;
         if (!toggle || (toggle.chains && !toggle.chains.includes(chain)))
           throw new Error('Unknown switch');
+        const sourceMode = this.settingsSource(ctx)?.mode;
+        if (toggle.modes && (!sourceMode || !toggle.modes.includes(sourceMode)))
+          throw new Error('This entry filter is only available for SpyDefi channels');
         if (toggle.group === 'exits') {
           const desired = !toggle.value(this.currentSettings(ctx, chain));
           const target = option === 'tp' || option === 'ttp' ? 'tp' : 'sl';

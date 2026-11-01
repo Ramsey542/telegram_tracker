@@ -4,6 +4,7 @@ import {
   parseAmount,
   type Chain,
   type ChainSettings,
+  type ChannelMode,
 } from '../domain.js';
 
 export interface EditableField {
@@ -255,10 +256,29 @@ export const toggles: Record<
     label: string;
     group: EditableField['group'];
     chains?: Chain[];
+    modes?: ChannelMode[];
     value: (s: ChainSettings) => boolean;
     change: (s: ChainSettings) => void;
   }
 > = {
+  firstCaller: {
+    label: 'Buy Only First Caller',
+    group: 'filters',
+    modes: ['spydefi'],
+    value: (s) => s.filters.buyOnlyFirstCaller,
+    change: (s) => {
+      s.filters.buyOnlyFirstCaller = !s.filters.buyOnlyFirstCaller;
+    },
+  },
+  justLaunched: {
+    label: 'Just Launched',
+    group: 'filters',
+    modes: ['spydefi'],
+    value: (s) => s.filters.justLaunched,
+    change: (s) => {
+      s.filters.justLaunched = !s.filters.justLaunched;
+    },
+  },
   wrapMyEth: {
     label: 'Wrap my ETH if WETH is insufficient',
     group: 'buy',
