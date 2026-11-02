@@ -421,7 +421,6 @@ export interface Operation {
   funding?: { sourceId?: string };
   swapHash: string | null;
   outputRaw: string | null;
-  minimumNativeRaw: string | null;
   createdAt: number;
   error: string | null;
   retryCount?: number;

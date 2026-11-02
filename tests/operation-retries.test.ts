@@ -62,7 +62,6 @@ function fixture(t: TestContext, prepared = true) {
     quote: null,
     swapHash: null,
     outputRaw: null,
-    minimumNativeRaw: null,
     createdAt: Date.now(),
     error: null,
   };

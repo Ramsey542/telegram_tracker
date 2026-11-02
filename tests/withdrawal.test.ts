@@ -44,7 +44,6 @@ function withdrawal(): Operation {
     quote: null,
     swapHash: null,
     outputRaw: null,
-    minimumNativeRaw: null,
     createdAt: Date.now(),
     error: null,
   };

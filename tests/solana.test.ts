@@ -63,7 +63,6 @@ function operation(kind: 'buy' | 'sell' = 'buy'): Operation {
     quote: null,
     swapHash: null,
     outputRaw: null,
-    minimumNativeRaw: null,
     createdAt: Date.now(),
     error: null,
   };
@@ -437,17 +436,38 @@ test('Jupiter-confirmed execution cannot be treated as an expired unexecuted buy
   assert.equal(value.events.includes('getBlockHeight'), false);
   assert.equal(value.orders.length, 1);
 });
-test('price impact and take-profit bounds prevent signing an unsuitable order', async (t) => {
+test('buy price impact limits prevent signing an unsuitable order', async (t) => {
   const value = harness(t);
   const buy = operation();
   buy.settings.filters.maxPriceImpactPercent = 0.05;
   await assert.rejects(advance(value, buy), /Price impact/);
-  const sell = operation('sell');
-  sell.minimumNativeRaw = '100000001';
-  await assert.rejects(advance(value, sell), /more than 3% below the target/);
   assert.equal(value.signing.mock.callCount(), 0);
   assert.equal(value.executions.length, 0);
 });
+
+for (const exitKey of ['sl', 'tp:first', 'trail:sl', 'trail:tp']) {
+  test(`${exitKey} executes a Solana sale below the original trigger quote and ignores saved target floors`, async (t) => {
+    const value = harness(t);
+    const sell = Object.assign(operation('sell'), { minimumNativeRaw: '150000000' });
+    sell.exitKey = exitKey;
+    sell.quote = {
+      inputRaw: sell.amountRaw,
+      outputRaw: '150000000',
+      minOutputRaw: '150000000',
+      nativeUsd: null,
+      priceImpactPercent: null,
+      receivedAt: Date.now(),
+      estimated: true,
+    };
+    value.setReceipt(receipt('sell'));
+    const result = await advance(value, sell);
+    assert.equal(result.nativeRaw, '99995000');
+    assert.equal(value.orders.length, 1);
+    assert.equal(value.orders[0]!.searchParams.get('slippageBps'), '50');
+    assert.equal(value.signing.mock.callCount(), 1);
+    assert.equal(value.executions.length, 1);
+  });
+}
 for (const mismatch of [
   { inputMint: mint },
   { inAmount: '999' },

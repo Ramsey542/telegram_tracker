@@ -15,15 +15,7 @@ const log = logger.child({ component: 'trading.exits' });
 export interface ExitDecision {
   key: string;
   amountRaw: string;
-  minimumNativeRaw: string | null;
 }
-const minimum = (cost: bigint, quantity: bigint, original: bigint, profit: number): string =>
-  (
-    (cost * quantity * (10_000n + bps(profit)) + original * 10_000n - 1n) /
-    (original * 10_000n)
-  ).toString();
-const executionFloor = (target: bigint | string): string =>
-  ((BigInt(target) * 97n + 99n) / 100n).toString();
 
 function trailing(
   rule: TrailRule,
@@ -99,15 +91,7 @@ function trailing(
     state,
   });
   if (amount <= 0n) return null;
-  const minimumNativeRaw = key.startsWith('trail:sl')
-    ? executionFloor(
-        (BigInt(state.peakNativeRaw) * amount * (10_000n - bps(rule.drawdownPercent)) +
-          BigInt(state.peakTokenRaw) * 10_000n -
-          1n) /
-          (BigInt(state.peakTokenRaw) * 10_000n),
-      )
-    : null;
-  return { key, amountRaw: amount.toString(), minimumNativeRaw };
+  return { key, amountRaw: amount.toString() };
 }
 
 function trailingStages(
@@ -222,14 +206,6 @@ export function evaluateExits(position: Position, quote: Quote): ExitDecision | 
     return {
       key: 'sl',
       amountRaw: quantity.toString(),
-      minimumNativeRaw: executionFloor(
-        minimum(
-          entryCostRaw(position),
-          quantity,
-          BigInt(position.originalTokenRaw),
-          -settings.stopLoss.lossPercent,
-        ),
-      ),
     };
   const trailingSl = trailingStages(position, 'sl', native, quantity, profit);
   const trailingTp = trailingStages(position, 'tp', native, quantity, profit);
@@ -267,14 +243,6 @@ export function evaluateExits(position: Position, quote: Quote): ExitDecision | 
         return {
           key,
           amountRaw: amount.toString(),
-          minimumNativeRaw: executionFloor(
-            minimum(
-              entryCostRaw(position),
-              amount,
-              BigInt(position.originalTokenRaw),
-              tier.profitPercent,
-            ),
-          ),
         };
     }
   } else log.info('exit.take_profit_check', { decision: 'wait', reason: 'disabled' });

@@ -729,12 +729,6 @@ export class RobinhoodAdapter implements ChainAdapter {
           (quote.impact === null || Math.abs(quote.impact) > limit)
         )
           throw new TradeRejected('Price impact is unknown or exceeds the maximum');
-        if (
-          operation.kind === 'sell' &&
-          operation.minimumNativeRaw !== null &&
-          quote.outputRaw < BigInt(operation.minimumNativeRaw)
-        )
-          throw new TradeRejected('Exit execution quote is more than 3% below the target price');
         operation.quote = {
           inputRaw: operation.amountRaw,
           outputRaw: quote.outputRaw.toString(),

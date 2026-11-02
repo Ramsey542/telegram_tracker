@@ -62,7 +62,6 @@ test('listen-only retains captured calls and pending operations while blocking e
     quote: null,
     swapHash: null,
     outputRaw: null,
-    minimumNativeRaw: null,
     createdAt: Date.now(),
     error: null,
   };

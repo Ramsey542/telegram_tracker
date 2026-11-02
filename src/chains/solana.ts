@@ -407,12 +407,6 @@ export class SolanaAdapter implements ChainAdapter {
       (impact === null || impact > maximumImpact)
     )
       throw new TradeRejected('Price impact is unknown or exceeds the configured limit');
-    if (
-      operation.kind === 'sell' &&
-      operation.minimumNativeRaw !== null &&
-      BigInt(order.outAmount) < BigInt(operation.minimumNativeRaw)
-    )
-      throw new TradeRejected('Exit execution quote is more than 3% below the target price');
     const expiresAt = order.expireAt == null ? null : Date.parse(order.expireAt);
     if (
       (expiresAt !== null && (!Number.isFinite(expiresAt) || Date.now() >= expiresAt)) ||

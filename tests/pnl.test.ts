@@ -106,7 +106,6 @@ function operation(kind: 'buy' | 'sell' = 'buy'): Operation {
       priceImpactPercent: 0,
       receivedAt: yesterday,
     },
-    minimumNativeRaw: null,
     createdAt: yesterday,
     error: null,
   };

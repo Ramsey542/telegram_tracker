@@ -168,7 +168,7 @@ test('TP percentages use the original entry and never repeat a completed tier', 
     '100000000',
   );
 });
-test('Solana take profit and its minimum output use swap cost instead of wallet spending', () => {
+test('Solana take profit uses swap cost instead of wallet spending', () => {
   const value = position();
   value.exits.takeProfitEnabled = true;
   value.exits.takeProfits = [{ id: 'first', profitPercent: 50, sellPercent: 90 }];
@@ -176,7 +176,7 @@ test('Solana take profit and its minimum output use swap cost instead of wallet 
   value.entryFeeNativeRaw = '7204000';
   const decision = evaluateExits(value, quote('1500000000'));
   assert.equal(decision?.amountRaw, '900000000');
-  assert.equal(decision?.minimumNativeRaw, '1309500000');
+  assert.deepEqual(decision, { key: 'tp:first', amountRaw: '900000000' });
   assert.equal(value.lastProfitPercent, 50);
 });
 
@@ -300,7 +300,6 @@ for (const savedExecution of [false, true]) {
         quote: null,
         swapHash: 'confirmed-signature',
         outputRaw: null,
-        minimumNativeRaw: null,
         createdAt: value.openedAt,
         error: null,
       };
@@ -444,7 +443,6 @@ test('a confirmed trailing stage completion survives a database restart without 
       quote: null,
       swapHash: 'offline-signature',
       outputRaw: null,
-      minimumNativeRaw: null,
       createdAt: Date.now(),
       error: null,
     };
@@ -523,7 +521,6 @@ test('a rejected caller does not reserve a token and an in-flight buy is durable
       quote: null,
       swapHash: null,
       outputRaw: null,
-      minimumNativeRaw: null,
       createdAt: Date.now(),
       error: null,
     };

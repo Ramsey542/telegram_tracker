@@ -228,7 +228,6 @@ function trade(id: string, call: CallSignal | null, kind: 'buy' | 'sell' = 'buy'
     quote: null,
     swapHash: id,
     outputRaw: null,
-    minimumNativeRaw: null,
     createdAt: Date.now(),
     error: null,
   };

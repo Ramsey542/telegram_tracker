@@ -45,22 +45,22 @@ const quote = (outputRaw: string): Quote => ({
   estimated: true,
 });
 
-test('a partial hard TP triggers at its target and permits three percent below the target sale price', () => {
+test('a partial hard TP triggers at its target without setting an execution price floor', () => {
   const decision = evaluateExits(fixture(), quote('1500000000'))!;
   assert.equal(decision.amountRaw, '90000000');
-  assert.equal(decision.minimumNativeRaw, '1309500000');
+  assert.deepEqual(decision, { key: 'tp:first', amountRaw: '90000000' });
   assert.equal(evaluateExits(fixture(), quote('1499900000')), null);
 });
 
 for (const chain of ['solana', 'robinhood'] as const) {
-  test(`${chain} stop loss sells all remaining tokens with a three percent floor below its target price`, () => {
+  test(`${chain} stop loss sells all remaining tokens without setting an execution price floor`, () => {
     const value = fixture();
     value.chain = chain;
     value.entryNativeRaw = '1000000000';
     const decision = evaluateExits(value, quote('790000000'))!;
     assert.equal(decision.key, 'sl');
     assert.equal(decision.amountRaw, '100000000');
-    assert.equal(decision.minimumNativeRaw, '776000000');
+    assert.deepEqual(decision, { key: 'sl', amountRaw: '100000000' });
     assert.equal(evaluateExits(value, quote('800100000')), null);
     value.remainingTokenRaw = '10000000';
     const partial = evaluateExits(value, {
@@ -68,10 +68,10 @@ for (const chain of ['solana', 'robinhood'] as const) {
       inputRaw: value.remainingTokenRaw,
     })!;
     assert.equal(partial.amountRaw, '10000000');
-    assert.equal(partial.minimumNativeRaw, '77600000');
+    assert.deepEqual(partial, { key: 'sl', amountRaw: '10000000' });
   });
 
-  test(`${chain} trailing stop loss uses the trailing stop price for the three percent execution floor`, () => {
+  test(`${chain} trailing stop loss triggers on drawdown without setting an execution price floor`, () => {
     const value = fixture();
     value.chain = chain;
     value.entryNativeRaw = '1000000000';
@@ -87,6 +87,6 @@ for (const chain of ['solana', 'robinhood'] as const) {
     const decision = evaluateExits(value, quote('1190000000'))!;
     assert.equal(decision.key, 'trail:sl');
     assert.equal(decision.amountRaw, '100000000');
-    assert.equal(decision.minimumNativeRaw, '1164000000');
+    assert.deepEqual(decision, { key: 'trail:sl', amountRaw: '100000000' });
   });
 }

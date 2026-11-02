@@ -395,7 +395,6 @@ export class TradeEngine {
       quote: null,
       swapHash: null,
       outputRaw: null,
-      minimumNativeRaw: null,
       createdAt: Date.now(),
       error: null,
     };
@@ -835,7 +834,6 @@ export class TradeEngine {
         operation.positionId = position.id;
         operation.exitKey = decision.key;
         operation.exitDescription = exitReasonLabel(decision.key, position.exits);
-        operation.minimumNativeRaw = decision.minimumNativeRaw;
         operation.quote = quote;
         if (this.store.claim(operation)) {
           await withLogContext(
