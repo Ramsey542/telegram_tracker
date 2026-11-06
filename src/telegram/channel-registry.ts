@@ -157,13 +157,14 @@ export class ChannelRegistry {
           new Api.messages.CheckChatInvite({ hash: target.inviteHash }),
         );
         if (!(invite instanceof Api.ChatInviteAlready)) {
-          if (invite instanceof Api.ChatInvite && !invite.broadcast)
-            throw new Error('Only broadcast channels are supported');
+          if (invite instanceof Api.ChatInvite && !invite.broadcast && !invite.megagroup)
+            throw new Error('Only broadcast channels and supergroups are supported');
           if (
             invite instanceof Api.ChatInvitePeek &&
-            (!(invite.chat instanceof Api.Channel) || !invite.chat.broadcast)
+            (!(invite.chat instanceof Api.Channel) ||
+              (!invite.chat.broadcast && !invite.chat.megagroup))
           )
-            throw new Error('Only broadcast channels are supported');
+            throw new Error('Only broadcast channels and supergroups are supported');
           await client.invoke(new Api.messages.ImportChatInvite({ hash: target.inviteHash }));
           invite = await client.invoke(
             new Api.messages.CheckChatInvite({ hash: target.inviteHash }),
@@ -173,8 +174,8 @@ export class ChannelRegistry {
           throw new Error('Channel access is not ready');
         entity = invite.chat;
       } else entity = await client.getEntity(target.username!);
-      if (!(entity instanceof Api.Channel) || !entity.broadcast)
-        throw new Error('Only broadcast channels are supported');
+      if (!(entity instanceof Api.Channel) || (!entity.broadcast && !entity.megagroup))
+        throw new Error('Only broadcast channels and supergroups are supported');
       const channelId = utils.getPeerId(entity).toString();
       if (
         this.store
@@ -212,6 +213,7 @@ export class ChannelRegistry {
       else if (this.store.metadata('channels:spydefi-id') === channelId) current.mode = 'spydefi';
       current.title = entity.title;
       current.username = entity.username?.toLowerCase() ?? null;
+      current.isGroup = Boolean(entity.megagroup);
       this.store.setMetadata(activationKey, String(current.activatedAt));
       current.status = 'ready';
       current.error = null;

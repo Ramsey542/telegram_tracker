@@ -5,6 +5,33 @@ import { settingsCallback } from './settings-scope.js';
 import { exitSummary, exitPlanLines, timeExitSummary } from './exits.js';
 
 export const channelStatus = (enabled: boolean): string => (enabled ? '🟢 On' : '🔴 Off');
+export const senderFilterLabel = (channel: CallChannel): string =>
+  `Sender filter: ${channel.senderFilter?.enabled ? 'On' : 'Off'}`;
+
+export function senderFilterPanel(channel: CallChannel) {
+  const filter = channel.senderFilter;
+  return {
+    text: joinMessages([
+      bold('Sender filter'),
+      '',
+      senderFilterLabel(channel),
+      '',
+      bold('Watched usernames'),
+      ...(filter?.usernames.length
+        ? filter.usernames.map((username) => code(`@${username}`))
+        : ['No usernames configured.']),
+      '',
+      'When enabled, only messages posted by these Telegram users can trigger a buy in this source. The list applies to all chains in this source; the other entry filters still apply.',
+      'Names mentioned in text, forwarded-author names and anonymous sender signatures do not count. Posts without an identifiable sender username are skipped.',
+    ]),
+    keyboard: new InlineKeyboard()
+      .text(filter?.enabled ? 'Disable sender filter' : 'Enable sender filter', 'sendertoggle')
+      .row()
+      .text('Set usernames', 'senderset')
+      .row()
+      .text('Back', 'home'),
+  };
+}
 
 export function channelList(
   channels: CallChannel[],
@@ -91,6 +118,8 @@ export function channelDetails(channel: CallChannel, lastSuccess: string | null)
       .text('Default: BNB', `channelchain:${key}:bnb`)
       .row();
   keyboard
+    .text(senderFilterLabel(channel), settingsCallback(rulesKey, 'senderfilter'))
+    .row()
     .text('🚫 Caller blocklist', settingsCallback(rulesKey, 'blocklist'))
     .row()
     .text('🔄 Retry channel access', `channelretry:${key}`)
@@ -108,6 +137,8 @@ export function channelDetails(channel: CallChannel, lastSuccess: string | null)
       ...(channel.channelId ? [message`${bold('Telegram ID:')} ${code(channel.channelId)}`] : []),
       `Channel: ${channelStatus(channel.enabled)}`,
       `Access: ${channel.status}`,
+      `Source type: ${channel.isGroup ? 'Group' : 'Broadcast channel'}`,
+      senderFilterLabel(channel),
       `Mode: ${channel.mode === 'spydefi' ? 'SpyDefi consistency feed' : 'General calls; no consistency requirement'}`,
       `Default chain: ${channel.defaultChain ?? 'None; a reliable chain hint is required for EVM addresses'}`,
       `Last read: ${lastSuccess ? new Date(Number(lastSuccess)).toISOString() : 'Not checked yet'}`,

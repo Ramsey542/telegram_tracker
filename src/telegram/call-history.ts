@@ -106,7 +106,10 @@ export function recentCallMessage(
 ): MessageText {
   const text = item.post?.text ?? '';
   const caller =
-    item.signal?.caller ?? /@([A-Za-z0-9_]+)\s+just\s+posted\b/i.exec(text)?.[1] ?? null;
+    item.signal?.caller ??
+    (item.post?.mode === 'general' ? item.post.senderUsername : null) ??
+    /@([A-Za-z0-9_]+)\s+just\s+posted\b/i.exec(text)?.[1] ??
+    null;
   const address = item.signal?.address ?? /\bCA\s*:\s*([A-Za-z0-9]+)/i.exec(text)?.[1] ?? null;
   const name =
     item.signal?.tokenName ??

@@ -223,6 +223,24 @@ export type ExitSettings = z.infer<typeof exitSchema>;
 export type TrailRule = z.infer<typeof trailSchema>;
 export type TrailStage = z.infer<typeof trailStageSchema>;
 export type ChannelMode = 'spydefi' | 'general';
+export const senderFilterSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    usernames: z
+      .array(
+        z
+          .string()
+          .trim()
+          .transform((value) => value.replace(/^@/, '').toLowerCase())
+          .pipe(z.string().regex(/^[a-z][a-z0-9_]{0,31}$/)),
+      )
+      .max(100)
+      .transform((values) => [...new Set(values)])
+      .default([]),
+  })
+  .refine((value) => !value.enabled || value.usernames.length > 0, {
+    message: 'Set at least one username before enabling the sender filter',
+  });
 export interface CallChannel {
   id: string;
   target: string;
@@ -238,11 +256,15 @@ export interface CallChannel {
   settingsKey?: string;
   settings?: ChannelRules;
   blockedCallers?: string[];
+  isGroup?: boolean;
+  senderFilter?: z.infer<typeof senderFilterSchema>;
 }
 export interface SourceInfo {
   sourceId?: string;
   sourceName?: string;
   mode?: ChannelMode;
+  senderId?: string | null;
+  senderUsername?: string | null;
 }
 export interface ConsistencyRates {
   overall: number;

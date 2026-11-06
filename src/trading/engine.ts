@@ -26,6 +26,7 @@ import { Store } from '../infra/store.js';
 import { ApiError, safeError } from '../infra/http.js';
 import { RiskFilters } from '../providers/risk.js';
 import { evaluateExits, evaluateTimeExit, timeExitDeadline, type ExitDecision } from './exits.js';
+import { senderFilterRejection } from '../telegram/sender-filter.js';
 import { exitReasonLabel } from './exit-reason.js';
 import { withdrawalAddress, withdrawalAmount } from './withdrawal.js';
 import { logger, withLogContext } from '../logging/logger.js';
@@ -305,8 +306,10 @@ export class TradeEngine {
       throw new TradeRejected('Just Launched is enabled: JUST LAUNCHED label is missing');
   }
   private validateSignal(signal: CallSignal, requireReady = true): ChainSettings {
-    if (signal.sourceId && !this.store.callChannel(signal.sourceId))
-      throw new TradeRejected('Source channel no longer exists');
+    const source = signal.sourceId ? this.store.callChannel(signal.sourceId) : null;
+    if (signal.sourceId && !source) throw new TradeRejected('Source channel no longer exists');
+    const senderRejection = source ? senderFilterRejection(source, signal) : null;
+    if (senderRejection) throw new TradeRejected(senderRejection);
     const settings = this.store.tradingSettings(signal.chain, signal.sourceId);
     const blockedCallers = this.store.callerBlocklist(signal.sourceId);
     const age = Date.now() - signal.date;
@@ -682,6 +685,8 @@ export class TradeEngine {
         operation.signal.date < source.activatedAt
       )
         throw new TradeRejected('Source channel was disabled or changed before signing');
+      const senderRejection = senderFilterRejection(source, operation.signal);
+      if (senderRejection) throw new TradeRejected(senderRejection);
     }
     const settings = this.store.tradingSettings(operation.chain, operation.signal?.sourceId);
     if (!settings.enabled) throw new TradeRejected('Channel entries were disabled before signing');

@@ -262,6 +262,7 @@ function botFixture(t: TestContext) {
   };
   return {
     send,
+    store,
     requests,
     settings: { ...settings, chains: firstRules },
     globals: settings,
@@ -315,6 +316,32 @@ test('forged watcher callbacks and text never reach trade or settings handlers',
   const requestCount = fixture.requests.length;
   await fixture.send(789, '/settings');
   assert.equal(fixture.requests.length, requestCount);
+});
+
+test('sender filter prompts, username lists and switches remain scoped to their source', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, settingsCallback('a1b2c3', 'sendertoggle'), true);
+  assert.match(String(fixture.requests.at(-1)!.payload.text), /Set watched usernames/);
+  await fixture.send(456, settingsCallback('d4e5f6', 'senderfilter'), true);
+  await fixture.send(456, 'intruder');
+  await fixture.send(123, '@Alice, BOB');
+  const first = fixture.store.callChannel('first')!;
+  assert.deepEqual(first.senderFilter, { enabled: true, usernames: ['alice', 'bob'] });
+  assert.equal(fixture.store.callChannel('second')!.senderFilter?.enabled ?? false, false);
+  await fixture.send(123, settingsCallback('a1b2c3', 'sendertoggle'), true);
+  assert.equal(fixture.store.callChannel('first')!.senderFilter!.enabled, false);
+  await fixture.send(123, settingsCallback('d4e5f6', 'senderset'), true);
+  await fixture.send(123, 'charlie');
+  assert.deepEqual(fixture.store.callChannel('second')!.senderFilter, {
+    enabled: false,
+    usernames: ['charlie'],
+  });
+  await fixture.send(123, settingsCallback('d4e5f6', 'sendertoggle'), true);
+  assert.equal(fixture.store.callChannel('second')!.senderFilter!.enabled, true);
+  const writes = fixture.writes();
+  await fixture.send(456, settingsCallback('d4e5f6', 'sendertoggle'), true);
+  await fixture.send(456, settingsCallback('d4e5f6', 'senderset'), true);
+  assert.equal(fixture.writes(), writes);
 });
 
 test('watcher views use current owner settings and cannot consume the owner pending input', async (t) => {

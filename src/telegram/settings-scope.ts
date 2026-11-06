@@ -16,6 +16,9 @@ const settingsActions = new Set([
   'deltp',
   'blocklist',
   'block',
+  'senderfilter',
+  'sendertoggle',
+  'senderset',
 ]);
 export function settingsAction(data: string): boolean {
   return settingsActions.has(data.split(':')[0] ?? '');

@@ -12,6 +12,7 @@ import {
   chainLabel,
   exitSchema,
   channelRulesSchema,
+  senderFilterSchema,
   settingsSchema,
   emptyTrail,
   formatAmount,
@@ -49,7 +50,7 @@ export class Store {
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 9)
+    if (Number(version?.user_version ?? 0) > 10)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -102,7 +103,7 @@ export class Store {
         `);
       this.restoreSolanaEntryPrices();
       this.restorePnlFills();
-      this.db.exec('PRAGMA user_version = 9');
+      this.db.exec('PRAGMA user_version = 10');
     });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));
@@ -112,6 +113,7 @@ export class Store {
     if (channel) {
       channel.settings = channelRulesSchema.parse(channel.settings ?? {});
       channel.blockedCallers ??= [];
+      channel.senderFilter = senderFilterSchema.parse(channel.senderFilter ?? {});
     }
     return channel;
   }
@@ -250,6 +252,9 @@ export class Store {
     const existing = this.callChannel(channel.id);
     channel.settings = channelRulesSchema.parse(channel.settings ?? existing?.settings ?? {});
     channel.blockedCallers ??= existing?.blockedCallers ?? [];
+    channel.senderFilter = senderFilterSchema.parse(
+      channel.senderFilter ?? existing?.senderFilter ?? {},
+    );
     channel.settingsKey ??= existing?.settingsKey;
     while (
       !channel.settingsKey ||

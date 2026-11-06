@@ -47,7 +47,14 @@ import {
 } from './access.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { recentCallMessage } from './call-history.js';
-import { channelDetails, channelList, channelStatus } from './channels.js';
+import {
+  channelDetails,
+  channelList,
+  channelStatus,
+  senderFilterLabel,
+  senderFilterPanel,
+} from './channels.js';
+import { senderUsernames } from './sender-filter.js';
 import type { ChannelRegistry } from './channel-registry.js';
 import {
   settingsAction,
@@ -89,6 +96,7 @@ type PendingInput =
     }
   | { kind: 'block'; remove: boolean; sourceId?: string }
   | { kind: 'channel_add' }
+  | { kind: 'sender_filter'; sourceId: string; enableAfter: boolean }
   | { kind: 'wrap_amount'; chain: EvmChain; sourceId?: string }
   | { kind: 'withdraw_address'; chain: Chain }
   | { kind: 'withdraw_amount'; chain: Chain; recipient: string };
@@ -374,6 +382,7 @@ export class ControlBot {
         ? [
             message`${bold('Selected channel:')} ${selected.title} · ${channelStatus(selected.enabled)}`,
             `Channel access: ${selected.status}`,
+            senderFilterLabel(selected),
             ...(selected.mode === 'general'
               ? [`Default chain: ${selected.defaultChain ?? 'None'}`]
               : []),
@@ -446,6 +455,10 @@ export class ControlBot {
         selected.enabled ? '🔴 Disable channel' : '🟢 Enable channel',
         `channeltoggle:${selected.id}`,
       );
+    if (selected)
+      keyboard
+        .row()
+        .text(senderFilterLabel(selected), settingsCallback(selected.settingsKey!, 'senderfilter'));
     const channelSummary = joinMessages([
       '',
       bold('All channels'),
@@ -971,6 +984,12 @@ export class ControlBot {
         .text('⬅️ Back', 'home'),
     );
   }
+  private async senderFilter(ctx: Context): Promise<void> {
+    const source = this.settingsSource(ctx);
+    if (!source) throw new Error('Open Channels and select a source to view its sender filter');
+    const panel = senderFilterPanel(source);
+    await this.display(ctx, panel.text, panel.keyboard);
+  }
   private async callChannels(ctx: Context, page = 0, removing = false): Promise<void> {
     this.interaction(ctx).settingsSourceId = null;
     const panel = channelList(
@@ -1063,7 +1082,7 @@ export class ControlBot {
       data = scoped.data;
     } else if (settingsAction(data)) {
       const action = data.split(':')[0];
-      if (!['chain', 'menu', 'exit', 'blocklist'].includes(action ?? ''))
+      if (!['chain', 'menu', 'exit', 'blocklist', 'senderfilter'].includes(action ?? ''))
         throw new Error('Settings are managed per channel. Open Channels and select a source.');
       const source = this.selectedChannel(ctx);
       if (!source) throw new Error('Open Channels and select a source to view its settings');
@@ -1093,7 +1112,7 @@ export class ControlBot {
         state.pending = { kind: 'channel_add' };
         await this.reply(
           ctx,
-          message`${bold('Add a call channel')}\n\nSend a public channel @username or t.me link, or a private channel invite link. Only broadcast channels are supported.\n\nNew channels start with independent, disabled rules. Configure buy size, filters, slippage and exits under its Solana, Robinhood or BNB rules. Then enable that chain and channel monitoring.\n\n${italic('Send /cancel to cancel.')}`,
+          message`${bold('Add a call source')}\n\nSend a public channel or group @username or t.me link, or a private invite link. Broadcast channels and supergroups are supported.\n\nNew sources start with independent, disabled rules. Configure buy size, filters, slippage and exits under its Solana, Robinhood or BNB rules. To watch specific group members, configure the sender filter before enabling that chain and source monitoring.\n\n${italic('Send /cancel to cancel.')}`,
         );
         return;
       case 'channelretry':
@@ -1333,6 +1352,36 @@ export class ControlBot {
       case 'blocklist':
         await this.blocklist(ctx);
         return;
+      case 'senderfilter':
+        await this.senderFilter(ctx);
+        return;
+      case 'sendertoggle':
+      case 'senderset': {
+        const source = this.settingsSource(ctx);
+        if (!source) throw new Error('Open Channels and select a source first');
+        const filter = (source.senderFilter ??= { enabled: false, usernames: [] });
+        if (action === 'sendertoggle' && (filter.enabled || filter.usernames.length)) {
+          filter.enabled = !filter.enabled;
+          this.store.saveCallChannel(source);
+          log.info('channel.sender_filter_updated', {
+            sourceId: source.id,
+            enabled: filter.enabled,
+            usernames: filter.usernames,
+          });
+          await this.senderFilter(ctx);
+          return;
+        }
+        state.pending = {
+          kind: 'sender_filter',
+          sourceId: source.id,
+          enableAfter: action === 'sendertoggle',
+        };
+        await this.reply(
+          ctx,
+          message`${bold('Set watched usernames')}\n\nSend one or more Telegram usernames, separated by commas, spaces or newlines. For example: @alice, @bob. This replaces this source's list.\n\n${action === 'sendertoggle' ? 'The sender filter will be enabled after you save the list.' : 'The current on/off setting will be preserved.'}\n\n${italic('Send /cancel to cancel.')}`,
+        );
+        return;
+      }
       case 'block':
         state.pending = {
           kind: 'block',
@@ -1553,6 +1602,25 @@ export class ControlBot {
       state.pending = null;
       this.selectChannel(ctx, channel.id);
       await this.home(ctx);
+      return;
+    }
+    if (pending.kind === 'sender_filter') {
+      const source = this.store.callChannel(pending.sourceId);
+      if (!source) throw new Error('This source no longer exists');
+      const usernames = senderUsernames(text);
+      source.senderFilter = {
+        enabled: pending.enableAfter || (source.senderFilter?.enabled ?? false),
+        usernames,
+      };
+      this.store.saveCallChannel(source);
+      log.info('channel.sender_filter_updated', {
+        sourceId: source.id,
+        enabled: source.senderFilter.enabled,
+        usernames,
+      });
+      state.settingsSourceId = source.id;
+      state.pending = null;
+      await this.senderFilter(ctx);
       return;
     }
     if (pending.kind === 'withdraw_address' || pending.kind === 'withdraw_amount') {

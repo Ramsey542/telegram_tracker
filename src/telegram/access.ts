@@ -27,6 +27,7 @@ const watcherActions = new Set([
   'pnl',
   'pnlquotes',
   'blocklist',
+  'senderfilter',
   'recent',
   'channels',
   'channelpick',

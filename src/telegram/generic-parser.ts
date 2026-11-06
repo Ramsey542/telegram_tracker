@@ -2,6 +2,7 @@ import { PublicKey } from '@solana/web3.js';
 import { normalizeAddress, type CallChannel, type Chain, type ChannelPost } from '../domain.js';
 import type { DexPair } from '../providers/market.js';
 import type { ParsedCall } from './parser.js';
+import { senderFilterRejection } from './sender-filter.js';
 
 export type PairResolver = (chain: string, address: string) => Promise<DexPair | null>;
 const dexHosts = new Set(['dexscreener.com', 'www.dexscreener.com']);
@@ -54,6 +55,8 @@ export async function parseGeneralCall(
   resolvePair: PairResolver,
 ): Promise<ParsedCall> {
   const skip = (reason: string): ParsedCall => ({ ok: false, reason });
+  const senderRejection = senderFilterRejection(channel, post);
+  if (senderRejection) return skip(senderRejection);
   if (isUpdatePost(post.text)) return skip('Update or performance post');
   const candidates = new Set(addresses(post.text.replace(/https?:\/\/[^\s<>]+/gi, ' ')));
   const hints = new Set<string>();
@@ -154,8 +157,11 @@ export async function parseGeneralCall(
       date: post.date,
       chain,
       address: normalizeAddress(chain, candidate),
-      caller: channel.username?.toLowerCase() ?? channel.title,
-      callerId: channel.channelId,
+      caller:
+        post.senderUsername ?? post.senderId ?? channel.username?.toLowerCase() ?? channel.title,
+      callerId: post.senderId ?? channel.channelId,
+      senderId: post.senderId,
+      senderUsername: post.senderUsername,
       consistency: null,
       advertisedMarketCapUsd: null,
       tokenName: /\$([A-Za-z][A-Za-z0-9_]{0,31})\b/.exec(post.text)?.[1] ?? candidate.slice(0, 8),

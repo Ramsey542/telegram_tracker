@@ -17,6 +17,7 @@ import {
 } from '../domain.js';
 import { ChannelRegistry } from './channel-registry.js';
 import { parseGeneralCall } from './generic-parser.js';
+import { senderFilterRejection, senderIdentity } from './sender-filter.js';
 import type { MarketData } from '../providers/market.js';
 import type { Wallets } from '../wallets.js';
 import { atomicWrite } from '../wallets.js';
@@ -261,6 +262,7 @@ export class ChannelReader {
       text: message.message,
       urls,
       revision: message.editDate ?? message.date,
+      ...senderIdentity(message),
     };
   }
   async hydrateHistory(references: { channelId: string; messageId: number }[]): Promise<void> {
@@ -288,10 +290,27 @@ export class ChannelReader {
     const detectedAt = Date.now();
     const post = this.sourcePost(message, source);
     if (this.store.alreadyRecorded(post)) return;
+    if (post.senderId && !post.senderUsername) {
+      try {
+        Object.assign(post, senderIdentity(message, await message.getSender()));
+      } catch (error) {
+        signalLog.error('signal.sender_lookup_failed', error, {
+          source: source.title,
+          channelId: post.channelId,
+          messageId: post.messageId,
+          senderId: post.senderId,
+        });
+      }
+    }
+    const current = this.store.callChannel(source.id);
+    if (!current) return;
+    source = current;
     let parsed;
     try {
-      parsed =
-        source.mode === 'spydefi'
+      const senderRejection = senderFilterRejection(source, post);
+      parsed = senderRejection
+        ? { ok: false as const, reason: senderRejection }
+        : source.mode === 'spydefi'
           ? parseCall(post)
           : await parseGeneralCall(post, source, (chain, address) => {
               if (!this.market) throw new Error('Pair lookup is unavailable');
@@ -311,6 +330,8 @@ export class ChannelReader {
         sourceId: source.id,
         sourceName: source.title,
         mode: source.mode,
+        senderId: post.senderId,
+        senderUsername: post.senderUsername,
       });
     withLogContext(
       {
@@ -318,6 +339,8 @@ export class ChannelReader {
         channelId: source.channelId!,
         messageId: message.id,
         signalId: `${source.channelId}:${message.id}`,
+        senderId: post.senderId,
+        senderUsername: post.senderUsername,
       },
       () => {
         const changed = this.store.recordPost(
@@ -335,6 +358,8 @@ export class ChannelReader {
           revision: post.revision,
           urls: post.urls,
           textLength: post.text.length,
+          senderId: post.senderId,
+          senderUsername: post.senderUsername,
         });
         signalLog.debug('signal.content', { text: post.text });
         if (parsed.ok) signalLog.info('signal.parsed', { signal: parsed.signal });
