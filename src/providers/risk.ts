@@ -8,7 +8,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
 } from '@solana/spl-token';
 import type { Config } from '../config.js';
-import type { ChainSettings, TokenInfo } from '../domain.js';
+import type { ChainSettings, TokenInfo, EvmChain } from '../domain.js';
 import { HttpClient } from '../infra/http.js';
 import { logger } from '../logging/logger.js';
 import { GoPlusClient } from './goplus.js';
@@ -37,10 +37,10 @@ export class RiskFilters {
       filters: settings.filters,
     });
     try {
-      if (currentToken && token.chain === 'robinhood') {
+      if (currentToken && token.chain !== 'solana') {
         const [current] = await Promise.all([
           currentToken,
-          this.robinhood(token.address, settings),
+          this.evm(token.address, settings, token.chain),
         ]);
         token = current;
         this.checkMarket(token, settings);
@@ -65,7 +65,7 @@ export class RiskFilters {
   private async checkCurrent(token: TokenInfo, settings: ChainSettings): Promise<void> {
     this.checkMarket(token, settings);
     if (token.chain === 'solana') await this.solana(token, settings);
-    else await this.robinhood(token.address, settings);
+    else await this.evm(token.address, settings, token.chain);
   }
   private checkMarket(token: TokenInfo, settings: ChainSettings): void {
     const filters = settings.filters;
@@ -171,7 +171,7 @@ export class RiskFilters {
         throw new Error('Holder concentration is unavailable or exceeds the maximum');
     }
   }
-  private async robinhood(address: string, settings: ChainSettings): Promise<void> {
+  private async evm(address: string, settings: ChainSettings, chain: EvmChain): Promise<void> {
     const filters = settings.filters;
     const enabled =
       filters.rejectHoneypot ||
@@ -184,7 +184,7 @@ export class RiskFilters {
       log.info('risk.goplus_skipped', { token: address, reason: 'security_filters_disabled' });
       return;
     }
-    const report = await this.goplus.security(address);
+    const report = await this.goplus.security(address, chain);
     log.info('risk.goplus_result', { service: 'GoPlus', token: address, report });
     const checks: [boolean, string | undefined, string][] = [
       [filters.rejectHoneypot, report.is_honeypot, 'Honeypot'],

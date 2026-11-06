@@ -86,7 +86,11 @@ test('listen-only retains captured calls and pending operations while blocking e
     const engine = new TradeEngine(
       { listenOnly: true, maxSignalAgeMs: 120_000 } as Config,
       store,
-      { solana: adapter, robinhood: { ...adapter, chain: 'robinhood' } },
+      {
+        solana: adapter,
+        robinhood: { ...adapter, chain: 'robinhood' },
+        bnb: { ...adapter, chain: 'bnb' },
+      },
       { check: unexpected } as unknown as RiskFilters,
     );
     engine.observeSignal(signal);

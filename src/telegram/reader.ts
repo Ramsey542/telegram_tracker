@@ -8,7 +8,13 @@ import { StringSession } from 'teleproto/sessions';
 import { type NewMessageEvent, type EditedMessageEvent } from 'teleproto/events';
 import { channelEvents } from './channel-events.js';
 import type { Config } from '../config.js';
-import { chains, type ChannelPost, type CallSignal, type CallChannel } from '../domain.js';
+import {
+  chains,
+  chainLabel,
+  type ChannelPost,
+  type CallSignal,
+  type CallChannel,
+} from '../domain.js';
 import { ChannelRegistry } from './channel-registry.js';
 import { parseGeneralCall } from './generic-parser.js';
 import type { MarketData } from '../providers/market.js';
@@ -228,7 +234,7 @@ export class ChannelReader {
     }, 10_000);
     const enabled = chains
       .filter((chain) => this.store.entriesEnabled(chain))
-      .map((chain) => (chain === 'solana' ? 'Solana' : 'Robinhood'));
+      .map((chain) => chainLabel[chain]);
     this.store.notify(
       `reader-start:${process.pid}`,
       `Telegram reader connected. Monitored channels: ${this.channels.list().length}. ${this.config.listenOnly ? 'LISTEN ONLY: all trading is blocked.' : `Enabled buy chains: ${enabled.join(', ') || 'none'}. Each chain is controlled in its own settings.`}`,

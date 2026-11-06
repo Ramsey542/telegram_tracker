@@ -10,7 +10,7 @@ import {
 export interface EditableField {
   label: string;
   hint: string;
-  group: 'buy' | 'consistency' | 'filters' | 'exits' | 'execution';
+  group: 'buy' | 'consistency' | 'filters' | 'exits' | 'execution' | 'timeExit';
   value: (settings: ChainSettings) => string | number | null;
   set: (settings: ChainSettings, value: string) => void;
   chains?: Chain[];
@@ -35,6 +35,19 @@ const amount = (value: string): string | null => {
   return value;
 };
 export const editableFields: Record<string, EditableField> = {
+  timeExitMinutes: {
+    label: 'Time limit (minutes)',
+    hint: 'Enter whole minutes from 1 to 43200. If no TP/SL sale completes before this time from the confirmed buy, all remaining tokens are sold regardless of profit or loss. Send off to disable and clear the limit.',
+    group: 'timeExit',
+    value: (s) => s.exits.timeExit.minutes,
+    set: (s, v) => {
+      const minutes = numeric(v, 1, 43200);
+      if (minutes !== null && !Number.isInteger(minutes))
+        throw new Error('Enter a whole number of minutes');
+      s.exits.timeExit.minutes = minutes;
+      if (minutes === null) s.exits.timeExit.enabled = false;
+    },
+  },
   buySize: {
     label: '💰 Buy size',
     hint: 'Enter the native coin amount to spend per new token.',
@@ -89,6 +102,19 @@ export const editableFields: Record<string, EditableField> = {
     value: (s) => s.priorityFee,
     set: (s, v) => {
       s.priorityFee = ['auto', 'off'].includes(v.toLowerCase()) ? null : v;
+    },
+  },
+  bnbGasPrice: {
+    label: 'Gas price (gwei)',
+    hint: 'Optional BNB transaction gas price in gwei. Enter a positive number, or auto/off to use the provider estimate.',
+    group: 'execution',
+    chains: ['bnb'],
+    emptyLabel: 'Auto',
+    value: (s) => s.priorityFee,
+    set: (s, v) => {
+      s.priorityFee = ['auto', 'off'].includes(v.toLowerCase()) ? null : v;
+      if (s.priorityFee !== null && parseAmount(s.priorityFee, 9) <= 0n)
+        throw new Error('Gas price must be greater than zero');
     },
   },
   evmPriorityFee: {
@@ -158,7 +184,7 @@ export const editableFields: Record<string, EditableField> = {
     label: '🧾 Maximum token tax (%)',
     hint: 'Enter the maximum buy and sell tax percentage, or off.',
     group: 'filters',
-    chains: ['robinhood'],
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.filters.maxTaxPercent,
     set: (s, v) => {
       s.filters.maxTaxPercent = numeric(v, 0, 100);
@@ -261,6 +287,14 @@ export const toggles: Record<
     change: (s: ChainSettings) => void;
   }
 > = {
+  timeExit: {
+    label: 'Time exit',
+    group: 'timeExit',
+    value: (s) => s.exits.timeExit.enabled,
+    change: (s) => {
+      s.exits.timeExit.enabled = !s.exits.timeExit.enabled;
+    },
+  },
   firstCaller: {
     label: 'Buy Only First Caller',
     group: 'filters',
@@ -277,6 +311,15 @@ export const toggles: Record<
     value: (s) => s.filters.justLaunched,
     change: (s) => {
       s.filters.justLaunched = !s.filters.justLaunched;
+    },
+  },
+  wrapMyBnb: {
+    label: 'Wrap my BNB if WBNB is insufficient',
+    group: 'buy',
+    chains: ['bnb'],
+    value: (s) => s.wrapMyEth,
+    change: (s) => {
+      s.wrapMyEth = !s.wrapMyEth;
     },
   },
   wrapMyEth: {
@@ -334,7 +377,7 @@ export const toggles: Record<
   honeypot: {
     label: '🍯 Reject honeypots',
     group: 'filters',
-    chains: ['robinhood'],
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.filters.rejectHoneypot,
     change: (s) => {
       s.filters.rejectHoneypot = !s.filters.rejectHoneypot;
@@ -343,7 +386,7 @@ export const toggles: Record<
   blacklist: {
     label: '🚫 Reject blacklist capability',
     group: 'filters',
-    chains: ['robinhood'],
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.filters.rejectBlacklist,
     change: (s) => {
       s.filters.rejectBlacklist = !s.filters.rejectBlacklist;
@@ -352,7 +395,7 @@ export const toggles: Record<
   pausable: {
     label: '⏸️ Reject pausable transfers',
     group: 'filters',
-    chains: ['robinhood'],
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.filters.rejectPausable,
     change: (s) => {
       s.filters.rejectPausable = !s.filters.rejectPausable;
@@ -361,7 +404,7 @@ export const toggles: Record<
   proxy: {
     label: '🔧 Reject upgradeable contracts',
     group: 'filters',
-    chains: ['robinhood'],
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.filters.rejectProxy,
     change: (s) => {
       s.filters.rejectProxy = !s.filters.rejectProxy;
@@ -370,7 +413,7 @@ export const toggles: Record<
   mev: {
     label: '🛡️ Require UniswapX protection',
     group: 'execution',
-    chains: ['robinhood'],
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.mevProtection,
     change: (s) => {
       s.mevProtection = !s.mevProtection;

@@ -56,6 +56,7 @@ export interface Config {
   httpTimeoutMs: number;
   solanaRpc: string;
   robinhoodRpc: string;
+  bnbRpc: string;
   jupiterKey: string;
   uniswapKey: string;
   rugcheckKey: string;
@@ -106,6 +107,7 @@ export function loadConfig(): Config {
     httpTimeoutMs: value.HTTP_TIMEOUT_SECONDS * 1000,
     solanaRpc,
     robinhoodRpc: url('QUICKNODE_ROBINHOOD_RPC_URL'),
+    bnbRpc: url('QUICKNODE_BNB_RPC_URL'),
     jupiterKey: process.env.JUPITER_API_KEY?.trim() ?? '',
     uniswapKey: process.env.UNISWAP_API_KEY?.trim() ?? '',
     rugcheckKey: process.env.RUGCHECK_API_KEY?.trim() ?? '',

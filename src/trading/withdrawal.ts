@@ -12,7 +12,7 @@ export function withdrawalAddress(chain: Chain, value: string, sender: string): 
     return key.toBase58();
   }
   if (!isAddress(address) || address.toLowerCase() === zeroAddress)
-    throw new Error('Enter a valid Robinhood EVM address');
+    throw new Error('Enter a valid EVM address for the selected network');
   if (address.toLowerCase() === sender.toLowerCase())
     throw new Error('Destination must differ from the sending wallet');
   return getAddress(address);

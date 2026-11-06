@@ -1,8 +1,8 @@
 import { InlineKeyboard } from 'grammy';
-import type { CallChannel } from '../domain.js';
+import { chains, chainLabel, nativeSymbol, type CallChannel } from '../domain.js';
 import { bold, code, italic, joinMessages, message } from './presentation.js';
 import { settingsCallback } from './settings-scope.js';
-import { exitSummary, exitPlanLines } from './exits.js';
+import { exitSummary, exitPlanLines, timeExitSummary } from './exits.js';
 
 export const channelStatus = (enabled: boolean): string => (enabled ? '🟢 On' : '🔴 Off');
 
@@ -74,6 +74,11 @@ export function channelDetails(channel: CallChannel, lastSuccess: string | null)
       settingsCallback(rulesKey, 'chain:robinhood'),
     )
     .row()
+    .text(
+      `BNB: ${channelStatus(channel.settings!.bnb.enabled)}`,
+      settingsCallback(rulesKey, 'chain:bnb'),
+    )
+    .row()
     .text(channel.enabled ? '🔴 Disable channel' : '🟢 Enable channel', `channeltoggle:${key}`)
     .row();
   if (channel.mode === 'general')
@@ -82,6 +87,8 @@ export function channelDetails(channel: CallChannel, lastSuccess: string | null)
       .row()
       .text('🟣 Default: Solana', `channelchain:${key}:solana`)
       .text('🪶 Default: Robinhood', `channelchain:${key}:robinhood`)
+      .row()
+      .text('Default: BNB', `channelchain:${key}:bnb`)
       .row();
   keyboard
     .text('🚫 Caller blocklist', settingsCallback(rulesKey, 'blocklist'))
@@ -108,17 +115,18 @@ export function channelDetails(channel: CallChannel, lastSuccess: string | null)
         ? ['', message`${bold('Access details:')} ${channel.error.slice(0, 700)}`]
         : []),
       '',
-      ...(['solana', 'robinhood'] as const).flatMap((chain) => {
+      ...chains.flatMap((chain) => {
         const settings = channel.settings![chain];
         return [
           '',
-          bold(chain === 'solana' ? 'Solana rules' : 'Robinhood rules'),
-          `New entries: ${settings.enabled ? 'On' : 'Off'} | Buy size: ${settings.buySizeNative ?? 'Unset'} ${chain === 'solana' ? 'SOL' : 'ETH'}`,
+          bold(`${chainLabel[chain]} rules`),
+          `New entries: ${settings.enabled ? 'On' : 'Off'} | Buy size: ${settings.buySizeNative ?? 'Unset'} ${nativeSymbol[chain]}`,
           `Slippage: ${settings.slippagePercent === null ? 'Unset' : `${settings.slippagePercent}%`}`,
           exitSummary(settings.exits, 'tp'),
           ...exitPlanLines(settings.exits, 'tp'),
           exitSummary(settings.exits, 'sl'),
           ...exitPlanLines(settings.exits, 'sl'),
+          timeExitSummary(settings.exits),
         ];
       }),
       '',

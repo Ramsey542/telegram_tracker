@@ -1,9 +1,15 @@
 import { z } from 'zod';
 
-export const chains = ['solana', 'robinhood'] as const;
+export const chains = ['solana', 'robinhood', 'bnb'] as const;
 export type Chain = (typeof chains)[number];
-export const nativeSymbol = { solana: 'SOL', robinhood: 'ETH' } as const;
-export const nativeDecimals = { solana: 9, robinhood: 18 } as const;
+export type EvmChain = Exclude<Chain, 'solana'>;
+export const chainLabel = {
+  solana: 'Solana',
+  robinhood: 'Robinhood',
+  bnb: 'BNB Smart Chain',
+} as const;
+export const nativeSymbol = { solana: 'SOL', robinhood: 'ETH', bnb: 'BNB' } as const;
+export const nativeDecimals = { solana: 9, robinhood: 18, bnb: 18 } as const;
 const percent = z.number().finite().min(0).max(100);
 const positivePercent = percent.positive();
 const positive = z.number().finite().positive();
@@ -53,6 +59,12 @@ export const exitSchema = z
   .object({
     tpMode: z.enum(['hard', 'trailing']).optional(),
     slMode: z.enum(['hard', 'trailing']).optional(),
+    timeExit: z
+      .object({
+        enabled: z.boolean().default(false),
+        minutes: z.number().int().min(1).max(43200).nullable().default(null),
+      })
+      .default(() => ({ enabled: false, minutes: null })),
     stopLoss: z
       .object({
         enabled: z.boolean().default(false),
@@ -83,6 +95,8 @@ export const exitSchema = z
     })),
   })
   .superRefine((value, context) => {
+    if (value.timeExit.enabled && value.timeExit.minutes === null)
+      context.addIssue({ code: 'custom', message: 'Set the time exit limit before enabling it' });
     if (value.stopLoss.enabled && value.stopLoss.lossPercent === null)
       context.addIssue({ code: 'custom', message: 'Set a stop loss before enabling it' });
     if (value.takeProfitEnabled && value.takeProfits.length === 0)
@@ -185,16 +199,24 @@ export const chainSettingsSchema = z
 
 export const settingsSchema = z.object({
   blockedCallers: z.array(z.string()).default(() => []),
-  chains: z.object({ solana: chainSettingsSchema, robinhood: chainSettingsSchema }).default(() => ({
-    solana: chainSettingsSchema.parse({}),
-    robinhood: chainSettingsSchema.parse({}),
-  })),
+  chains: z
+    .object({
+      solana: chainSettingsSchema,
+      robinhood: chainSettingsSchema,
+      bnb: chainSettingsSchema.default(() => chainSettingsSchema.parse({ mevProtection: false })),
+    })
+    .default(() => ({
+      solana: chainSettingsSchema.parse({}),
+      robinhood: chainSettingsSchema.parse({}),
+      bnb: chainSettingsSchema.parse({ mevProtection: false }),
+    })),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 export type ChainSettings = z.infer<typeof chainSettingsSchema>;
 export const channelRulesSchema = z.object({
   solana: chainSettingsSchema.default(() => chainSettingsSchema.parse({})),
   robinhood: chainSettingsSchema.default(() => chainSettingsSchema.parse({})),
+  bnb: chainSettingsSchema.default(() => chainSettingsSchema.parse({ mevProtection: false })),
 });
 export type ChannelRules = z.infer<typeof channelRulesSchema>;
 export type ExitSettings = z.infer<typeof exitSchema>;
@@ -327,6 +349,10 @@ export interface Position {
   entrySwapNativeRaw?: string;
   entryFeeNativeRaw: string;
   entryUsd: number | null;
+  entryMarketCapUsd?: number | null;
+  entryMarketCapCapturedAt?: number;
+  entryMarketCapAfterBuy?: boolean;
+  timeExitOperationId?: string;
   realizedNativeRaw: string;
   realizedFeeNativeRaw: string;
   exits: ExitSettings;
@@ -443,7 +469,7 @@ export const emptyTrail = (): TrailState => ({
 });
 
 export function normalizeAddress(chain: Chain, address: string): string {
-  return chain === 'robinhood' ? address.toLowerCase() : address;
+  return chain === 'solana' ? address : address.toLowerCase();
 }
 export function parseAmount(value: string, decimals: number): bigint {
   if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value))

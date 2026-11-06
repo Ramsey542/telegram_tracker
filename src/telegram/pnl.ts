@@ -11,7 +11,7 @@ export function pnlPeriod(value: string | undefined): PnlPeriod {
 
 export function pnlChain(value: string | undefined): PnlChain {
   if (value === undefined) return 'all';
-  if (value !== 'all' && value !== 'solana' && value !== 'robinhood')
+  if (value !== 'all' && value !== 'solana' && value !== 'robinhood' && value !== 'bnb')
     throw new Error('Unknown PNL chain');
   return value;
 }
@@ -28,7 +28,12 @@ export function usdText(value: bigint | null, signed = false): string {
 
 export function pnlMessage(summary: PnlSummary, updating = false): MessageText {
   const period = { day: 'Daily', week: 'Weekly', month: 'Monthly' }[summary.window.period];
-  const chain = { all: 'All chains', solana: 'Solana', robinhood: 'Robinhood' }[summary.chain];
+  const chain = {
+    all: 'All chains',
+    solana: 'Solana',
+    robinhood: 'Robinhood',
+    bnb: 'BNB Smart Chain',
+  }[summary.chain];
   const roi =
     summary.allocatedCostUsd > 0n && summary.realizedUsd !== null
       ? `${(Number((summary.realizedUsd * 10_000n) / summary.allocatedCostUsd) / 100).toFixed(2)}%`

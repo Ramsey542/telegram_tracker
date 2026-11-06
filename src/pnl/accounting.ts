@@ -33,7 +33,7 @@ export function pnlFill(
   let walletNativeRaw = result?.nativeRaw ?? (buy ? position.entryNativeRaw : null);
   let feeNativeRaw = result?.feeNativeRaw ?? (buy ? position.entryFeeNativeRaw : null);
   if (buy) swapNativeRaw ??= position.entrySwapNativeRaw ?? operation.amountRaw;
-  if (operation.chain === 'robinhood') {
+  if (operation.chain !== 'solana') {
     swapNativeRaw ??= buy ? operation.amountRaw : operation.outputRaw;
     feeNativeRaw ??= operation.steps
       .reduce(

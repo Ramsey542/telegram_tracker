@@ -9,11 +9,15 @@ const quoteAssets = new Set([
   'So11111111111111111111111111111111111111112',
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
+  '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
+  '0x55d398326f99059ff775485246999027b3197955',
+  '0xe9e7cea3dedca5984780bafc599bd69add087d56',
 ]);
 function chainHint(value: string): string {
   const name = value.toLowerCase();
   if (name === 'sol') return 'solana';
   if (['rh', 'rbh', '4663'].includes(name)) return 'robinhood';
+  if (['bnb', 'bsc', '56', 'binance'].includes(name)) return 'bnb';
   if (['eth', '1'].includes(name)) return 'ethereum';
   return name;
 }
@@ -56,10 +60,11 @@ export async function parseGeneralCall(
   const plain = post.text.replace(/https?:\/\/[^\s<>]+/gi, ' ');
   if (/\b(?:solana|sol)\b/i.test(plain)) hints.add('solana');
   if (/\b(?:robinhood|rbh|rh)\b/i.test(plain)) hints.add('robinhood');
+  if (/\b(?:bnb|bsc|binance\s+smart\s+chain)\b/i.test(plain)) hints.add('bnb');
   for (const match of plain.matchAll(
     /\b(?:chain|network)\s*:\s*(ethereum|bsc|base|arbitrum|polygon)\b/gi,
   ))
-    hints.add(match[1]!.toLowerCase());
+    hints.add(chainHint(match[1]!));
   const links = new Set([
     ...post.urls,
     ...Array.from(post.text.matchAll(/https?:\/\/[^\s<>]+/gi), (match) => match[0]),
@@ -82,6 +87,11 @@ export async function parseGeneralCall(
       continue;
     }
     if (url.hostname.toLowerCase() === 'solscan.io' && parts[0] === 'token') hints.add('solana');
+    if (
+      ['bscscan.com', 'www.bscscan.com'].includes(url.hostname.toLowerCase()) &&
+      ['token', 'address'].includes(parts[0] ?? '')
+    )
+      hints.add('bnb');
     const queryChain = url.searchParams.get('chain') ?? url.searchParams.get('chainId');
     if (queryChain) hints.add(chainHint(queryChain));
     let path = url.pathname;
@@ -99,7 +109,8 @@ export async function parseGeneralCall(
   }
   if (hints.size > 1) return skip('Conflicting chain hints');
   const hint = [...hints][0];
-  if (hint && hint !== 'solana' && hint !== 'robinhood') return skip(`Unsupported chain: ${hint}`);
+  if (hint && hint !== 'solana' && hint !== 'robinhood' && hint !== 'bnb')
+    return skip(`Unsupported chain: ${hint}`);
   if (candidates.size > 1) for (const quoteAsset of quoteAssets) candidates.delete(quoteAsset);
   if (candidates.size > 1) return skip('Multiple token candidates; no unambiguous call');
   let candidate = [...candidates][0];
@@ -114,7 +125,10 @@ export async function parseGeneralCall(
       normalizeAddress(chain, pairLink.address) === normalizeAddress(chain, candidate)
     )
       continue;
-    const pair = await resolvePair(pairLink.chain, pairLink.address);
+    const pair = await resolvePair(
+      pairLink.chain === 'bnb' ? 'bsc' : pairLink.chain,
+      pairLink.address,
+    );
     if (!pair) return skip('Chart pair could not be resolved');
     const base = normalizeAddress(chain, pair.baseToken.address);
     const quote = normalizeAddress(chain, pair.quoteToken.address);
@@ -128,7 +142,7 @@ export async function parseGeneralCall(
     }
   }
   if (!candidate) return skip('No complete contract address found');
-  if ((chain === 'robinhood') !== candidate.startsWith('0x'))
+  if ((chain !== 'solana') !== candidate.startsWith('0x'))
     return skip('Contract address conflicts with the selected chain');
   if (quoteAssets.has(candidate)) return skip('Call points to a native or quote asset');
   return {

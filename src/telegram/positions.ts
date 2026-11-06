@@ -50,7 +50,7 @@ export function positionEntryPrice(position: Position, entry: PnlFill | null): s
   const cost =
     position.entrySwapNativeRaw ??
     fill?.swapNativeRaw ??
-    (position.chain === 'robinhood'
+    (position.chain !== 'solana'
       ? (BigInt(position.entryNativeRaw) - BigInt(position.entryFeeNativeRaw)).toString()
       : null);
   if (cost === null || BigInt(cost) <= 0n || BigInt(position.originalTokenRaw) <= 0n)
@@ -64,4 +64,11 @@ export function positionEntryPrice(position: Position, entry: PnlFill | null): s
   const rate = Math.round(fill.nativeUsd * Number(USD_SCALE));
   if (!Number.isSafeInteger(rate) || rate <= 0) return native;
   return `${native} (approximately $${priceRatio(numerator * BigInt(rate), denominator * USD_SCALE)}/token)`;
+}
+
+export function positionEntryMarketCap(
+  snapshot: { value: number; afterBuy: boolean } | null,
+): string {
+  if (!snapshot || !Number.isFinite(snapshot.value) || snapshot.value <= 0) return 'Unavailable';
+  return `${snapshot.afterBuy ? '~' : ''}${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(snapshot.value)}`;
 }

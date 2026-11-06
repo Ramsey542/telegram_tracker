@@ -12,6 +12,7 @@ import { PnlTracker } from './pnl/tracker.js';
 import { RiskFilters } from './providers/risk.js';
 import { SolanaAdapter } from './chains/solana.js';
 import { RobinhoodAdapter } from './chains/robinhood.js';
+import { BnbAdapter } from './chains/bnb.js';
 import { TradeEngine } from './trading/engine.js';
 import { ChannelReader } from './telegram/reader.js';
 import { ControlBot } from './telegram/bot.js';
@@ -28,6 +29,7 @@ async function main(): Promise<void> {
       'TELEGRAM_BOT_TOKEN',
       'QUICKNODE_SOLANA_RPC_URL',
       'QUICKNODE_ROBINHOOD_RPC_URL',
+      'QUICKNODE_BNB_RPC_URL',
       'JUPITER_API_KEY',
       'UNISWAP_API_KEY',
       'RUGCHECK_API_KEY',
@@ -54,6 +56,7 @@ async function main(): Promise<void> {
       config.botToken,
       config.solanaRpc,
       config.robinhoodRpc,
+      config.bnbRpc,
       config.jupiterKey,
       config.uniswapKey,
       config.rugcheckKey,
@@ -138,10 +141,12 @@ async function main(): Promise<void> {
       {
         solana: new SolanaAdapter(config, wallets, http, market),
         robinhood: new RobinhoodAdapter(config, wallets, http, market),
+        bnb: new BnbAdapter(config, wallets, http, market),
       },
       filters,
       () => pnl?.refreshRates(),
       positionPrices,
+      market,
     );
     const activeEngine = engine;
     pnl = new PnlTracker(config, store, engine.adapters, nativePrices, positionPrices);
@@ -169,6 +174,7 @@ async function main(): Promise<void> {
     log.debug('wallets.ready', {
       solana: wallets.solana.publicKey.toBase58(),
       robinhood: wallets.robinhood.address,
+      bnb: wallets.bnb.address,
     });
     await control.start();
     await reader.start();

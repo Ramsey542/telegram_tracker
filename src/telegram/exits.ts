@@ -1,11 +1,22 @@
 import { InlineKeyboard } from 'grammy';
 import { z } from 'zod';
-import { type Chain, type ExitSettings, type TrailStage, trailStageSchema } from '../domain.js';
+import {
+  chainLabel,
+  nativeSymbol,
+  type Chain,
+  type ExitSettings,
+  type TrailStage,
+  trailStageSchema,
+} from '../domain.js';
 import { safeError } from '../infra/http.js';
 import { bold, code, italic, joinMessages, message, type MessageText } from './presentation.js';
 
 export type ExitKind = 'tp' | 'sl';
 export type ExitMode = 'hard' | 'trailing';
+export function timeExitSummary(exits: ExitSettings): string {
+  const rule = exits.timeExit;
+  return `Time exit: ${rule?.enabled ? 'On' : 'Off'}${rule?.minutes == null ? '' : ` | ${rule.minutes} minutes`}`;
+}
 export const exitKind = (value: string | undefined): ExitKind => {
   if (value !== 'tp' && value !== 'sl') throw new Error('Unknown exit type');
   return value;
@@ -196,7 +207,7 @@ export function exitPanel(
     .row();
   const lines: (string | MessageText)[] = [
     bold(title(kind)),
-    chain === 'solana' ? 'Solana / SOL' : 'Robinhood / ETH',
+    `${chainLabel[chain]} / ${nativeSymbol[chain]}`,
     exitSummary(exits, kind),
     '',
   ];

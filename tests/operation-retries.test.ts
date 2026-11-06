@@ -83,7 +83,7 @@ function fixture(t: TestContext, prepared = true) {
     new TradeEngine(
       { listenOnly: false } as Config,
       store,
-      { solana: adapter('solana'), robinhood: adapter('robinhood') },
+      { solana: adapter('solana'), robinhood: adapter('robinhood'), bnb: adapter('bnb') },
       {} as RiskFilters,
     );
   let engine = createEngine();

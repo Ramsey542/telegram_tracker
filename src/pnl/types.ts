@@ -11,7 +11,7 @@ export interface PnlFill {
   walletNativeRaw: string | null;
   feeNativeRaw: string | null;
   nativeUsd: number | null;
-  usdSource: 'swap_quote' | 'coinbase_spot' | null;
+  usdSource: 'swap_quote' | 'coinbase_spot' | 'dexscreener' | null;
   usdAt: number | null;
   confirmedAt: number;
   legacy: boolean;

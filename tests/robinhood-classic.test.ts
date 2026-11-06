@@ -19,10 +19,12 @@ import type { Config } from '../src/config.js';
 import type { Wallets } from '../src/wallets.js';
 import type { ChainAdapter } from '../src/chains/types.js';
 import { ROBINHOOD_CHAIN_ID, ROBINHOOD_WETH, RobinhoodAdapter } from '../src/chains/robinhood.js';
-import { chainSettingsSchema, type Operation } from '../src/domain.js';
+import { chainSettingsSchema, type Operation, type EvmChain } from '../src/domain.js';
 import { HttpClient } from '../src/infra/http.js';
 import { Store } from '../src/infra/store.js';
 import { MarketData } from '../src/providers/market.js';
+import { BnbAdapter } from '../src/chains/bnb.js';
+import { evmNetworks } from '../src/chains/networks.js';
 import { RiskFilters } from '../src/providers/risk.js';
 import { TradeEngine } from '../src/trading/engine.js';
 
@@ -51,7 +53,12 @@ function deferred() {
   return { promise, resolve };
 }
 
-function harness(t: TestContext) {
+function harness(t: TestContext, chain: EvmChain = 'robinhood') {
+  const network = evmNetworks[chain];
+  const router = UNIVERSAL_ROUTER_ADDRESS(
+    UniversalRouterVersion.V2_1_2,
+    network.chainId,
+  ) as Address;
   const directory = mkdtempSync(join(tmpdir(), 'telegram-classic-'));
   const store = new Store(directory);
   t.after(() => {
@@ -59,10 +66,15 @@ function harness(t: TestContext) {
     assert.ok(directory.startsWith(join(tmpdir(), 'telegram-classic-')));
     rmSync(directory, { recursive: true, force: true });
   });
-  const config = { robinhoodRpc: rpcUrl, httpTimeoutMs: 1000, listenOnly: false } as Config;
+  const config = {
+    robinhoodRpc: rpcUrl,
+    bnbRpc: rpcUrl,
+    httpTimeoutMs: 1000,
+    listenOnly: false,
+  } as Config;
   const operation: Operation = {
     id: 'classic-buy',
-    chain: 'robinhood',
+    chain,
     address: token,
     kind: 'buy',
     status: 'active',
@@ -71,7 +83,7 @@ function harness(t: TestContext) {
     exitKey: null,
     amountRaw: inputRaw.toString(),
     token: {
-      chain: 'robinhood',
+      chain,
       address: token,
       symbol: 'CALL',
       decimals: null,
@@ -96,16 +108,16 @@ function harness(t: TestContext) {
     error: null,
   };
   store.updateSettings((settings) => {
-    settings.chains.robinhood = operation.settings;
+    settings.chains[chain] = operation.settings;
   });
   const quote = {
     routing: 'CLASSIC',
     permitData: null,
     quote: {
-      input: { token: ROBINHOOD_WETH, amount: inputRaw.toString() },
+      input: { token: network.wrappedNative, amount: inputRaw.toString() },
       output: { token, amount: outputRaw.toString() },
       swapper: wallet.address,
-      chainId: ROBINHOOD_CHAIN_ID,
+      chainId: Number(network.chainId),
       slippage: 2,
       priceImpact: 0.1,
       route: [
@@ -113,7 +125,7 @@ function harness(t: TestContext) {
           {
             tokenOut: {
               address: token,
-              chainId: ROBINHOOD_CHAIN_ID,
+              chainId: Number(network.chainId),
               symbol: 'QUOTE',
               decimals: '6',
             },
@@ -149,7 +161,7 @@ function harness(t: TestContext) {
             { type: 'bool' },
             { type: 'uint256[]' },
           ],
-          [wallet.address, inputRaw, 980_000n, [ROBINHOOD_WETH, token], true, [0n]],
+          [wallet.address, inputRaw, 980_000n, [network.wrappedNative, token], true, [0n]],
         ),
       ],
       BigInt(Math.floor(Date.now() / 1000) + 120),
@@ -160,7 +172,7 @@ function harness(t: TestContext) {
     from: wallet.address,
     data,
     value: '0',
-    chainId: ROBINHOOD_CHAIN_ID,
+    chainId: Number(network.chainId),
     gasLimit: '150000',
     maxFeePerGas: '3000000000',
     maxPriorityFeePerGas: '1000000000',
@@ -194,7 +206,7 @@ function harness(t: TestContext) {
           Response.json({ jsonrpc: '2.0', id: body.id, result });
         switch (body.method) {
           case 'eth_chainId':
-            return response('0x1237');
+            return response(`0x${network.chainId.toString(16)}`);
           case 'eth_getTransactionCount':
             assert.equal(body.params[1], 'pending');
             nonceStarted.resolve();
@@ -258,7 +270,7 @@ function harness(t: TestContext) {
               type: '0x2',
               logsBloom: `0x${'00'.repeat(256)}`,
               logs: [
-                transfer(ROBINHOOD_WETH, wallet.address, router, inputRaw, 0),
+                transfer(network.wrappedNative, wallet.address, router, inputRaw, 0),
                 transfer(token, router, wallet.address, outputRaw, 1),
               ],
             });
@@ -295,10 +307,10 @@ function harness(t: TestContext) {
         await marketGate;
         return Response.json([
           {
-            chainId: 'robinhood',
+            chainId: network.dexChain,
             pairAddress: router,
             baseToken: { address: token, symbol: 'DEX' },
-            quoteToken: { address: ROBINHOOD_WETH, symbol: 'WETH' },
+            quoteToken: { address: network.wrappedNative, symbol: 'WETH' },
             marketCap: 100000,
             liquidity: { usd: 50000 },
             priceUsd: '0.5',
@@ -317,16 +329,20 @@ function harness(t: TestContext) {
     },
   };
   const http = new HttpClient(1000);
-  const adapter = new RobinhoodAdapter(
+  const adapter = new (chain === 'bnb' ? BnbAdapter : RobinhoodAdapter)(
     config,
-    { robinhood: account } as Wallets,
+    { [chain]: account } as unknown as Wallets,
     http,
     new MarketData(config, http),
   );
   const engine = new TradeEngine(
     config,
     store,
-    { robinhood: adapter, solana: {} as ChainAdapter },
+    {
+      robinhood: chain === 'robinhood' ? adapter : ({} as ChainAdapter),
+      solana: {} as ChainAdapter,
+      bnb: chain === 'bnb' ? adapter : ({} as ChainAdapter),
+    },
     new RiskFilters(config, http),
   );
   // Keep the unrelated chain idle without invoking a fake adapter.
@@ -561,7 +577,7 @@ test('uncertain broadcast is reported and reconciled across restart without rebu
       async () => assert.fail('A saved swap must not repeat risk checks'),
       () => assert.fail('A saved swap must not be signed or rebroadcast'),
     ),
-    /Waiting for Robinhood confirmation/,
+    /Waiting for Robinhood(?: Chain)? confirmation/,
   );
   value.receipt(true);
   const result = await adapter.advance(
@@ -666,5 +682,28 @@ for (const fields of [{ gasLimit: '0' }, { maxFeePerGas: '1', maxPriorityFeePerG
     assert.match(value.store.operation(value.operation.id)?.error ?? '', /invalid gas fields/);
     assert.equal(value.signed.length, 0);
     assert.equal(value.sent.length, 0);
+  });
+}
+
+for (const priorityFee of [null, '1.5']) {
+  test(`BNB Classic buy uses chain 56, WBNB and its own wallet with gas price ${priorityFee ?? 'auto'}`, async (t) => {
+    const value = harness(t, 'bnb');
+    value.operation.settings.priorityFee = priorityFee;
+    value.claim();
+    await value.engine.tick(true);
+    const saved = value.store.operation(value.operation.id)!;
+    assert.equal(saved.status, 'confirmed');
+    assert.equal(value.store.positions('bnb').length, 1);
+    assert.equal(value.store.positions('robinhood').length, 0);
+    assert.equal(value.sent.length, 1);
+    const transaction = parseTransaction(value.sent[0]!);
+    assert.equal(transaction.chainId, 56);
+    assert.equal(transaction.type, 'legacy');
+    assert.equal(transaction.gasPrice, priorityFee === null ? 3_000_000_000n : 1_500_000_000n);
+    assert.equal(value.calls.includes('eth_getBalance'), false);
+    assert.equal(value.calls.includes('eth_call'), false);
+    assert.equal(value.calls.filter((call) => call === 'quote').length, 1);
+    assert.equal(value.calls.filter((call) => call === 'swap').length, 1);
+    assert.equal(value.quote.quote.input.token, evmNetworks.bnb.wrappedNative);
   });
 }

@@ -2,6 +2,8 @@ import type { ExitSettings } from '../domain.js';
 
 export function exitReasonLabel(key: string | null, exits: ExitSettings): string {
   if (key === null || key === 'manual') return 'Manual sale';
+  if (key === 'time')
+    return `Time exit after ${exits.timeExit?.minutes ?? 'configured'} minutes without a completed TP/SL sale`;
   if (key === 'sl')
     return exits.stopLoss.lossPercent === null
       ? 'Stop loss'

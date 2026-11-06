@@ -11,7 +11,8 @@ import { pnlFill, summarizePnl, usdValue } from '../src/pnl/accounting.js';
 import { pnlWindow } from '../src/pnl/periods.js';
 import type { PnlFill } from '../src/pnl/types.js';
 import { pnlMessage, usdText } from '../src/telegram/pnl.js';
-import { positionEntryPrice } from '../src/telegram/positions.js';
+import { positionEntryPrice, positionEntryMarketCap } from '../src/telegram/positions.js';
+
 import { PnlTracker } from '../src/pnl/tracker.js';
 import type { Config } from '../src/config.js';
 import type { ChainAdapter } from '../src/chains/types.js';
@@ -19,6 +20,39 @@ import { TradeEngine } from '../src/trading/engine.js';
 import type { RiskFilters } from '../src/providers/risk.js';
 import type { Quote } from '../src/domain.js';
 
+test('entry market cap distinguishes historical snapshots from post-buy estimates and missing data', () => {
+  assert.equal(positionEntryMarketCap({ value: 405000, afterBuy: false }), '$405,000');
+  assert.equal(positionEntryMarketCap({ value: 40000, afterBuy: true }), '~$40,000');
+  assert.equal(positionEntryMarketCap(null), 'Unavailable');
+  assert.equal(positionEntryMarketCap({ value: NaN, afterBuy: false }), 'Unavailable');
+});
+
+test('entry market cap remains fixed and legacy positions use only their saved entry snapshot', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'tracker-entry-mcap-'));
+  const store = new Store(directory);
+  t.after(() => {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const buy = operation();
+  const holding = position();
+  buy.token.marketCapUsd = 405000;
+  store.completeBuy(buy, holding, {
+    tokenRaw: holding.originalTokenRaw,
+    nativeRaw: holding.entryNativeRaw,
+    feeNativeRaw: holding.entryFeeNativeRaw,
+    signature: 'offline-buy',
+    nativeUsd: null,
+  });
+  assert.equal(store.position(holding.id)?.entryMarketCapUsd, 405000);
+  assert.deepEqual(store.positionEntryMarketCap(holding), { value: 405000, afterBuy: false });
+  const legacy = { ...holding };
+  delete legacy.entryMarketCapUsd;
+  assert.deepEqual(store.positionEntryMarketCap(legacy), { value: 405000, afterBuy: false });
+  buy.token.marketCapUsd = 900000;
+  store.saveOperation(buy);
+  assert.deepEqual(store.positionEntryMarketCap(holding), { value: 405000, afterBuy: false });
+});
 const now = Date.parse('2026-10-28T18:00:00Z');
 const yesterday = Date.parse('2026-10-27T12:00:00Z');
 const day = pnlWindow('day', 0, 'UTC', now);
@@ -448,7 +482,11 @@ for (const scenario of ['quotes', 'listen-only', 'trade-active'] as const) {
     const tracker = new PnlTracker(
       { listenOnly: scenario === 'listen-only' } as Config,
       store,
-      { solana: adapter, robinhood: { ...adapter, chain: 'robinhood' } },
+      {
+        solana: adapter,
+        robinhood: { ...adapter, chain: 'robinhood' },
+        bnb: { ...adapter, chain: 'bnb' },
+      },
       new NativePrices(new HttpClient(1000)),
     );
     try {
@@ -502,7 +540,7 @@ for (const changedHoldings of [false, true]) {
       const engine = new TradeEngine(
         {} as Config,
         store,
-        { solana: adapter, robinhood: adapter },
+        { solana: adapter, robinhood: adapter, bnb: adapter },
         {} as RiskFilters,
       );
       const refresh = engine.refresh(current);

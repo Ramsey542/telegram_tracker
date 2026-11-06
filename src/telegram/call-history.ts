@@ -95,6 +95,7 @@ function chartChain(item: CallHistoryItem): string | null {
 function chainLabel(chain: string | null): string {
   if (chain === 'solana') return 'Solana (SOL)';
   if (chain === 'robinhood') return 'Robinhood (ETH)';
+  if (chain === 'bnb' || chain === 'bsc') return 'BNB Smart Chain (BNB)';
   if (chain === 'ethereum') return 'Ethereum (unsupported)';
   return chain ? `${clean(chain)} (unsupported)` : 'Not identified';
 }

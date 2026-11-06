@@ -4,6 +4,8 @@ import type { Config } from '../config.js';
 import { ApiError, HttpClient, HttpError } from '../infra/http.js';
 import { logger } from '../logging/logger.js';
 import { registerSecrets } from '../logging/redaction.js';
+import type { EvmChain } from '../domain.js';
+import { evmNetworks } from '../chains/networks.js';
 
 const log = logger.child({ component: 'api.goplus', service: 'GoPlus' });
 const envelopeSchema = z.object({
@@ -155,16 +157,18 @@ export class GoPlusClient {
   private invalidate(token: string): void {
     if (this.cached?.token === token) this.cached = null;
   }
-  async security(address: string): Promise<SecurityReport> {
+  async security(address: string, chain: EvmChain = 'robinhood'): Promise<SecurityReport> {
     if (!/^0x[a-fA-F0-9]{40}$/.test(address))
-      throw new Error('GoPlus requires a valid Robinhood token address');
+      throw new Error('GoPlus requires a valid EVM token address');
     address = address.toLowerCase();
+    const key = `${chain}:${address}`;
     const now = Date.now();
     for (const [token, saved] of this.reports)
       if (now - saved.fetchedAt >= reportLifetimeMs) this.reports.delete(token);
-    const saved = this.reports.get(address);
+    const saved = this.reports.get(key);
     if (saved) {
       log.info('goplus.report_reused', {
+        chain,
         token: address,
         networkRequest: false,
         ageMs: now - saved.fetchedAt,
@@ -172,25 +176,26 @@ export class GoPlusClient {
       });
       return structuredClone(saved.report);
     }
-    let pending = this.pendingReports.get(address);
+    let pending = this.pendingReports.get(key);
     if (!pending) {
-      pending = this.fetchSecurity(address)
+      pending = this.fetchSecurity(address, chain)
         .then((report) => {
-          this.reports.set(address, { report, fetchedAt: Date.now() });
+          this.reports.set(key, { report, fetchedAt: Date.now() });
           log.info('goplus.report_received', {
+            chain,
             token: address,
             networkRequest: true,
             validForMs: reportLifetimeMs,
           });
           return report;
         })
-        .finally(() => this.pendingReports.delete(address));
-      this.pendingReports.set(address, pending);
+        .finally(() => this.pendingReports.delete(key));
+      this.pendingReports.set(key, pending);
     }
     return structuredClone(await pending);
   }
-  private async fetchSecurity(address: string): Promise<SecurityReport> {
-    const endpoint = `https://api.gopluslabs.io/api/v1/token_security/4663?contract_addresses=${address}`;
+  private async fetchSecurity(address: string, chain: EvmChain): Promise<SecurityReport> {
+    const endpoint = `https://api.gopluslabs.io/api/v1/token_security/${evmNetworks[chain].chainId}?contract_addresses=${address}`;
     for (let attempt = 0; attempt < 2; attempt++) {
       const token = await this.token();
       let response: Envelope;

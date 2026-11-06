@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Chain } from '../domain.js';
 import { HttpClient } from '../infra/http.js';
 import { logger } from '../logging/logger.js';
+import { evmNetworks } from '../chains/networks.js';
 
 export interface NativeUsdRate {
   value: number;
@@ -36,6 +37,40 @@ export class NativePrices {
   }
 
   private async fetch(chain: Chain): Promise<NativeUsdRate> {
+    if (chain === 'bnb') {
+      const pairs = await this.http.json(
+        'DEX Screener BNB/USD price',
+        `https://api.dexscreener.com/token-pairs/v1/bsc/${evmNetworks.bnb.wrappedNative}`,
+        z.array(
+          z.object({
+            chainId: z.string(),
+            baseToken: z.object({ address: z.string() }),
+            priceUsd: z.string().nullish(),
+            liquidity: z.object({ usd: z.number().nullish() }).nullish(),
+          }),
+        ),
+        { retry: false },
+      );
+      const pair = pairs
+        .filter(
+          (pair) =>
+            pair.chainId === 'bsc' &&
+            pair.baseToken.address.toLowerCase() === evmNetworks.bnb.wrappedNative &&
+            Number(pair.priceUsd) > 0 &&
+            Number.isFinite(Number(pair.priceUsd)),
+        )
+        .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+      if (!pair) throw new Error('BNB/USD price is unavailable');
+      const rate = { value: Number(pair.priceUsd), observedAt: Date.now() };
+      this.cache.set(chain, rate);
+      log.info('pnl.usd_rate_received', {
+        chain,
+        nativeUsd: rate.value,
+        observedAt: rate.observedAt,
+        service: 'DEX Screener',
+      });
+      return rate;
+    }
     const symbol = chain === 'solana' ? 'SOL' : 'ETH';
     const result = await this.http.json(
       `Coinbase ${symbol}/USD spot price`,

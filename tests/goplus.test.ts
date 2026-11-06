@@ -14,6 +14,7 @@ const credentials = {
 function harness(context: TestContext) {
   const grants: { app_key: string; time: number; sign: string }[] = [];
   const authorizations: (string | null)[] = [];
+  const paths: string[] = [];
   let lifetime = 3600;
   let rejectToken = false;
   let authError: number | null = null;
@@ -37,6 +38,7 @@ function harness(context: TestContext) {
         });
       }
       authorizations.push(new Headers(init?.headers).get('authorization'));
+      paths.push(new URL(url).pathname);
       if (rejectToken) {
         rejectToken = false;
         return Response.json({ code: 4023, message: 'Access token not found' });
@@ -63,6 +65,7 @@ function harness(context: TestContext) {
     client: new GoPlusClient(credentials, new HttpClient(1000)),
     grants,
     authorizations,
+    paths,
     setLifetime(value: number) {
       lifetime = value;
     },
@@ -96,6 +99,15 @@ test('concurrent security checks share a report request and SHA1-authenticated a
       .digest('hex'),
   );
   assert.deepEqual(authorizations, ['issued-access-token-1']);
+});
+
+test('GoPlus keeps BNB and Robinhood reports separate for the same contract address', async (context) => {
+  const { client, grants, paths } = harness(context);
+  await client.security(address, 'bnb');
+  await client.security(address, 'robinhood');
+  await client.security(address, 'bnb');
+  assert.deepEqual(paths, ['/api/v1/token_security/56', '/api/v1/token_security/4663']);
+  assert.equal(grants.length, 1);
 });
 
 test('access tokens are renewed after expiration', async (context) => {

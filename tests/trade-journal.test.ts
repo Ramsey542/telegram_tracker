@@ -76,7 +76,11 @@ function fixture(t: TestContext) {
     new TradeEngine(
       { listenOnly: false, maxSignalAgeMs: 120000 } as Config,
       store,
-      { solana: adapter, robinhood: { ...adapter, chain: 'robinhood' } },
+      {
+        solana: adapter,
+        robinhood: { ...adapter, chain: 'robinhood' },
+        bnb: { ...adapter, chain: 'bnb' },
+      },
       { check: async () => {} } as unknown as RiskFilters,
     );
   let engine = makeEngine();

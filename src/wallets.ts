@@ -10,6 +10,10 @@ const payloadSchema = z.object({
   version: z.literal(1),
   solana: z.string(),
   robinhood: z.string().regex(/^0x[0-9a-f]{64}$/),
+  bnb: z
+    .string()
+    .regex(/^0x[0-9a-f]{64}$/)
+    .optional(),
 });
 const envelopeSchema = z.object({
   version: z.literal(1),
@@ -42,6 +46,7 @@ export function openWallets(config: Pick<Config, 'dataDirectory' | 'walletEncryp
   }
   if (key.length !== 32) throw new Error('WALLET_ENCRYPTION_KEY must decode to 32 bytes');
   let payload: z.infer<typeof payloadSchema>;
+  let migrate = false;
   if (existsSync(walletPath)) {
     const envelope = envelopeSchema.parse(JSON.parse(readFileSync(walletPath, 'utf8')));
     const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
@@ -52,31 +57,40 @@ export function openWallets(config: Pick<Config, 'dataDirectory' | 'walletEncryp
     ]);
     payload = payloadSchema.parse(JSON.parse(plaintext.toString('utf8')));
     plaintext.fill(0);
+    if (!payload.bnb) {
+      const backup = join(config.dataDirectory, 'wallets.pre-bnb.enc.json');
+      if (!existsSync(backup))
+        writeFileSync(backup, readFileSync(walletPath), { flag: 'wx', mode: 0o600 });
+      payload.bnb = generatePrivateKey();
+      migrate = true;
+    }
   } else {
     payload = {
       version: 1,
       solana: Buffer.from(Keypair.generate().secretKey).toString('base64'),
       robinhood: generatePrivateKey(),
+      bnb: generatePrivateKey(),
     };
+  }
+  if (migrate || !existsSync(walletPath)) {
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', key, iv);
     const ciphertext = Buffer.concat([
       cipher.update(JSON.stringify(payload), 'utf8'),
       cipher.final(),
     ]);
-    writeFileSync(
-      walletPath,
-      JSON.stringify({
-        version: 1,
-        iv: iv.toString('base64'),
-        tag: cipher.getAuthTag().toString('base64'),
-        ciphertext: ciphertext.toString('base64'),
-      }),
-      { flag: 'wx', mode: 0o600 },
-    );
+    const encrypted = JSON.stringify({
+      version: 1,
+      iv: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+    });
+    if (migrate) atomicWrite(walletPath, encrypted);
+    else writeFileSync(walletPath, encrypted, { flag: 'wx', mode: 0o600 });
   }
   const solana = Keypair.fromSecretKey(Buffer.from(payload.solana, 'base64'));
   const robinhood = privateKeyToAccount(payload.robinhood as `0x${string}`);
-  return { solana, robinhood, encryptionKey: key };
+  const bnb = privateKeyToAccount(payload.bnb as `0x${string}`);
+  return { solana, robinhood, bnb, encryptionKey: key };
 }
 export type Wallets = ReturnType<typeof openWallets>;

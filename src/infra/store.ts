@@ -8,6 +8,9 @@ import type { PnlFill, PnlMark } from '../pnl/types.js';
 import { exitReasonLabel } from '../trading/exit-reason.js';
 import {
   chainSettingsSchema,
+  chains,
+  chainLabel,
+  exitSchema,
   channelRulesSchema,
   settingsSchema,
   emptyTrail,
@@ -36,12 +39,17 @@ const decodeOperation = (row: Row | undefined, key = 'payload'): Operation | nul
   if (operation) operation.settings = chainSettingsSchema.parse(operation.settings);
   return operation;
 };
+const decodePosition = (row: Row | undefined): Position | null => {
+  const position = decode<Position>(row);
+  if (position) position.exits = exitSchema.parse(position.exits);
+  return position;
+};
 export class Store {
   private readonly db: DatabaseSync;
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 7)
+    if (Number(version?.user_version ?? 0) > 9)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -87,14 +95,14 @@ export class Store {
         this.db.exec(`
           INSERT OR IGNORE INTO purchased_tokens (channel_id,chain,address,operation_id)
           SELECT COALESCE(json_extract(payload, '$.signal.channelId'), ''), chain,
-            CASE WHEN chain = 'robinhood' THEN lower(address) ELSE address END, id
+            CASE WHEN chain != 'solana' THEN lower(address) ELSE address END, id
           FROM operations
           WHERE status = 'confirmed' AND json_extract(payload, '$.kind') = 'buy'
           ORDER BY created_at;
         `);
       this.restoreSolanaEntryPrices();
       this.restorePnlFills();
-      this.db.exec('PRAGMA user_version = 7');
+      this.db.exec('PRAGMA user_version = 9');
     });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));
@@ -300,12 +308,10 @@ export class Store {
   disableAllEntries(): void {
     this.transaction(() => {
       const defaults = this.settings();
-      defaults.chains.solana.enabled = false;
-      defaults.chains.robinhood.enabled = false;
+      for (const chain of chains) defaults.chains[chain].enabled = false;
       this.saveSettings(defaults);
       for (const channel of this.callChannels()) {
-        channel.settings!.solana.enabled = false;
-        channel.settings!.robinhood.enabled = false;
+        for (const chain of chains) channel.settings![chain].enabled = false;
         this.saveCallChannel(channel);
       }
     });
@@ -740,6 +746,11 @@ export class Store {
       position.sourceId = operation.signal?.sourceId;
       position.sourceName = operation.signal?.sourceName;
       position.executionSettings = structuredClone(operation.settings);
+      const marketCap = operation.token.marketCapUsd;
+      if (typeof marketCap === 'number' && Number.isFinite(marketCap) && marketCap > 0) {
+        position.entryMarketCapUsd = marketCap;
+        position.entryMarketCapCapturedAt = operation.token.fetchedAt;
+      }
       operation.status = 'confirmed';
       this.saveOperation(operation);
       this.savePosition(position);
@@ -812,7 +823,7 @@ export class Store {
       this.notify(
         `trade:${operation.id}`,
         [
-          `Sold ${position.symbol.replace(/[\x00-\x1f]/g, ' ').slice(0, 60)} on ${position.chain === 'solana' ? 'Solana' : 'Robinhood'}.`,
+          `Sold ${position.symbol.replace(/[\x00-\x1f]/g, ' ').slice(0, 60)} on ${chainLabel[position.chain]}.`,
           `Reason: ${operation.exitDescription ?? exitReasonLabel(operation.exitKey, position.exits)}`,
           `Sold: ${formatAmount(result.tokenRaw, position.decimals)} tokens`,
           `Remaining: ${formatAmount(position.remainingTokenRaw, position.decimals)} tokens`,
@@ -832,7 +843,7 @@ export class Store {
       this.saveOperation(operation);
       this.notify(
         `withdraw:${operation.id}`,
-        `Withdrawal confirmed on ${operation.chain === 'solana' ? 'Solana' : 'Robinhood'}.\nAmount: ${formatAmount(operation.amountRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}\nDestination: ${operation.withdrawal!.recipient}\nNetwork fee: ${formatAmount(result.feeNativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}\nTransaction: ${result.signature}`,
+        `Withdrawal confirmed on ${chainLabel[operation.chain]}.\nAmount: ${formatAmount(operation.amountRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}\nDestination: ${operation.withdrawal!.recipient}\nNetwork fee: ${formatAmount(result.feeNativeRaw, nativeDecimals[operation.chain])} ${nativeSymbol[operation.chain]}\nTransaction: ${result.signature}`,
       );
     });
   }
@@ -860,11 +871,21 @@ export class Store {
         ? this.db.prepare('SELECT payload FROM positions WHERE chain = ? AND closed = 0').all(chain)
         : this.db.prepare('SELECT payload FROM positions WHERE closed = 0').all()
     )
-      .map((row) => decode<Position>(row)!)
+      .map((row) => decodePosition(row)!)
       .filter(Boolean);
   }
   position(id: string): Position | null {
-    return decode(this.db.prepare('SELECT payload FROM positions WHERE id = ?').get(id));
+    return decodePosition(this.db.prepare('SELECT payload FROM positions WHERE id = ?').get(id));
+  }
+  positionEntryMarketCap(position: Position): { value: number; afterBuy: boolean } | null {
+    const entryId = position.entryOperationId ?? this.positionEntryFill(position.id)?.operationId;
+    const stored = entryId ? this.operation(entryId) : null;
+    const value =
+      position.entryMarketCapUsd ??
+      (stored?.kind === 'buy' && stored.status === 'confirmed' ? stored.token.marketCapUsd : null);
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? { value, afterBuy: position.entryMarketCapAfterBuy ?? false }
+      : null;
   }
   savePosition(position: Position): void {
     this.db
@@ -929,7 +950,7 @@ export class Store {
     )
       throw new Error('USD price is unavailable near the fill time');
     fill.nativeUsd = nativeUsd;
-    fill.usdSource = 'coinbase_spot';
+    fill.usdSource = fill.chain === 'bnb' ? 'dexscreener' : 'coinbase_spot';
     fill.usdAt = observedAt;
     this.db
       .prepare('UPDATE pnl_fills SET payload = ? WHERE operation_id = ?')
@@ -954,6 +975,7 @@ export class Store {
     text: string;
     solanaSignature: string | null;
     robinhoodHash: string | null;
+    bnbHash: string | null;
   }[] {
     return this.db
       .prepare(
@@ -980,6 +1002,7 @@ export class Store {
           text: String(row.text),
           solanaSignature: operation?.chain === 'solana' ? signature : null,
           robinhoodHash: operation?.chain === 'robinhood' ? signature : null,
+          bnbHash: operation?.chain === 'bnb' ? signature : null,
         };
       });
   }

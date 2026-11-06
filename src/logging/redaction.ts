@@ -32,6 +32,7 @@ const confidentialKeys = new Set([
   'sign',
   'solanarpc',
   'robinhoodrpc',
+  'bnbrpc',
   'session',
   'sessionstring',
   'serialized',

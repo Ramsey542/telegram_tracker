@@ -79,7 +79,7 @@ function fixture(enabled: Chain) {
   const engine = new TradeEngine(
     { listenOnly: false, maxSignalAgeMs: 120_000 } as Config,
     store,
-    { solana: adapter('solana'), robinhood: adapter('robinhood') },
+    { solana: adapter('solana'), robinhood: adapter('robinhood'), bnb: adapter('bnb') },
     {
       check: async () => {
         filterChecks++;

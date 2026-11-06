@@ -17,6 +17,46 @@ export interface ExitDecision {
   amountRaw: string;
 }
 
+export function timeExitDeadline(position: Position): number | null {
+  const rule = position.exits.timeExit;
+  if (
+    !rule?.enabled ||
+    rule.minutes === null ||
+    position.closedAt !== null ||
+    position.timeExitOperationId ||
+    BigInt(position.remainingTokenRaw) <= 0n
+  )
+    return null;
+  const completed = Object.entries(position.exitFills).some(
+    ([key, amount]) =>
+      (key === 'sl' || key === 'tp' || key.startsWith('tp:') || key.startsWith('trail:')) &&
+      BigInt(amount) > 0n,
+  );
+  return completed ? null : position.openedAt + rule.minutes * 60_000;
+}
+
+export function evaluateTimeExit(position: Position, now = Date.now()): ExitDecision | null {
+  const deadline = timeExitDeadline(position);
+  const due = deadline !== null && now >= deadline;
+  log.info('exit.time_check', {
+    positionId: position.id,
+    enabled: position.exits.timeExit?.enabled ?? false,
+    minutes: position.exits.timeExit?.minutes ?? null,
+    openedAt: position.openedAt,
+    deadline,
+    remainingMs: deadline === null ? null : Math.max(0, deadline - now),
+    decision: due ? 'sell_all' : 'wait',
+    reason: due
+      ? 'time_limit_reached'
+      : position.timeExitOperationId
+        ? 'time_exit_already_attempted'
+        : deadline === null
+          ? 'disabled_or_tp_sl_already_filled'
+          : 'time_limit_not_reached',
+  });
+  return due ? { key: 'time', amountRaw: position.remainingTokenRaw } : null;
+}
+
 function trailing(
   rule: TrailRule,
   state: TrailState,

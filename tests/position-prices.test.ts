@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { Config } from '../src/config.js';
 import { exitSchema, type Chain, type Position } from '../src/domain.js';
 import type { HttpClient } from '../src/infra/http.js';
-import type { NativePrices } from '../src/providers/native-prices.js';
+import { NativePrices } from '../src/providers/native-prices.js';
 import { PositionPrices } from '../src/providers/position-prices.js';
 
 const sol = 'So11111111111111111111111111111111111111112';
@@ -85,6 +85,49 @@ test('missing and stale prices cannot be interpreted as a zero-price stop loss',
   const result = await prices.quotes([position('valid'), position('missing'), position('stale')]);
   assert.equal(result.size, 1);
   assert.equal(result.get('valid')!.outputRaw, '1000000000');
+});
+
+test('BNB position prices use bsc and WBNB instead of ETH valuation', async () => {
+  const address = '0x1111111111111111111111111111111111111111';
+  const { prices, requests } = provider((url) => {
+    assert.equal(url.pathname, `/tokens/v1/bsc/${address}`);
+    return [
+      {
+        chainId: 'bsc',
+        baseToken: { address },
+        quoteToken: { address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' },
+        priceUsd: '6',
+        priceNative: '0.01',
+        liquidity: { usd: 100000 },
+      },
+    ];
+  });
+  const result = (await prices.quotes([position(address, 'bnb')])).get(address)!;
+  assert.equal(result.outputRaw, '1000000000000000000');
+  assert.equal(result.nativeUsd, 600);
+  assert.equal(requests.length, 1);
+});
+
+test('BNB USD fill pricing uses WBNB market data and caches the rate', async () => {
+  let requests = 0;
+  const http = {
+    json: async (_service: string, url: string) => {
+      requests++;
+      assert.match(url, /^https:\/\/api\.dexscreener\.com\/token-pairs\/v1\/bsc\//);
+      return [
+        {
+          chainId: 'bsc',
+          baseToken: { address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' },
+          priceUsd: '600',
+          liquidity: { usd: 1000000 },
+        },
+      ];
+    },
+  } as unknown as HttpClient;
+  const prices = new NativePrices(http);
+  assert.equal((await prices.get('bnb')).value, 600);
+  assert.equal((await prices.get('bnb')).value, 600);
+  assert.equal(requests, 1);
 });
 
 test('concurrent position refreshes share one batch price request', async () => {

@@ -357,6 +357,41 @@ test('channel settings buttons edit their original source rather than the last o
   assert.equal(fixture.writes(), 2);
 });
 
+test('BNB settings are visible, independent by channel and protected from watcher changes', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, '/start');
+  const screen = fixture.requests.at(-1)!.payload;
+  const callbacks = (screen.reply_markup as InlineKeyboard).inline_keyboard
+    .flat()
+    .flatMap((button) => ('callback_data' in button ? [button.callback_data] : []));
+  assert.ok(callbacks.includes(settingsCallback('a1b2c3', 'chain:bnb')));
+  await fixture.send(123, settingsCallback('a1b2c3', 'edit:bnb:buySize'), true);
+  await fixture.send(123, '0.02');
+  assert.equal(fixture.firstRules.bnb.buySizeNative, '0.02');
+  assert.equal(fixture.secondRules.bnb.buySizeNative, null);
+  assert.equal(fixture.firstRules.robinhood.buySizeNative, null);
+  await fixture.send(456, settingsCallback('a1b2c3', 'menu:bnb:buy'), true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /0.02/);
+  await fixture.send(456, settingsCallback('a1b2c3', 'edit:bnb:buySize'), true);
+  assert.equal(fixture.writes(), 1);
+});
+
+test('time exit setup prompts for a limit, stays scoped and cannot be changed by watchers', async (t) => {
+  const fixture = botFixture(t);
+  await fixture.send(123, settingsCallback('a1b2c3', 'toggle:solana:timeExit'), true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /Enable time exit/);
+  assert.equal(fixture.firstRules.solana.exits.timeExit.enabled, false);
+  await fixture.send(123, '10');
+  assert.deepEqual(fixture.firstRules.solana.exits.timeExit, { enabled: true, minutes: 10 });
+  assert.deepEqual(fixture.secondRules.solana.exits.timeExit, { enabled: false, minutes: null });
+  await fixture.send(456, settingsCallback('a1b2c3', 'menu:solana:timeExit'), true);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /10/);
+  await fixture.send(456, settingsCallback('a1b2c3', 'toggle:solana:timeExit'), true);
+  assert.equal(fixture.firstRules.solana.exits.timeExit.enabled, true);
+  await fixture.send(123, settingsCallback('a1b2c3', 'toggle:solana:timeExit'), true);
+  assert.deepEqual(fixture.firstRules.solana.exits.timeExit, { enabled: false, minutes: 10 });
+});
+
 test('SpyDefi label switches are scoped, hidden from general channels and read only for watchers', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(123, settingsCallback('a1b2c3', 'menu:solana:filters'), true);

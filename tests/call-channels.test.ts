@@ -47,6 +47,7 @@ function channel(id = 'general'): CallChannel {
     status: 'ready',
     error: null,
     settings: {
+      bnb: chainSettingsSchema.parse({}),
       solana: chainSettingsSchema.parse({
         enabled: true,
         buySizeNative: '0.001',
@@ -143,6 +144,39 @@ test('general extraction accepts bare Solana mints and chain defaults without ex
     ).ok,
     true,
   );
+});
+
+test('BNB calls accept chain hints and defaults without treating every EVM address as BNB', async () => {
+  for (const hint of ['BNB', 'BSC', 'Binance Smart Chain', 'Network: bsc']) {
+    const parsed = await parseGeneralCall(post(`${hint}\n${evm}`), channel(), noLookup);
+    assert.ok(parsed.ok);
+    assert.equal(parsed.signal.chain, 'bnb');
+  }
+  const defaulted = await parseGeneralCall(
+    post(evm),
+    { ...channel(), defaultChain: 'bnb' },
+    noLookup,
+  );
+  assert.ok(defaulted.ok);
+  assert.equal(defaulted.signal.chain, 'bnb');
+  const linked = await parseGeneralCall(
+    post('', [`https://bscscan.com/token/${evm}`]),
+    channel(),
+    noLookup,
+  );
+  assert.ok(linked.ok);
+  assert.equal(linked.signal.chain, 'bnb');
+  assert.equal((await parseGeneralCall(post(evm), channel(), noLookup)).ok, false);
+  const chart = await parseGeneralCall(
+    post(evm, ['https://dexscreener.com/bsc/0x1111111111111111111111111111111111111111']),
+    channel(),
+    async (chain) => {
+      assert.equal(chain, 'bsc');
+      return { ...pair(), chainId: 'bsc' };
+    },
+  );
+  assert.ok(chart.ok);
+  assert.equal(chart.signal.chain, 'bnb');
 });
 
 test('updates, conflicting chains, ambiguous CAs and long pool hashes do not become buys', async () => {
@@ -777,7 +811,7 @@ test('buy routing uses the calling channel size and filters while other channel 
   const engine = new TradeEngine(
     { listenOnly: false, maxSignalAgeMs: 120000 } as Config,
     db.store,
-    { solana: adapter, robinhood: adapter },
+    { solana: adapter, robinhood: adapter, bnb: adapter },
     {
       check: async (_token: TokenInfo, settings: ChainSettings) => {
         limits.push(settings.filters.minMarketCapUsd!);
@@ -860,7 +894,7 @@ test('automatic exits use their position source and retain the correct execution
   const engine = new TradeEngine(
     { listenOnly: false } as Config,
     db.store,
-    { solana: adapter, robinhood: adapter },
+    { solana: adapter, robinhood: adapter, bnb: adapter },
     {} as RiskFilters,
   );
   await engine.tick();

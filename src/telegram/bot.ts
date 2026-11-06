@@ -3,11 +3,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Config } from '../config.js';
 import {
   chains,
+  chainLabel,
   emptyTrail,
   formatAmount,
   nativeDecimals,
   nativeSymbol,
   type Chain,
+  type EvmChain,
   type ChainSettings,
   type CallChannel,
 } from '../domain.js';
@@ -28,6 +30,7 @@ import {
   saveTrailingStage,
   removeTrailingStage,
   exitSummary,
+  timeExitSummary,
   exitPlanLines,
   exitPanel,
   exitPrompt,
@@ -52,7 +55,8 @@ import {
   settingsKeyboard,
   unpackSettingsCallback,
 } from './settings-scope.js';
-import { positionEntryPrice, positionPage } from './positions.js';
+import { positionEntryPrice, positionEntryMarketCap, positionPage } from './positions.js';
+import { timeExitDeadline } from '../trading/exits.js';
 import type { Position } from '../domain.js';
 import { pnlChain, pnlMessage, pnlPeriod } from './pnl.js';
 import { pnlWindow } from '../pnl/periods.js';
@@ -73,7 +77,7 @@ import {
 const log = logger.child({ component: 'telegram.control' });
 
 type PendingInput =
-  | { kind: 'field'; chain: Chain; field: string; sourceId?: string }
+  | { kind: 'field'; chain: Chain; field: string; sourceId?: string; enableTimeExit?: boolean }
   | {
       kind: 'exit';
       chain: Chain;
@@ -85,11 +89,11 @@ type PendingInput =
     }
   | { kind: 'block'; remove: boolean; sourceId?: string }
   | { kind: 'channel_add' }
-  | { kind: 'wrap_amount'; sourceId?: string }
+  | { kind: 'wrap_amount'; chain: EvmChain; sourceId?: string }
   | { kind: 'withdraw_address'; chain: Chain }
   | { kind: 'withdraw_amount'; chain: Chain; recipient: string };
 interface InteractionState {
-  wrapping?: { id: string; amount: string; expires: number; sourceId?: string };
+  wrapping?: { id: string; chain: EvmChain; amount: string; expires: number; sourceId?: string };
   settingsSourceId: string | null;
   pending: PendingInput | null;
   sale: { id: string; percentage: number; balance: string; expires: number } | null;
@@ -104,7 +108,11 @@ interface InteractionState {
 const label = (value: string): string => value.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 60);
 const onOff = (value: boolean): string => (value ? '✅ On' : '⚪ Off');
 const chainName = (chain: Chain): string =>
-  chain === 'solana' ? '🟣 Solana (SOL)' : '🟢 Robinhood (ETH)';
+  chain === 'solana'
+    ? '🟣 Solana (SOL)'
+    : chain === 'bnb'
+      ? 'BNB Smart Chain (BNB)'
+      : '🟢 Robinhood (ETH)';
 const statuses: Record<string, string> = {
   active: '⏳ Pending',
   confirmed: '✅ Confirmed',
@@ -116,11 +124,12 @@ const statuses: Record<string, string> = {
 };
 const statusLabel = (status: string): string => statuses[status] ?? status;
 const chainValue = (value: string | undefined): Chain => {
-  if (value !== 'solana' && value !== 'robinhood') throw new Error('Unknown chain');
+  if (value !== 'solana' && value !== 'robinhood' && value !== 'bnb')
+    throw new Error('Unknown chain');
   return value;
 };
 const groupValue = (value: string | undefined): EditableField['group'] => {
-  if (!['buy', 'consistency', 'filters', 'exits', 'execution'].includes(value ?? ''))
+  if (!['buy', 'consistency', 'filters', 'exits', 'execution', 'timeExit'].includes(value ?? ''))
     throw new Error('Unknown menu');
   return value as EditableField['group'];
 };
@@ -197,7 +206,7 @@ export class ControlBot {
     });
     this.bot.command(['start', 'settings'], (ctx) => this.home(ctx));
     this.bot.command('wallets', (ctx) => this.wallets(ctx));
-    this.bot.command('positions', (ctx) => this.positions(ctx, 0));
+    this.bot.command(['positions', 'position'], (ctx) => this.positions(ctx, 0));
     this.bot.command('history', (ctx) => this.history(ctx));
     this.bot.command('pnl', (ctx) => this.pnl(ctx));
     this.bot.command('channels', (ctx) => this.callChannels(ctx));
@@ -221,7 +230,7 @@ export class ControlBot {
           '',
           message`💰 ${bold('Before enabling a chain')}`,
           'Set buy size and slippage. Priority fees are automatic unless you set an override. All three consistency thresholds start at 30%. Entry filters and exits start disabled.',
-          'Open Channels and choose a source to return to its main menu. Configure its Solana or Robinhood settings, then enable the chain and channel. Disabling a channel stops new calls and buys from that source; configured exits for its existing positions continue.',
+          'Open Channels and choose a source to return to its main menu. Configure its Solana, Robinhood or BNB settings, then enable the chain and channel. Disabling a channel stops new calls and buys from that source; configured exits for its existing positions continue.',
           'Each channel has independent buy sizes, filters, fees, slippage and exits. SpyDefi feeds require consistency rates; general call channels do not. Obvious update and performance posts are ignored.',
           '',
           message`🎯 ${bold('Profit and sell percentages')}`,
@@ -230,7 +239,7 @@ export class ControlBot {
           message`Trailing TP: percentage of the ${bold('remaining balance')}.`,
           '',
           italic(
-            'Settings apply to future positions. Use Apply current exit settings to update an open position. The owner can withdraw SOL or Robinhood ETH from Wallets after confirming the destination and amount.',
+            'Settings apply to future positions. Use Apply current exit settings to update an open position. The owner can withdraw SOL, Robinhood ETH or BNB from Wallets after confirming the destination and amount.',
           ),
           ...(this.config.listenOnly
             ? [
@@ -413,6 +422,11 @@ export class ControlBot {
           `🪶 Robinhood · ${channelStatus(selected.settings!.robinhood.enabled)}`,
           settingsCallback(selected.settingsKey!, 'chain:robinhood'),
         )
+        .row()
+        .text(
+          `BNB Smart Chain | ${channelStatus(selected.settings!.bnb.enabled)}`,
+          settingsCallback(selected.settingsKey!, 'chain:bnb'),
+        )
         .row();
     }
     keyboard
@@ -459,7 +473,7 @@ export class ControlBot {
         ? [
             'Consistency is not required for this channel.',
             `Default chain: ${source.defaultChain ?? 'None'}`,
-            'The default is used only when a call has no chain hint. It applies to this channel across both chain settings.',
+            'The default is used only when a call has no chain hint. It applies to this channel across all chain settings.',
           ]
         : [
             bold('Minimum consistency'),
@@ -471,6 +485,7 @@ export class ControlBot {
       '',
       bold(exitSummary(settings.exits, 'sl')),
       ...(slTargets.length ? slTargets.map(italic) : [italic('No stop-loss targets set.')]),
+      timeExitSummary(settings.exits),
       '',
       missing.length
         ? message`📝 ${bold('Still needed:')} ${missing.join(', ')}`
@@ -509,6 +524,8 @@ export class ControlBot {
         .text('🟣 Default: Solana', `channelchain:${source.id}:solana`)
         .text('🪶 Default: Robinhood', `channelchain:${source.id}:robinhood`)
         .row()
+        .text('Default: BNB', `channelchain:${source.id}:bnb`)
+        .row()
         .text('🚫 No default chain', `channelchain:${source.id}:none`);
     if (source && (source.status !== 'ready' || source.error))
       keyboard.row().text('🔄 Retry channel access', `channelretry:${source.id}`);
@@ -541,6 +558,7 @@ export class ControlBot {
     for (const [value, label] of [
       ['all', '🌐 All chains'],
       ['solana', '🟣 Solana'],
+      ['bnb', 'BNB Smart Chain'],
       ['robinhood', '🟢 Robinhood'],
     ] as const)
       keyboard.text(value === chain ? `[${label}]` : label, `pnl:${period}:${value}:${offset}`);
@@ -568,6 +586,7 @@ export class ControlBot {
         '',
         exitSummary(exits, 'tp'),
         exitSummary(exits, 'sl'),
+        timeExitSummary(exits),
         '',
         'Choose TP or SL, select Hard or Trailing, then enable it.',
         italic(
@@ -578,6 +597,8 @@ export class ControlBot {
         .text(`🎯 Take profit: ${exitEnabled(exits, 'tp') ? 'On' : 'Off'}`, `exit:${chain}:tp`)
         .row()
         .text(`🛑 Stop loss: ${exitEnabled(exits, 'sl') ? 'On' : 'Off'}`, `exit:${chain}:sl`)
+        .row()
+        .text(timeExitSummary(exits), `menu:${chain}:timeExit`)
         .row()
         .text('⬅️ Back', `chain:${chain}`),
     );
@@ -651,6 +672,7 @@ export class ControlBot {
       filters: '🛡️ Entry filters: market cap and token safety',
       exits: '📈 Stop loss, take profit and trailing',
       execution: '⚡ Slippage, priority fees and MEV protection',
+      timeExit: 'Time-based exit',
     }[group];
     const lines: (string | MessageText)[] = [bold(title), chainName(chain), ''];
     for (const [key, field] of Object.entries(editableFields)) {
@@ -678,6 +700,13 @@ export class ControlBot {
           'Buy Only First Caller requires the FIRST CALLER heading. Just Launched requires the JUST LAUNCHED heading. When both are on, both labels are required. Consistency and other enabled filters still apply.',
         ),
       );
+    if (group === 'timeExit')
+      lines.push(
+        '',
+        italic(
+          'The timer starts at the confirmed buy. Any completed TP/SL sale, including a partial sale, cancels it. On expiry, all remaining tokens are sold. Changes apply to future positions; use Apply current exit settings on an existing position to update its rules.',
+        ),
+      );
     if (group === 'filters')
       lines.push(
         '',
@@ -691,17 +720,21 @@ export class ControlBot {
         italic(
           chain === 'solana'
             ? 'Jupiter builds and submits Solana buys and sells through its managed execution service. QuickNode reads receipts and reconciles pending trades. QuickNode dashboard MEV settings do not apply to Jupiter submissions.'
-            : 'Classic Robinhood buys require WETH, ETH for gas and token approval prepared in Wallets. They fail without automatic wrapping or approval. Wrap my ETH applies to protected UniswapX buys. Sale proceeds are unwrapped back to ETH.',
+            : `Classic buys require W${nativeSymbol[chain]}, ${nativeSymbol[chain]} for gas and token approval prepared in Wallets. Auto-wrap applies to protected UniswapX buys. Sale proceeds are unwrapped back to ${nativeSymbol[chain]}.`,
         ),
       );
-    if (group === 'buy' && chain === 'robinhood')
+    if (group === 'buy' && chain !== 'solana')
       lines.push(
         '',
         italic(
-          'Classic buys require WETH and approval prepared in Wallets; Wrap my ETH does not apply to Classic buys. Protected UniswapX buys can use this switch to wrap a WETH shortage, adding a transaction and fee. Insufficient funds disables new Robinhood buys for this channel.',
+          `Classic buys require W${nativeSymbol[chain]} and approval prepared in Wallets. Auto-wrap applies to protected UniswapX buys and adds a transaction when wrapping a shortage. Insufficient funds disables new ${chainLabel[chain]} buys for this channel.`,
         ),
       );
-    await this.display(ctx, joinMessages(lines), keyboard.text('⬅️ Back', `chain:${chain}`));
+    await this.display(
+      ctx,
+      joinMessages(lines),
+      keyboard.text('⬅️ Back', group === 'timeExit' ? `menu:${chain}:exits` : `chain:${chain}`),
+    );
   }
   private async wallets(ctx: Context): Promise<void> {
     const lines: (string | MessageText)[] = [
@@ -717,11 +750,11 @@ export class ControlBot {
       try {
         const balance = await this.engine.adapters[chain].balance();
         lines.push(
-          message`💰 ${bold(chain === 'robinhood' ? 'ETH balance:' : 'SOL balance:')} ${formatAmount(balance.nativeRaw, nativeDecimals[chain])} ${nativeSymbol[chain]}`,
+          message`💰 ${bold(`${nativeSymbol[chain]} balance:`)} ${formatAmount(balance.nativeRaw, nativeDecimals[chain])} ${nativeSymbol[chain]}`,
         );
         if (balance.wrappedRaw !== null)
           lines.push(
-            message`🔄 ${bold('WETH balance:')} ${formatAmount(balance.wrappedRaw, 18)} WETH`,
+            message`🔄 ${bold(`W${nativeSymbol[chain]} balance:`)} ${formatAmount(balance.wrappedRaw, 18)} W${nativeSymbol[chain]}`,
           );
       } catch (error) {
         log.error('control.balance_failed', error, { chain });
@@ -731,7 +764,7 @@ export class ControlBot {
     }
     lines.push(
       italic(
-        'Robinhood buys spend WETH. ETH pays network fees. Use Wrap Robinhood ETH to prepare WETH and its token approval. Classic buys require this preparation. Wrap my ETH allows automatic top-ups for protected UniswapX buys.',
+        'Robinhood buys use WETH; BNB buys use WBNB. Keep native ETH or BNB for network fees. Wrap funds here to prepare the wrapped balance and token approval. Classic buys require this preparation; automatic top-ups apply to protected UniswapX buys.',
       ),
       '',
     );
@@ -741,6 +774,11 @@ export class ControlBot {
       new InlineKeyboard()
         .text('💸 Withdraw SOL', 'withdraw:solana')
         .text('💸 Withdraw Robinhood ETH', 'withdraw:robinhood')
+        .row()
+        .text('Withdraw BNB', 'withdraw:bnb')
+        .row()
+        .text('Wrap BNB', 'wrap:bnb')
+        .text('Unwrap idle WBNB', 'unwrap:bnb')
         .row()
         .text('Wrap Robinhood ETH', 'wrap')
         .row()
@@ -763,6 +801,7 @@ export class ControlBot {
       lines.push(
         bold(`${label(position.symbol)} (${nativeSymbol[position.chain]})`),
         message`${bold('Entry price:')} ${positionEntryPrice(position, this.store.positionEntryFill(position.id))}`,
+        message`${bold('Entry market cap:')} ${positionEntryMarketCap(this.store.positionEntryMarketCap(position))}`,
         `${formatAmount(position.remainingTokenRaw, position.decimals)} tokens | ${position.lastProfitPercent === null ? 'Value not refreshed' : `${position.lastProfitPercent.toFixed(2)}% in ${nativeSymbol[position.chain]}`}`,
         '',
       );
@@ -836,6 +875,10 @@ export class ControlBot {
           : []),
         '',
         message`${bold('Entry price:')} ${positionEntryPrice(position, this.store.positionEntryFill(position.id))}`,
+        message`${bold('Entry market cap:')} ${positionEntryMarketCap(this.store.positionEntryMarketCap(position))}`,
+        ...(position.entryMarketCapAfterBuy
+          ? [italic('Entry market cap is an approximate snapshot captured after buy confirmation.')]
+          : []),
         message`🪙 ${bold('Remaining:')} ${formatAmount(position.remainingTokenRaw, position.decimals)} tokens`,
         ...(position.entrySwapNativeRaw === undefined
           ? []
@@ -860,6 +903,19 @@ export class ControlBot {
         ...exitPlanLines(exits, 'sl').map(italic),
         bold(exitSummary(exits, 'tp')),
         ...exitPlanLines(exits, 'tp').map(italic),
+        timeExitSummary(exits),
+        ...(timeExitDeadline(position) === null
+          ? []
+          : [
+              italic(
+                `Time exit deadline: ${new Date(timeExitDeadline(position)!).toISOString()} (UTC)`,
+              ),
+            ]),
+        ...(position.timeExitOperationId
+          ? [
+              message`${bold('Time exit attempt:')} ${statusLabel(this.store.operation(position.timeExitOperationId)?.status ?? 'unknown')}`,
+            ]
+          : []),
         ...(position.lastError
           ? ['', message`⚠️ ${bold('Last issue')}\n${position.lastError}`]
           : []),
@@ -1037,7 +1093,7 @@ export class ControlBot {
         state.pending = { kind: 'channel_add' };
         await this.reply(
           ctx,
-          message`${bold('Add a call channel')}\n\nSend a public channel @username or t.me link, or a private channel invite link. Only broadcast channels are supported.\n\nNew channels start with independent, disabled rules. Configure buy size, filters, slippage and exits under its Solana or Robinhood rules. Then enable that chain and channel monitoring.\n\n${italic('Send /cancel to cancel.')}`,
+          message`${bold('Add a call channel')}\n\nSend a public channel @username or t.me link, or a private channel invite link. Only broadcast channels are supported.\n\nNew channels start with independent, disabled rules. Configure buy size, filters, slippage and exits under its Solana, Robinhood or BNB rules. Then enable that chain and channel monitoring.\n\n${italic('Send /cancel to cancel.')}`,
         );
         return;
       case 'channelretry':
@@ -1172,6 +1228,24 @@ export class ControlBot {
         const sourceMode = this.settingsSource(ctx)?.mode;
         if (toggle.modes && (!sourceMode || !toggle.modes.includes(sourceMode)))
           throw new Error('This entry filter is only available for SpyDefi channels');
+        if (
+          option === 'timeExit' &&
+          !this.currentSettings(ctx, chain).exits.timeExit.enabled &&
+          this.currentSettings(ctx, chain).exits.timeExit.minutes === null
+        ) {
+          state.pending = {
+            kind: 'field',
+            chain,
+            field: 'timeExitMinutes',
+            sourceId: state.settingsSourceId ?? undefined,
+            enableTimeExit: true,
+          };
+          await this.reply(
+            ctx,
+            message`${bold('Enable time exit')}\n\n${editableFields.timeExitMinutes!.hint}\n\nThe timer will be enabled after you set the limit.\n\n${italic('Send /cancel to cancel.')}`,
+          );
+          return;
+        }
         if (toggle.group === 'exits') {
           const desired = !toggle.value(this.currentSettings(ctx, chain));
           const target = option === 'tp' || option === 'ttp' ? 'tp' : 'sl';
@@ -1325,7 +1399,7 @@ export class ControlBot {
           );
         await this.display(
           ctx,
-          message`⚙️ ${bold('Apply current exit settings?')}\n\nReplace the exit rules for ${bold(label(position.symbol))} with the ${nativeSymbol[position.chain]} exit settings from ${bold(source?.title ?? 'the saved entry settings')}?\n\n⚠️ ${italic('Existing trailing peaks will reset.')}`,
+          message`⚙️ ${bold('Apply current exit settings?')}\n\nReplace the exit rules for ${bold(label(position.symbol))} with the ${nativeSymbol[position.chain]} exit settings from ${bold(source?.title ?? 'the saved entry settings')}?\n\nTime exits use the original buy time; an elapsed limit can trigger immediately.\n\n⚠️ ${italic('Existing trailing peaks will reset.')}`,
           new InlineKeyboard()
             .text('✅ Apply exit settings', `applyyes:${value}`)
             .row()
@@ -1346,7 +1420,11 @@ export class ControlBot {
         position.trailingSl = emptyTrail();
         position.trailingTp = emptyTrail();
         position.trailingStages = {};
+        position.timeExitOperationId = undefined;
         this.store.savePosition(position);
+        void this.engine
+          .tick()
+          .catch((error) => log.error('control.exit_settings_tick_failed', error));
         await this.position(ctx, value);
         return;
       }
@@ -1358,7 +1436,7 @@ export class ControlBot {
         state.pending = { kind: 'withdraw_address', chain };
         await this.reply(
           ctx,
-          message`${bold(`Withdraw ${nativeSymbol[chain]}`)}\n\nNetwork: ${chain === 'solana' ? 'Solana mainnet' : 'Robinhood Chain'}\nSend the destination wallet address.\n\n${italic('Send /cancel to cancel.')}`,
+          message`${bold(`Withdraw ${nativeSymbol[chain]}`)}\n\nNetwork: ${chainLabel[chain]}\nSend the destination wallet address.\n\n${italic('Send /cancel to cancel.')}`,
         );
         return;
       }
@@ -1381,45 +1459,54 @@ export class ControlBot {
         );
         return;
       }
-      case 'wrap':
-        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap ETH');
+      case 'wrap': {
+        const chain = value === undefined ? 'robinhood' : chainValue(value);
+        if (chain === 'solana') throw new Error('Wrapping is only available for EVM chains');
+        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap funds');
         if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks wrapping');
-        state.pending = { kind: 'wrap_amount', sourceId: this.selectedChannel(ctx)?.id };
+        state.pending = { kind: 'wrap_amount', chain, sourceId: this.selectedChannel(ctx)?.id };
         await this.reply(
           ctx,
-          message`${bold('Wrap Robinhood ETH')}\n\nSend the ETH amount to convert into WETH. Keep ETH for network fees. WETH is used directly for buys.\n\n${italic('Send /cancel to cancel.')}`,
+          message`${bold(`Wrap ${nativeSymbol[chain]} on ${chainLabel[chain]}`)}\n\nSend the ${nativeSymbol[chain]} amount to convert into W${nativeSymbol[chain]}. Keep ${nativeSymbol[chain]} for network fees. W${nativeSymbol[chain]} is used directly for buys.\n\n${italic('Send /cancel to cancel.')}`,
         );
         return;
+      }
       case 'wrapconfirm': {
-        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap ETH');
+        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap funds');
         const wrapping = state.wrapping;
         state.wrapping = undefined;
         if (!wrapping || wrapping.id !== value || wrapping.expires < Date.now())
           throw new Error('Wrap confirmation expired. Start again from Wallets.');
-        const id = await this.engine.wrap(wrapping.amount, wrapping.sourceId);
+        const id = await this.engine.wrap(wrapping.amount, wrapping.sourceId, wrapping.chain);
         await this.reply(
           ctx,
-          message`${bold('Wrap queued')}\nAmount: ${wrapping.amount} ETH\nOperation: ${code(id)}\nConfirmation will be reported here.`,
+          message`${bold('Wrap queued')}\nAmount: ${wrapping.amount} ${nativeSymbol[wrapping.chain]}\nOperation: ${code(id)}\nConfirmation will be reported here.`,
         );
         return;
       }
-      case 'unwrap':
+      case 'unwrap': {
+        const chain = value === undefined ? 'robinhood' : chainValue(value);
+        if (chain === 'solana') throw new Error('Unwrapping is only available for EVM chains');
         await this.display(
           ctx,
-          message`🔄 ${bold('Unwrap idle WETH?')}\n\nConvert all idle Robinhood WETH into ETH.\n\n${italic('Network fees apply. Active trades must finish first.')}`,
+          message`🔄 ${bold(`Unwrap idle W${nativeSymbol[chain]}?`)}\n\nConvert idle W${nativeSymbol[chain]} into ${nativeSymbol[chain]} on ${chainLabel[chain]}.\n\n${italic('Network fees apply. Active trades must finish first.')}`,
           new InlineKeyboard()
-            .text('✅ Confirm unwrap', 'unwrapyes')
+            .text('✅ Confirm unwrap', `unwrapyes:${chain}`)
             .row()
             .text('✖️ Cancel', 'wallets'),
         );
         return;
-      case 'unwrapyes':
-        await this.engine.unwrap();
+      }
+      case 'unwrapyes': {
+        const chain = chainValue(value ?? 'robinhood');
+        if (chain === 'solana') throw new Error('Unwrapping is only available for EVM chains');
+        await this.engine.unwrap(chain);
         await this.reply(
           ctx,
           message`⏳ ${bold('Unwrap queued')}\n${italic('Confirmation will be reported here.')}`,
         );
         return;
+      }
       case 'reconcile':
         if (value) this.engine.reconcile(value);
         await this.home(ctx);
@@ -1440,18 +1527,19 @@ export class ControlBot {
     }
     if ('sourceId' in pending) state.settingsSourceId = pending.sourceId ?? null;
     if (pending.kind === 'wrap_amount') {
-      if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap ETH');
-      const amount = formatAmount(withdrawalAmount('robinhood', text), 18);
+      if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap funds');
+      const amount = formatAmount(withdrawalAmount(pending.chain, text), 18);
       state.pending = null;
       state.wrapping = {
         id: this.store.newId(),
+        chain: pending.chain,
         amount,
         expires: Date.now() + 120_000,
         sourceId: pending.sourceId,
       };
       await this.display(
         ctx,
-        message`${bold('Confirm ETH wrapping')}\n\nConvert ${bold(`${amount} ETH`)} into WETH on Robinhood Chain.\nThis also prepares Permit2 token approval up to this amount if needed, so later buys can use signed permissions. Wrapping and any required approval each incur a network fee.\n\n${italic('Confirmation expires in two minutes.')}`,
+        message`${bold('Confirm wrapping')}\n\nConvert ${bold(`${amount} ${nativeSymbol[pending.chain]}`)} into W${nativeSymbol[pending.chain]} on ${chainLabel[pending.chain]}.\nThis also prepares Permit2 token approval up to this amount if needed, so later buys can use signed permissions. Wrapping and any required approval each incur a network fee.\n\n${italic('Confirmation expires in two minutes.')}`,
         new InlineKeyboard()
           .text('Confirm wrap', `wrapconfirm:${state.wrapping.id}`)
           .row()
@@ -1496,7 +1584,7 @@ export class ControlBot {
       };
       await this.display(
         ctx,
-        message`${bold('Confirm withdrawal')}\n\nNetwork: ${pending.chain === 'solana' ? 'Solana mainnet' : 'Robinhood Chain'}\nFrom: ${code(this.engine.adapters[pending.chain].address)}\nDestination: ${code(pending.recipient)}\nAmount: ${bold(`${amount} ${nativeSymbol[pending.chain]}`)}\n\nNetwork fees are charged in addition to this amount. Verify the full destination and network before confirming.\n\n${italic('Confirmation expires in two minutes.')}`,
+        message`${bold('Confirm withdrawal')}\n\nNetwork: ${chainLabel[pending.chain]}\nFrom: ${code(this.engine.adapters[pending.chain].address)}\nDestination: ${code(pending.recipient)}\nAmount: ${bold(`${amount} ${nativeSymbol[pending.chain]}`)}\n\nNetwork fees are charged in addition to this amount. Verify the full destination and network before confirming.\n\n${italic('Confirmation expires in two minutes.')}`,
         new InlineKeyboard()
           .text('✅ Confirm withdrawal', `withdrawconfirm:${state.withdrawal.id}`)
           .row()
@@ -1526,6 +1614,8 @@ export class ControlBot {
         pending.field,
         text,
       );
+      if (pending.enableTimeExit && updated.exits.timeExit.minutes !== null)
+        updated.exits.timeExit.enabled = true;
       this.updateChain(ctx, pending.chain, (settings) => {
         Object.assign(settings, updated);
       });
@@ -1612,7 +1702,12 @@ export class ControlBot {
                     'View on Blockscout',
                     `https://robinhoodchain.blockscout.com/tx/${encodeURIComponent(notification.robinhoodHash)}`,
                   )
-                : undefined;
+                : notification.bnbHash
+                  ? new InlineKeyboard().url(
+                      'View on BscScan',
+                      `https://bscscan.com/tx/${encodeURIComponent(notification.bnbHash)}`,
+                    )
+                  : undefined;
             await this.bot.api.sendMessage(recipientId, rendered.text, {
               entities: rendered.entities,
               reply_markup: keyboard,

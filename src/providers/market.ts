@@ -2,6 +2,8 @@ import { z } from 'zod';
 import type { Config } from '../config.js';
 import { HttpClient } from '../infra/http.js';
 import { logger } from '../logging/logger.js';
+import type { EvmChain } from '../domain.js';
+import { evmNetworks } from '../chains/networks.js';
 
 const log = logger.child({ component: 'trading.market' });
 
@@ -63,21 +65,24 @@ export class MarketData {
     return token;
   }
   async robinhood(address: string, retry = true) {
+    return this.evm('robinhood', address, retry);
+  }
+  async evm(chain: EvmChain, address: string, retry = true) {
+    const slug = evmNetworks[chain].dexChain;
     const pairs = await this.http.json(
       'DEX Screener',
-      `https://api.dexscreener.com/token-pairs/v1/robinhood/${address}`,
+      `https://api.dexscreener.com/token-pairs/v1/${slug}/${address}`,
       z.array(pairSchema),
       { retry },
     );
     const matching = pairs.filter(
       (pair) =>
-        pair.chainId === 'robinhood' &&
-        pair.baseToken.address.toLowerCase() === address.toLowerCase(),
+        pair.chainId === slug && pair.baseToken.address.toLowerCase() === address.toLowerCase(),
     );
     matching.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
     log.info('market.token_result', {
       service: 'DEX Screener',
-      chain: 'robinhood',
+      chain,
       token: address,
       matched: matching.length > 0,
       pairCount: pairs.length,

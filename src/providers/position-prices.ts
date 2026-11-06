@@ -1,12 +1,19 @@
 import { z } from 'zod';
 import type { Config } from '../config.js';
-import { nativeDecimals, parseAmount, type Chain, type Position, type Quote } from '../domain.js';
+import {
+  chains,
+  nativeDecimals,
+  parseAmount,
+  type Chain,
+  type Position,
+  type Quote,
+} from '../domain.js';
 import { HttpClient } from '../infra/http.js';
 import { logger } from '../logging/logger.js';
 import { NativePrices } from './native-prices.js';
+import { evmNetworks } from '../chains/networks.js';
 
 const SOL = 'So11111111111111111111111111111111111111112';
-const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
 const log = logger.child({ component: 'trading.prices' });
 const priceSchema = z.record(
   z.string(),
@@ -31,7 +38,7 @@ interface ReferencePrice {
   source: string;
 }
 const key = (chain: Chain, address: string): string =>
-  `${chain}:${chain === 'robinhood' ? address.toLowerCase() : address}`;
+  `${chain}:${chain === 'solana' ? address : address.toLowerCase()}`;
 const scaled = (value: number): bigint => parseAmount(value.toFixed(18), 18);
 
 export class PositionPrices {
@@ -44,14 +51,13 @@ export class PositionPrices {
     private readonly nativePrices: NativePrices,
   ) {}
   async quotes(positions: readonly Position[]): Promise<Map<string, Quote>> {
-    const chains = ['solana', 'robinhood'] as const;
     const results = await Promise.allSettled(
       chains.map(async (chain) => {
         const addresses = [
           ...new Set(
             positions
               .filter((p) => p.chain === chain)
-              .map((p) => (chain === 'robinhood' ? p.address.toLowerCase() : p.address)),
+              .map((p) => (chain === 'solana' ? p.address : p.address.toLowerCase())),
           ),
         ];
         if (!addresses.length) return;
@@ -180,23 +186,27 @@ export class PositionPrices {
       } else {
         const result = await this.http.json(
           'DEX Screener batch prices',
-          `https://api.dexscreener.com/tokens/v1/robinhood/${batch.join(',')}`,
+          `https://api.dexscreener.com/tokens/v1/${evmNetworks[chain].dexChain}/${batch.join(',')}`,
           z.array(pairSchema),
           { retry: false },
         );
         for (const address of batch) {
           const pair = result
             .filter(
-              (p) => p.chainId === 'robinhood' && p.baseToken.address.toLowerCase() === address,
+              (p) =>
+                p.chainId === evmNetworks[chain].dexChain &&
+                p.baseToken.address.toLowerCase() === address,
             )
             .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
           const usd = Number(pair?.priceUsd);
           if (!pair || !Number.isFinite(usd) || usd <= 0) continue;
           const native = Number(pair.priceNative);
           const nativeUsd =
-            pair.quoteToken.address.toLowerCase() === WETH && Number.isFinite(native) && native > 0
+            pair.quoteToken.address.toLowerCase() === evmNetworks[chain].wrappedNative &&
+            Number.isFinite(native) &&
+            native > 0
               ? usd / native
-              : (await this.nativePrices.get('robinhood')).value;
+              : (await this.nativePrices.get(chain)).value;
           this.cache.set(key(chain, address), {
             usd,
             nativeUsd,

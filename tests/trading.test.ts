@@ -116,6 +116,18 @@ test('an EVM address and a footer cannot imply Robinhood', () => {
   ];
   assert.equal(parseCall(value).ok, false);
 });
+
+test('SpyDefi BSC charts produce BNB calls with all consistency rates', () => {
+  const value = post();
+  const address = '0x1111111111111111111111111111111111111111';
+  value.text = value.text.replace(mint, address);
+  value.urls = [`https://dexscreener.com/bsc/${address}`];
+  const parsed = parseCall(value);
+  assert.ok(parsed.ok);
+  assert.equal(parsed.signal.chain, 'bnb');
+  assert.equal(parsed.signal.address, address);
+  assert.deepEqual(parsed.signal.consistency, { overall: 44, recent: 35, chain: 43 });
+});
 test('missing consistency fails instead of turning into zero', () => {
   const value = post();
   value.text = value.text.replace('Chain: 43%', 'Chain: N/A');

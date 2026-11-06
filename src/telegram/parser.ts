@@ -37,8 +37,9 @@ export function parseCall(post: ChannelPost): ParsedCall {
     }
   }
   if (chartChains.size !== 1) return { ok: false, reason: 'Missing or ambiguous chart chain' };
-  const chainName = [...chartChains][0];
-  if (chainName !== 'solana' && chainName !== 'robinhood')
+  const rawChainName = [...chartChains][0];
+  const chainName = rawChainName === 'bsc' ? 'bnb' : rawChainName;
+  if (chainName !== 'solana' && chainName !== 'robinhood' && chainName !== 'bnb')
     return { ok: false, reason: `Unsupported chain: ${chainName ?? 'unknown'}` };
   const chain: Chain = chainName;
   const address = normalizeAddress(chain, addressMatch[1]);

@@ -37,6 +37,7 @@ const watcherCommands = new Set([
   'settings',
   'wallets',
   'positions',
+  'position',
   'history',
   'pnl',
   'cancel',
