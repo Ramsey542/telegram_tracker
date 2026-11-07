@@ -504,6 +504,9 @@ export class TradeEngine {
         const position: Position = {
           id: this.store.newId(),
           chain: operation.chain,
+          directVenue:
+            operation.directEvmPlan?.venue ??
+            operation.steps.find((step) => step.type === 'solana')?.venue,
           address: operation.address,
           symbol: operation.token.symbol,
           decimals,
@@ -740,8 +743,14 @@ export class TradeEngine {
   }
   private async captureEntryMarketCap(position: Position): Promise<void> {
     try {
-      const value =
-        position.chain === 'solana'
+      const value = position.directVenue
+        ? (
+            await this.adapters[position.chain].tokenInfo(position.address, {
+              ...this.store.positionSettings(position),
+              directTradingEnabled: true,
+            })
+          ).marketCapUsd
+        : position.chain === 'solana'
           ? (await this.market!.solana(position.address))?.mcap
           : (await this.market!.evm(position.chain, position.address, false))?.marketCap;
       if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)
@@ -843,6 +852,7 @@ export class TradeEngine {
     operation.approvalAmountRaw = position.remainingTokenRaw;
     operation.settings = structuredClone(settings);
     operation.settings.exits = structuredClone(position.exits);
+    if (position.directVenue) operation.settings.directTradingEnabled = true;
     operation.positionId = position.id;
     operation.exitKey = decision.key;
     operation.exitDescription = exitReasonLabel(decision.key, position.exits);
@@ -1078,7 +1088,8 @@ export class TradeEngine {
       throw new Error('Sell percentage must be between 0 and 100');
     if (this.busy.has(position.chain) || this.store.activeOperation(position.chain))
       throw new Error('This chain already has an operation in progress');
-    const settings = this.store.positionSettings(position);
+    const settings = structuredClone(this.store.positionSettings(position));
+    if (position.directVenue) settings.directTradingEnabled = true;
     const missing = this.readiness(position.chain, false, settings);
     if (missing.length) throw new Error(`Configure ${missing.join(', ')}`);
     const amount =

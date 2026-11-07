@@ -66,6 +66,10 @@ export function logTradeOutcome(operation: Operation, fields: LogFields = {}): v
     senderId: operation.signal?.senderId ?? null,
     senderUsername: operation.signal?.senderUsername ?? null,
     kind: operation.kind,
+    venue:
+      operation.directEvmPlan?.venue ??
+      operation.steps.find((step) => step.type === 'solana')?.venue ??
+      null,
     status: operation.status,
     signature: operation.swapHash,
     reason: confirmed ? operation.exitKey : operation.error,

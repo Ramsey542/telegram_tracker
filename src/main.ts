@@ -133,16 +133,17 @@ async function main(): Promise<void> {
     const http = new HttpClient(config.httpTimeoutMs, config.jupiterRps);
     const market = new MarketData(config, http);
     const nativePrices = new NativePrices(http);
-    const positionPrices = new PositionPrices(config, http, nativePrices);
+    const adapters = {
+      solana: new SolanaAdapter(config, wallets, http, market),
+      robinhood: new RobinhoodAdapter(config, wallets, http, market),
+      bnb: new BnbAdapter(config, wallets, http, market),
+    };
+    const positionPrices = new PositionPrices(config, http, nativePrices, adapters);
     const filters = new RiskFilters(config, http);
     engine = new TradeEngine(
       config,
       store,
-      {
-        solana: new SolanaAdapter(config, wallets, http, market),
-        robinhood: new RobinhoodAdapter(config, wallets, http, market),
-        bnb: new BnbAdapter(config, wallets, http, market),
-      },
+      adapters,
       filters,
       () => pnl?.refreshRates(),
       positionPrices,

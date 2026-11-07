@@ -50,7 +50,7 @@ export class Store {
   constructor(directory: string) {
     this.db = new DatabaseSync(join(directory, 'tracker.sqlite'));
     const version = this.db.prepare('PRAGMA user_version').get();
-    if (Number(version?.user_version ?? 0) > 10)
+    if (Number(version?.user_version ?? 0) > 11)
       throw new Error('Database was created by a newer version of this bot');
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -103,7 +103,7 @@ export class Store {
         `);
       this.restoreSolanaEntryPrices();
       this.restorePnlFills();
-      this.db.exec('PRAGMA user_version = 10');
+      this.db.exec('PRAGMA user_version = 11');
     });
     if (!this.db.prepare('SELECT id FROM configuration WHERE id = 1').get())
       this.saveSettings(settingsSchema.parse({}));

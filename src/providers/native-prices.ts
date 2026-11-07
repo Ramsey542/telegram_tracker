@@ -22,6 +22,11 @@ export class NativePrices {
   private readonly pending = new Map<Chain, Promise<NativeUsdRate>>();
   constructor(private readonly http: HttpClient) {}
 
+  peek(chain: Chain): NativeUsdRate | null {
+    const rate = this.cache.get(chain);
+    return rate && Date.now() - rate.observedAt < 30_000 ? rate : null;
+  }
+
   async get(chain: Chain): Promise<NativeUsdRate> {
     const cached = this.cache.get(chain);
     if (cached && Date.now() - cached.observedAt < 30_000) return cached;

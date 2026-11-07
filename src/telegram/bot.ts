@@ -732,8 +732,8 @@ export class ControlBot {
         '',
         italic(
           chain === 'solana'
-            ? 'Jupiter builds and submits Solana buys and sells through its managed execution service. QuickNode reads receipts and reconciles pending trades. QuickNode dashboard MEV settings do not apply to Jupiter submissions.'
-            : `Classic buys require W${nativeSymbol[chain]}, ${nativeSymbol[chain]} for gas and token approval prepared in Wallets. Auto-wrap applies to protected UniswapX buys. Sale proceeds are unwrapped back to ${nativeSymbol[chain]}.`,
+            ? 'Enable direct routes to trade SOL-paired Pump.fun curves and canonical PumpSwap pools using the official SDKs through QuickNode, without PumpPortal fees. Other routes use Jupiter. Direct submissions use your QuickNode settings; Jupiter submissions use Jupiter execution.'
+            : `Enable direct routes for native-asset Flap tokens and PancakeSwap V2, V3 and Infinity. Disable Require UniswapX protection to use direct EVM routes. Flap buys spend native ${nativeSymbol[chain]}; PancakeSwap buys spend W${nativeSymbol[chain]}. Wrap my ETH/BNB can top up wrapped funds for direct PancakeSwap buys. Direct routes use QuickNode; other routes use Uniswap.`,
         ),
       );
     if (group === 'buy' && chain !== 'solana')

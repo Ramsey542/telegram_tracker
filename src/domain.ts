@@ -172,6 +172,7 @@ export const chainSettingsSchema = z
     // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
     mevProtection: z.boolean().default(true),
     wrapMyEth: z.boolean().default(false),
+    directTradingEnabled: z.boolean().default(false),
     consistency: z
       .object({
         overall: percent.default(30),
@@ -329,6 +330,7 @@ export interface TokenInfo {
   usdPrice: number | null;
   fetchedAt: number;
   topHoldersPercent?: number | null;
+  marketSource?: string;
 }
 export interface Quote {
   inputRaw: string;
@@ -348,6 +350,20 @@ export interface PreparedQuote {
   slippagePercent: number;
   priorityFee: string | null;
 }
+export interface DirectEvmPlan {
+  venue: 'flap' | 'pancake-v2' | 'pancake-v3' | 'pancake-infinity';
+  to: string;
+  spender: string | null;
+  inputToken: string;
+  outputToken: string;
+  value: string;
+  data: string;
+  outputRaw: string;
+  minimumRaw: string;
+  permit2?: string;
+  permitSigned?: boolean;
+  receivedAt: number;
+}
 export interface TrailState {
   active: boolean;
   peakNativeRaw: string;
@@ -360,6 +376,7 @@ export interface Position {
   sourceId?: string;
   sourceName?: string;
   executionSettings?: ChainSettings;
+  directVenue?: 'pump' | 'pump-amm' | DirectEvmPlan['venue'];
   chain: Chain;
   address: string;
   symbol: string;
@@ -410,6 +427,7 @@ export interface EvmStep {
 }
 export interface SolanaStep {
   type: 'solana';
+  venue?: 'pump' | 'pump-amm';
   key: string;
   signature: string;
   serialized: string;
@@ -464,6 +482,7 @@ export interface Operation {
   steps: TradeStep[];
   quote: Quote | null;
   preparedQuote?: PreparedQuote;
+  directEvmPlan?: DirectEvmPlan;
   wrapAmountRaw?: string;
   wrapWarningSent?: boolean;
   funding?: { sourceId?: string };

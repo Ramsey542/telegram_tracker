@@ -6,6 +6,10 @@ import {
   http as viemHttp,
   encodeFunctionData,
   decodeEventLog,
+  decodeFunctionData,
+  encodeAbiParameters,
+  parseAbi,
+  parseAbiParameters,
   erc20Abi,
   keccak256,
   zeroAddress,
@@ -32,6 +36,7 @@ import {
   type Quote,
   type SwapResult,
   type TokenInfo,
+  type Position,
   parseAmount,
 } from '../domain.js';
 import type { ChainAdapter } from './types.js';
@@ -39,6 +44,8 @@ import { robinhoodGasFees } from './fees.js';
 import { logger } from '../logging/logger.js';
 import { evmNetworks } from './networks.js';
 import type { EvmChain } from '../domain.js';
+import { DirectEvmRoutes, directNetworks } from './direct-evm.js';
+import { NativePrices } from '../providers/native-prices.js';
 
 // The router SDK's ESM build uses extensionless imports that native Node cannot resolve.
 const require = createRequire(import.meta.url);
@@ -163,6 +170,66 @@ const transactionSchema = z.object({
   maxFeePerGas: z.unknown().optional(),
   maxPriorityFeePerGas: z.unknown().optional(),
 });
+export function uniswapHeaders(apiKey: string): Record<string, string> {
+  return {
+    'x-api-key': apiKey,
+    'x-universal-router-version': '2.1.2',
+    'x-agent-info': JSON.stringify({
+      integration_name: 'swap-integration',
+      decision_origin: 'autonomous',
+      version: '1.5.0',
+    }),
+  };
+}
+export function requestUniswapQuote(
+  http: HttpClient,
+  apiKey: string,
+  chain: EvmChain,
+  wallet: string,
+  input: string,
+  output: string,
+  amountRaw: string,
+  settings: ChainSettings,
+) {
+  if (settings.slippagePercent === null) throw new TradeRejected('Configure slippage first');
+  return http.json(
+    'Uniswap quote',
+    'https://trade-api.gateway.uniswap.org/v1/quote',
+    quoteResponseSchema,
+    {
+      method: 'POST',
+      headers: uniswapHeaders(apiKey),
+      body: {
+        tokenIn: input,
+        tokenOut: output,
+        tokenInChainId: evmNetworks[chain].chainId,
+        tokenOutChainId: evmNetworks[chain].chainId,
+        type: 'EXACT_INPUT',
+        amount: amountRaw,
+        swapper: wallet,
+        recipient: wallet,
+        slippageTolerance: settings.slippagePercent,
+        routingPreference: 'BEST_PRICE',
+        protocols: settings.mevProtection ? ['UNISWAPX_V3'] : ['V2', 'V3', 'V4'],
+        integratorFees: [],
+        enforceExactIn: true,
+        permitAmount: 'EXACT',
+      },
+    },
+  );
+}
+export function requestUniswapSwap(
+  http: HttpClient,
+  apiKey: string,
+  body: Record<string, unknown>,
+) {
+  return http.json(
+    'Uniswap swap build',
+    'https://trade-api.gateway.uniswap.org/v1/swap',
+    z.object({ swap: transactionSchema }),
+    { method: 'POST', headers: uniswapHeaders(apiKey), body },
+  );
+}
 const strictSwapSchema = transactionSchema
   .extend({
     gasLimit: raw.refine((value) => BigInt(value) > 0n),
@@ -277,6 +344,10 @@ export class EvmAdapter implements ChainAdapter {
   private networkVerification: Promise<void> | null = null;
   private readonly metadataCache = new Map<string, { decimals: number; expiresAt: number }>();
   private readonly metadataRequests = new Map<string, Promise<number>>();
+  private readonly nativePrices: NativePrices;
+  private directRoutes(): DirectEvmRoutes {
+    return new DirectEvmRoutes(this.chain, this.rpc(), this.address);
+  }
   constructor(
     private readonly config: Config,
     wallets: Wallets,
@@ -285,6 +356,7 @@ export class EvmAdapter implements ChainAdapter {
     chainKey: EvmChain,
   ) {
     this.chain = chainKey;
+    this.nativePrices = new NativePrices(http);
     this.network = evmNetworks[chainKey];
     this.rpcUrl = (chainKey === 'bnb' ? config.bnbRpc : config.robinhoodRpc) ?? '';
     this.account = wallets[chainKey];
@@ -300,6 +372,14 @@ export class EvmAdapter implements ChainAdapter {
       id: this.network.chainId,
       name: this.network.name,
       nativeCurrency: { name: this.network.symbol, symbol: this.network.symbol, decimals: 18 },
+      contracts: {
+        multicall3: {
+          address:
+            chainKey === 'bnb'
+              ? '0xca11bde05977b3631167028862be2a173976ca11'
+              : '0xd59aae32bcf95aae58119751d5e355c9855cdc31',
+        },
+      },
       rpcUrls: { default: { http: this.rpcUrl ? [this.rpcUrl] : [] } },
     });
     this.client = this.rpcUrl
@@ -319,20 +399,12 @@ export class EvmAdapter implements ChainAdapter {
     return this.client;
   }
   private headers(): Record<string, string> {
-    return {
-      'x-api-key': this.config.uniswapKey,
-      'x-universal-router-version': '2.1.2',
-      'x-agent-info': JSON.stringify({
-        integration_name: 'swap-integration',
-        decision_origin: 'autonomous',
-        version: '1.5.0',
-      }),
-    };
+    return uniswapHeaders(this.config.uniswapKey);
   }
-  readiness(_settings: ChainSettings): string[] {
+  readiness(settings: ChainSettings): string[] {
     return [
       !this.rpcUrl ? this.network.rpcVariable : '',
-      !this.config.uniswapKey ? 'UNISWAP_API_KEY' : '',
+      !settings.directTradingEnabled && !this.config.uniswapKey ? 'UNISWAP_API_KEY' : '',
     ].filter(Boolean);
   }
   async verifyNetwork(): Promise<void> {
@@ -368,6 +440,36 @@ export class EvmAdapter implements ChainAdapter {
     )
       throw new TradeRejected('Invalid project token address');
     const tokenAddress = address as Address;
+    if (settings?.directTradingEnabled && !settings.mevProtection) {
+      const state = await this.directRoutes().flapState(tokenAddress);
+      if (state && state.quoteTokenAddress === zeroAddress && state.price > 0n) {
+        const [decimals, supply, rate, symbol] = await Promise.all([
+          this.tokenDecimals(tokenAddress),
+          this.rpc().readContract({
+            address: tokenAddress,
+            abi: erc20Abi,
+            functionName: 'totalSupply',
+          }),
+          this.nativePrices.get(this.chain),
+          this.rpc().readContract({ address: tokenAddress, abi: erc20Abi, functionName: 'symbol' }),
+        ]);
+        const price = (Number(state.price) / 1e18) * rate.value;
+        return {
+          chain: this.chain,
+          address: address.toLowerCase(),
+          symbol,
+          decimals,
+          marketCapUsd: (Number(supply) / 10 ** decimals) * price,
+          usdPrice: price,
+          liquidityUsd:
+            state.status === 1
+              ? (Number(state.reserve) / 1e18) * rate.value
+              : ((await this.market.evm(this.chain, address, false))?.liquidity?.usd ?? null),
+          marketSource: 'flap-onchain',
+          fetchedAt: Date.now(),
+        };
+      }
+    }
     const classicBuy = settings !== undefined && !settings.mevProtection;
     const needsMarket =
       !classicBuy || settings.filters.marketCapEnabled || settings.filters.minLiquidityUsd !== null;
@@ -461,30 +563,15 @@ export class EvmAdapter implements ChainAdapter {
   ): Promise<ApiQuote> {
     const slippage = settings.slippagePercent;
     if (slippage === null) throw new TradeRejected('Configure slippage first');
-    const response = await this.http.json(
-      'Uniswap quote',
-      'https://trade-api.gateway.uniswap.org/v1/quote',
-      quoteResponseSchema,
-      {
-        method: 'POST',
-        headers: this.headers(),
-        body: {
-          tokenIn: input,
-          tokenOut: output,
-          tokenInChainId: this.network.chainId,
-          tokenOutChainId: this.network.chainId,
-          type: 'EXACT_INPUT',
-          amount: amountRaw,
-          swapper: this.address,
-          recipient: this.address,
-          slippageTolerance: slippage,
-          routingPreference: 'BEST_PRICE',
-          protocols: settings.mevProtection ? ['UNISWAPX_V3'] : ['V2', 'V3', 'V4'],
-          integratorFees: [],
-          enforceExactIn: true,
-          permitAmount: 'EXACT',
-        },
-      },
+    const response = await requestUniswapQuote(
+      this.http,
+      this.config.uniswapKey,
+      this.chain,
+      this.address,
+      input,
+      output,
+      amountRaw,
+      settings,
     );
     this.validateQuote(response, input, output, amountRaw, slippage);
     if (settings.mevProtection && response.routing !== 'DUTCH_V3')
@@ -576,6 +663,24 @@ export class EvmAdapter implements ChainAdapter {
     return { outputRaw, minimumRaw, impact: null };
   }
   async quoteSell(address: string, amountRaw: string, settings: ChainSettings): Promise<Quote> {
+    if (settings.directTradingEnabled && !settings.mevProtection) {
+      const direct = await this.directRoutes().quote(
+        address as Address,
+        BigInt(amountRaw),
+        false,
+        settings.slippagePercent!,
+      );
+      if (direct)
+        return {
+          inputRaw: amountRaw,
+          outputRaw: direct.outputRaw,
+          minOutputRaw: direct.minimumRaw,
+          nativeUsd: null,
+          priceImpactPercent: null,
+          receivedAt: direct.receivedAt,
+          source: `direct:${direct.venue}`,
+        };
+    }
     const response = await this.fetchQuote(
       address,
       this.network.wrappedNative,
@@ -612,6 +717,33 @@ export class EvmAdapter implements ChainAdapter {
     this.beforeSpend = beforeSpend;
     await this.verifyNetwork();
     const classicBuy = operation.kind === 'buy' && !operation.settings.mevProtection;
+    if (
+      operation.settings.directTradingEnabled &&
+      operation.settings.mevProtection &&
+      (operation.kind === 'buy' || operation.kind === 'sell')
+    )
+      throw new TradeRejected('Direct EVM routes require UniswapX protection to be disabled');
+    if (operation.kind === 'buy' || operation.kind === 'sell') {
+      if (operation.directEvmPlan) return this.advanceDirect(operation, persist, beforeSwap);
+      if (
+        operation.settings.directTradingEnabled &&
+        !operation.settings.mevProtection &&
+        operation.steps.length === 0 &&
+        !operation.preparedQuote
+      ) {
+        const plan = await this.directRoutes().quote(
+          operation.address as Address,
+          BigInt(operation.amountRaw),
+          operation.kind === 'buy',
+          operation.settings.slippagePercent!,
+        );
+        if (plan) {
+          operation.directEvmPlan = plan;
+          persist();
+          return this.advanceDirect(operation, persist, beforeSwap);
+        }
+      }
+    }
     if (operation.kind === 'withdraw') {
       if (!operation.withdrawal) throw new TradeRejected('Withdrawal destination is missing');
       const recipient = withdrawalAddress(this.chain, operation.withdrawal.recipient, this.address);
@@ -840,35 +972,26 @@ export class EvmAdapter implements ChainAdapter {
           swapReceipt = await this.orderStep(operation, step, persist);
         } else {
           const permit = await this.signPermit(response, input, operation.amountRaw);
-          const result = await this.http.json(
-            'Uniswap swap build',
-            'https://trade-api.gateway.uniswap.org/v1/swap',
-            z.object({ swap: transactionSchema }),
-            {
-              method: 'POST',
-              headers: this.headers(),
-              body: {
-                quote: response.quote,
-                ...permit,
-                simulateTransaction: true,
-                refreshGasPrice: true,
-                ...(classicBuy && this.chain !== 'bnb' && operation.settings.priorityFee !== null
-                  ? {
-                      urgency: {
-                        level: 'normal',
-                        overrides: {
-                          maxPriorityFeePerGas: parseAmount(
-                            operation.settings.priorityFee,
-                            9,
-                          ).toString(),
-                        },
-                      },
-                    }
-                  : {}),
-                deadline: Math.floor(Date.now() / 1000) + 120,
-              },
-            },
-          );
+          const result = await requestUniswapSwap(this.http, this.config.uniswapKey, {
+            quote: response.quote,
+            ...permit,
+            simulateTransaction: true,
+            refreshGasPrice: true,
+            ...(classicBuy && this.chain !== 'bnb' && operation.settings.priorityFee !== null
+              ? {
+                  urgency: {
+                    level: 'normal',
+                    overrides: {
+                      maxPriorityFeePerGas: parseAmount(
+                        operation.settings.priorityFee,
+                        9,
+                      ).toString(),
+                    },
+                  },
+                }
+              : {}),
+            deadline: Math.floor(Date.now() / 1000) + 120,
+          });
           if (
             !same(result.swap.to, this.router) ||
             result.swap.chainId !== this.network.chainId ||
@@ -971,6 +1094,295 @@ export class EvmAdapter implements ChainAdapter {
       ).toString(),
       feeNativeRaw: fees.toString(),
       signature: swapReceipt.transactionHash,
+      nativeUsd: null,
+      ...(fundsError ? { fundsError } : {}),
+    };
+  }
+  async directReference(position: Position): Promise<Quote> {
+    const unit = 10n ** BigInt(position.decimals);
+    const state = await this.directRoutes().flapState(position.address as Address);
+    if (state && state.quoteTokenAddress === zeroAddress && state.price > 0n) {
+      const output = (BigInt(position.remainingTokenRaw) * state.price) / unit;
+      return {
+        inputRaw: position.remainingTokenRaw,
+        outputRaw: output.toString(),
+        minOutputRaw: output.toString(),
+        nativeUsd: null,
+        priceImpactPercent: null,
+        receivedAt: Date.now(),
+        source: 'direct:flap',
+        estimated: true,
+      };
+    }
+    const plan = await this.directRoutes().quote(position.address as Address, unit, false, 0.1);
+    if (!plan) throw new Error('No direct route is available for this position');
+    const value = (BigInt(plan.outputRaw) * BigInt(position.remainingTokenRaw)) / unit;
+    return {
+      inputRaw: position.remainingTokenRaw,
+      outputRaw: value.toString(),
+      minOutputRaw: value.toString(),
+      nativeUsd: null,
+      priceImpactPercent: null,
+      receivedAt: Date.now(),
+      source: `direct:${plan.venue}`,
+      estimated: true,
+    };
+  }
+  private async advanceDirect(
+    operation: Operation,
+    persist: () => void,
+    beforeSwap: () => Promise<void>,
+  ): Promise<SwapResult> {
+    const plan = operation.directEvmPlan!;
+    const network = directNetworks[this.chain];
+    const permitted = [network.portal, network.v2, network.smart, network.infinity].map((value) =>
+      value.toLowerCase(),
+    );
+    if (
+      plan.permit2 &&
+      (plan.venue !== 'pancake-infinity' ||
+        plan.permit2.toLowerCase() !== '0x31c2f6fcff4f8759b3bd5bf0e1084a055615c768')
+    )
+      throw new TradeRejected('Direct Permit2 contract is not trusted');
+    if (
+      !permitted.includes(plan.to.toLowerCase()) ||
+      BigInt(plan.value) < 0n ||
+      BigInt(plan.value) > BigInt(operation.amountRaw) ||
+      (operation.kind === 'sell' && plan.value !== '0')
+    )
+      throw new TradeRejected('Direct transaction destination or value is invalid');
+    const buy = operation.kind === 'buy';
+    if (!operation.steps.some((step) => step.key === 'swap')) {
+      await beforeSwap();
+      operation.token.decimals = await this.tokenDecimals(operation.address as Address);
+      if (buy && operation.settings.filters.maxPriceImpactPercent !== null) {
+        const reference = await this.directReference({
+          address: operation.address,
+          decimals: operation.token.decimals,
+          remainingTokenRaw: (10n ** BigInt(operation.token.decimals)).toString(),
+        } as Position);
+        const expected =
+          (Number(operation.amountRaw) / Number(reference.outputRaw)) *
+          10 ** operation.token.decimals;
+        const impact = Math.max(0, (1 - Number(plan.outputRaw) / expected) * 100);
+        if (!Number.isFinite(impact) || impact > operation.settings.filters.maxPriceImpactPercent)
+          throw new TradeRejected('Direct route price impact exceeds the configured entry filter');
+      }
+      if (
+        buy &&
+        plan.venue !== 'flap' &&
+        operation.settings.wrapMyEth &&
+        operation.wrapAmountRaw === undefined
+      ) {
+        const balance = await this.rpc().readContract({
+          address: this.network.wrappedNative,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [this.address],
+        });
+        operation.wrapAmountRaw = (
+          BigInt(operation.amountRaw) > balance ? BigInt(operation.amountRaw) - balance : 0n
+        ).toString();
+        persist();
+      }
+      if (buy && plan.venue !== 'flap' && BigInt(operation.wrapAmountRaw ?? '0') > 0n)
+        await this.evmStep(
+          operation,
+          'wrap',
+          this.network.wrappedNative,
+          encodeFunctionData({ abi: wethAbi, functionName: 'deposit' }),
+          BigInt(operation.wrapAmountRaw!),
+          persist,
+        );
+      if (plan.spender) {
+        const spender = plan.spender as Address;
+        if (spender.toLowerCase() !== (plan.permit2 ?? plan.to).toLowerCase())
+          throw new TradeRejected('Direct token approval has an unexpected spender');
+        for (const key of ['direct-approve-reset', 'direct-approve'])
+          if (operation.steps.some((step) => step.key === key))
+            await this.evmStep(operation, key, plan.inputToken as Address, '0x', 0n, persist);
+        const allowance = await this.rpc().readContract({
+          address: plan.inputToken as Address,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [this.address, spender],
+        });
+        if (allowance < BigInt(operation.amountRaw)) {
+          if (operation.steps.some((step) => step.key === 'direct-approve'))
+            throw new TradeRejected('Direct token allowance changed after approval');
+          if (allowance > 0n)
+            await this.evmStep(
+              operation,
+              'direct-approve-reset',
+              plan.inputToken as Address,
+              encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [spender, 0n] }),
+              0n,
+              persist,
+            );
+          await this.evmStep(
+            operation,
+            'direct-approve',
+            plan.inputToken as Address,
+            encodeFunctionData({
+              abi: erc20Abi,
+              functionName: 'approve',
+              args: [spender, BigInt(operation.amountRaw)],
+            }),
+            0n,
+            persist,
+          );
+        }
+      }
+      if (Date.now() - plan.receivedAt > 30_000)
+        throw new TradeRejected('The original direct quote expired during preparation');
+      if (plan.permit2 && !plan.permitSigned) {
+        const [, , nonce] = await this.rpc().readContract({
+          address: plan.permit2 as Address,
+          abi: permit2Abi,
+          functionName: 'allowance',
+          args: [this.address, plan.inputToken as Address, plan.to as Address],
+        });
+        const details = {
+          token: plan.inputToken as Address,
+          amount: BigInt(operation.amountRaw),
+          expiration: Math.floor(Date.now() / 1000) + 120,
+          nonce,
+        };
+        const sigDeadline = BigInt(details.expiration);
+        if (details.amount >= 1n << 160n)
+          throw new TradeRejected('Direct Permit2 amount is out of range');
+        this.beforeSpend();
+        const signature = await this.account.signTypedData({
+          domain: {
+            name: 'Permit2',
+            chainId: this.network.chainId,
+            verifyingContract: plan.permit2 as Address,
+          },
+          types: {
+            PermitDetails: [
+              { name: 'token', type: 'address' },
+              { name: 'amount', type: 'uint160' },
+              { name: 'expiration', type: 'uint48' },
+              { name: 'nonce', type: 'uint48' },
+            ],
+            PermitSingle: [
+              { name: 'details', type: 'PermitDetails' },
+              { name: 'spender', type: 'address' },
+              { name: 'sigDeadline', type: 'uint256' },
+            ],
+          },
+          primaryType: 'PermitSingle',
+          message: { details, spender: plan.to as Address, sigDeadline },
+        });
+        const abi = parseAbi([
+          'function execute(bytes commands,bytes[] inputs,uint256 deadline) payable',
+        ]);
+        const decoded = decodeFunctionData({ abi, data: plan.data as Hex });
+        const permitInput = encodeAbiParameters(
+          parseAbiParameters(
+            '((address token,uint160 amount,uint48 expiration,uint48 nonce) details,address spender,uint256 sigDeadline) permitSingle,bytes signature',
+          ),
+          [{ details, spender: plan.to as Address, sigDeadline }, signature],
+        );
+        plan.data = encodeFunctionData({
+          abi,
+          functionName: 'execute',
+          args: [
+            `0x0a${decoded.args[0].slice(2)}`,
+            [permitInput, ...decoded.args[1]],
+            decoded.args[2],
+          ],
+        });
+        plan.permitSigned = true;
+        persist();
+      }
+      operation.quote = {
+        inputRaw: operation.amountRaw,
+        outputRaw: plan.outputRaw,
+        minOutputRaw: plan.minimumRaw,
+        nativeUsd: null,
+        priceImpactPercent: null,
+        receivedAt: plan.receivedAt,
+        source: `direct:${plan.venue}`,
+      };
+      persist();
+    }
+    const receipt = await this.evmStep(
+      operation,
+      'swap',
+      plan.to as Address,
+      plan.data as Hex,
+      BigInt(plan.value),
+      persist,
+    );
+    operation.swapHash = receipt.transactionHash;
+    persist();
+    const delta = erc20Delta(receipt, operation.address as Address, this.address);
+    const tokens = buy ? delta : -delta;
+    if (tokens <= 0n || (!buy && tokens !== BigInt(operation.amountRaw)))
+      throw new ReviewRequired('Confirmed direct token transfers do not match the position');
+    let native: bigint;
+    let fundsError: string | undefined;
+    if (plan.venue === 'flap') {
+      const abi = parseAbi([
+        'event TokenBought(uint256 ts,address token,address buyer,uint256 amount,uint256 eth,uint256 fee,uint256 postPrice)',
+        'event TokenSold(uint256 ts,address token,address seller,uint256 amount,uint256 eth,uint256 fee,uint256 postPrice)',
+      ]);
+      let found: bigint | null = null;
+      for (const event of receipt.logs) {
+        if (!same(event.address, network.portal)) continue;
+        try {
+          const decoded = decodeEventLog({ abi, topics: event.topics, data: event.data });
+          const trader =
+            decoded.eventName === 'TokenBought' ? decoded.args.buyer : decoded.args.seller;
+          if (
+            !same(decoded.args.token, operation.address) ||
+            !same(trader, this.address) ||
+            buy !== (decoded.eventName === 'TokenBought')
+          )
+            continue;
+          if (found !== null)
+            throw new ReviewRequired('Multiple Flap fills require reconciliation');
+          if (buy) {
+            const budget = BigInt(plan.value);
+            if (decoded.args.eth + decoded.args.fee === budget) found = budget;
+            else if (decoded.args.eth === budget) found = budget;
+            else throw new ReviewRequired('Flap buy spend differs from the exact input budget');
+          } else found = decoded.args.eth;
+        } catch (error) {
+          if (error instanceof ReviewRequired) throw error;
+        }
+      }
+      if (found === null || found <= 0n || (buy && found > BigInt(plan.value)))
+        throw new ReviewRequired('Confirmed Flap native fill could not be reconciled');
+      native = found;
+    } else {
+      native = erc20Delta(receipt, this.network.wrappedNative, this.address) * (buy ? -1n : 1n);
+      if (native <= 0n || (buy && native !== BigInt(operation.amountRaw)))
+        throw new ReviewRequired('Confirmed PancakeSwap input/output could not be reconciled');
+      if (!buy) {
+        try {
+          await this.evmStep(
+            operation,
+            'unwrap',
+            this.network.wrappedNative,
+            encodeFunctionData({ abi: wethAbi, functionName: 'withdraw', args: [native] }),
+            0n,
+            persist,
+          );
+        } catch (error) {
+          if (!insufficientFunds(error)) throw error;
+          fundsError = safeError(error);
+        }
+      }
+    }
+    const fee = this.fees(operation);
+    return {
+      tokenRaw: tokens.toString(),
+      nativeRaw: (buy ? native + fee : native - fee).toString(),
+      feeNativeRaw: fee.toString(),
+      swapNativeRaw: native.toString(),
+      signature: receipt.transactionHash,
       nativeUsd: null,
       ...(fundsError ? { fundsError } : {}),
     };
@@ -1096,7 +1508,11 @@ export class EvmAdapter implements ChainAdapter {
     parameters?: EvmParameters,
   ): Promise<TransactionReceipt> {
     const classicBuySwap =
-      operation.kind === 'buy' && !operation.settings.mevProtection && key === 'swap';
+      operation.kind === 'buy' &&
+      !operation.settings.mevProtection &&
+      !operation.directEvmPlan &&
+      key === 'swap';
+    const savedDirectSwap = operation.directEvmPlan !== undefined && key === 'swap';
     let step = operation.steps.find(
       (candidate): candidate is EvmStep => candidate.type === 'evm' && candidate.key === key,
     );
@@ -1185,7 +1601,7 @@ export class EvmAdapter implements ChainAdapter {
         receipt = await this.rpc().getTransactionReceipt({ hash: step.hash as Hex });
       } catch (error) {
         if (!(error instanceof Error) || error.name !== 'TransactionReceiptNotFoundError') {
-          if (classicBuySwap)
+          if (classicBuySwap || savedDirectSwap)
             throw new PendingTrade(
               `${this.network.name} receipt lookup failed; the saved swap will be reconciled`,
             );
@@ -1199,7 +1615,7 @@ export class EvmAdapter implements ChainAdapter {
       try {
         blockNumber = await this.rpc().getBlockNumber({ cacheTime: 0 });
       } catch (error) {
-        if (classicBuySwap)
+        if (classicBuySwap || savedDirectSwap)
           throw new PendingTrade(
             `${this.network.name} confirmation lookup failed; the saved swap will be reconciled`,
           );
@@ -1211,9 +1627,12 @@ export class EvmAdapter implements ChainAdapter {
       persist();
       return receipt;
     }
-    if (step.submittedAt === null || (!classicBuySwap && Date.now() - step.submittedAt > 30_000)) {
+    if (
+      step.submittedAt === null ||
+      (!classicBuySwap && !savedDirectSwap && Date.now() - step.submittedAt > 30_000)
+    ) {
       if (step.submittedAt === null) this.beforeSpend();
-      if (classicBuySwap) {
+      if (classicBuySwap || savedDirectSwap) {
         step.submittedAt = Date.now();
         persist();
       }
@@ -1224,7 +1643,7 @@ export class EvmAdapter implements ChainAdapter {
         });
       } catch (error) {
         if (insufficientFunds(error)) throw error;
-        if (classicBuySwap) {
+        if (classicBuySwap || savedDirectSwap) {
           let cause: unknown = error;
           for (let depth = 0; depth < 8 && cause instanceof Error; depth++) {
             if (

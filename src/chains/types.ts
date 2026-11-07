@@ -1,4 +1,12 @@
-import type { Chain, ChainSettings, Operation, Quote, SwapResult, TokenInfo } from '../domain.js';
+import type {
+  Chain,
+  ChainSettings,
+  Operation,
+  Position,
+  Quote,
+  SwapResult,
+  TokenInfo,
+} from '../domain.js';
 
 export interface ChainAdapter {
   readonly chain: Chain;
@@ -8,6 +16,7 @@ export interface ChainAdapter {
   balance(): Promise<{ nativeRaw: string; wrappedRaw: string | null }>;
   tokenInfo(address: string, settings?: ChainSettings): Promise<TokenInfo>;
   quoteSell(address: string, amountRaw: string, settings: ChainSettings): Promise<Quote>;
+  directReference?(position: Position): Promise<Quote>;
   advance(
     operation: Operation,
     persist: () => void,

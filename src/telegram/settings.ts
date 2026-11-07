@@ -419,6 +419,14 @@ export const toggles: Record<
       s.mevProtection = !s.mevProtection;
     },
   },
+  directTrading: {
+    label: 'Direct launchpad and DEX routes',
+    group: 'execution',
+    value: (s) => s.directTradingEnabled,
+    change: (s) => {
+      s.directTradingEnabled = !s.directTradingEnabled;
+    },
+  },
   sl: {
     label: '🛑 Fixed stop loss',
     group: 'exits',

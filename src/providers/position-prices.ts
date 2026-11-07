@@ -12,6 +12,7 @@ import { HttpClient } from '../infra/http.js';
 import { logger } from '../logging/logger.js';
 import { NativePrices } from './native-prices.js';
 import { evmNetworks } from '../chains/networks.js';
+import type { ChainAdapter } from '../chains/types.js';
 
 const SOL = 'So11111111111111111111111111111111111111112';
 const log = logger.child({ component: 'trading.prices' });
@@ -45,10 +46,12 @@ export class PositionPrices {
   private readonly cache = new Map<string, ReferencePrice>();
   private readonly pending = new Map<Chain, Promise<void>>();
   private readonly queued = new Map<Chain, Set<string>>();
+  private readonly directCache = new Map<string, Quote>();
   constructor(
     private readonly config: Config,
     private readonly http: HttpClient,
     private readonly nativePrices: NativePrices,
+    private readonly adapters?: Record<Chain, ChainAdapter>,
   ) {}
   async quotes(positions: readonly Position[]): Promise<Map<string, Quote>> {
     const results = await Promise.allSettled(
@@ -57,6 +60,7 @@ export class PositionPrices {
           ...new Set(
             positions
               .filter((p) => p.chain === chain)
+              .filter((p) => !p.directVenue)
               .map((p) => (chain === 'solana' ? p.address : p.address.toLowerCase())),
           ),
         ];
@@ -94,7 +98,58 @@ export class PositionPrices {
       if (result.status === 'rejected')
         log.error('position.price_batch_failed', result.reason, { chain: chains[index] });
     const quotes = new Map<string, Quote>();
+    await Promise.all(
+      positions
+        .filter((position) => position.directVenue)
+        .map(async (position) => {
+          const cached = this.directCache.get(position.id);
+          if (
+            cached &&
+            cached.inputRaw === position.remainingTokenRaw &&
+            Date.now() - cached.receivedAt < Math.min(1000, this.config.pollMs)
+          ) {
+            quotes.set(position.id, cached);
+            return;
+          }
+          try {
+            const adapter = this.adapters?.[position.chain];
+            if (!adapter?.directReference) throw new Error('Direct price adapter is unavailable');
+            const quote = await adapter.directReference(position);
+            if (
+              quote.inputRaw !== position.remainingTokenRaw ||
+              Date.now() - quote.receivedAt > 5000 ||
+              BigInt(quote.outputRaw) <= 0n
+            )
+              throw new Error('Direct reference price is invalid or stale');
+            if (quote.nativeUsd === null) {
+              quote.nativeUsd = this.nativePrices.peek(position.chain)?.value ?? null;
+              if (quote.nativeUsd === null)
+                void this.nativePrices.get(position.chain).catch((error) =>
+                  log.error('position.direct_usd_price_failed', error, {
+                    chain: position.chain,
+                    positionId: position.id,
+                  }),
+                );
+            }
+            this.directCache.set(position.id, quote);
+            quotes.set(position.id, quote);
+            log.info('position.direct_price_received', {
+              chain: position.chain,
+              positionId: position.id,
+              token: position.address,
+              quote,
+            });
+          } catch (error) {
+            log.error('position.direct_price_failed', error, {
+              chain: position.chain,
+              positionId: position.id,
+              token: position.address,
+            });
+          }
+        }),
+    );
     for (const position of positions) {
+      if (position.directVenue) continue;
       const price = this.cache.get(key(position.chain, position.address));
       if (!price || Date.now() - price.receivedAt > 5000) {
         log.warn('position.price_unavailable', {

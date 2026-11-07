@@ -94,3 +94,40 @@ export function openWallets(config: Pick<Config, 'dataDirectory' | 'walletEncryp
   return { solana, robinhood, bnb, encryptionKey: key };
 }
 export type Wallets = ReturnType<typeof openWallets>;
+export function readWalletAddresses(config: Pick<Config, 'dataDirectory' | 'walletEncryptionKey'>) {
+  const walletPath = join(config.dataDirectory, 'wallets.enc.json');
+  const keyPath = join(config.dataDirectory, 'wallet-master.key');
+  if (!existsSync(walletPath)) throw new Error('Existing encrypted wallet file was not found');
+  if (!config.walletEncryptionKey && !existsSync(keyPath))
+    throw new Error('Existing wallet encryption key was not found');
+  const key = config.walletEncryptionKey
+    ? Buffer.from(config.walletEncryptionKey, 'base64')
+    : readFileSync(keyPath);
+  let plaintext: Buffer | undefined;
+  try {
+    if (key.length !== 32) throw new Error('Wallet encryption key must contain 32 bytes');
+    const envelope = envelopeSchema.parse(JSON.parse(readFileSync(walletPath, 'utf8')));
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+    plaintext = Buffer.concat([
+      decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
+      decipher.final(),
+    ]);
+    const payload = payloadSchema.parse(JSON.parse(plaintext.toString('utf8')));
+    const secret = Buffer.from(payload.solana, 'base64');
+    let solana: string;
+    try {
+      solana = Keypair.fromSecretKey(secret).publicKey.toBase58();
+    } finally {
+      secret.fill(0);
+    }
+    return {
+      solana,
+      robinhood: privateKeyToAccount(payload.robinhood as `0x${string}`).address,
+      bnb: payload.bnb ? privateKeyToAccount(payload.bnb as `0x${string}`).address : undefined,
+    };
+  } finally {
+    plaintext?.fill(0);
+    key.fill(0);
+  }
+}
