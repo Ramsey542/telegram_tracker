@@ -24,7 +24,6 @@ import { Store } from '../src/infra/store.js';
 import { TradeEngine } from '../src/trading/engine.js';
 import type { Config } from '../src/config.js';
 import type { RiskFilters } from '../src/providers/risk.js';
-import { watcherCallbackAllowed } from '../src/telegram/access.js';
 import { senderFilterPanel } from '../src/telegram/channels.js';
 
 const mint = '4U6QvbLXyTpJTiU9HbgaN9yGa6CQ7gXFnWL1HFaWpump';
@@ -172,7 +171,7 @@ test('sender filters persist separately per source and are rechecked before spen
   );
 });
 
-test('public supergroups resolve with disabled trading rules and sender filter controls are read only for watchers', async (t) => {
+test('public supergroups resolve with disabled trading rules and sender filter controls', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'group-registry-'));
   const store = new Store(directory);
   const registry = new ChannelRegistry(store);
@@ -206,7 +205,4 @@ test('public supergroups resolve with disabled trading rules and sender filter c
   assert.ok(
     actions.some((button) => 'callback_data' in button && button.callback_data === 'senderset'),
   );
-  assert.equal(watcherCallbackAllowed('a1b2c3:senderfilter'), true);
-  assert.equal(watcherCallbackAllowed('a1b2c3:senderset'), false);
-  assert.equal(watcherCallbackAllowed('a1b2c3:sendertoggle'), false);
 });

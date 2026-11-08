@@ -34,6 +34,7 @@ import { logTradeOutcome } from '../logging/trades.js';
 import { PositionPrices } from '../providers/position-prices.js';
 import { insufficientFunds } from './funds.js';
 import { MarketData } from '../providers/market.js';
+import { BotAccess } from '../telegram/access.js';
 
 const log = logger.child({ component: 'trading.engine' });
 const maxOperationRetries = 3;
@@ -1182,7 +1183,12 @@ export class TradeEngine {
     requestedBy: number,
   ): Promise<string> {
     this.ensureTradingAllowed();
-    if (requestedBy !== this.config.ownerId) throw new Error('Only the owner can withdraw funds');
+    if (
+      !new BotAccess(this.config.ownerId, this.config.watcherUsername ?? '', this.store).canControl(
+        requestedBy,
+      )
+    )
+      throw new Error('Only authorized accounts can withdraw funds');
     if (this.stopped) throw new Error('Bot is shutting down');
     if (this.busy.has(chain) || this.store.activeOperation(chain))
       throw new Error('This chain already has an operation in progress');

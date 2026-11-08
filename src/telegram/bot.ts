@@ -39,12 +39,7 @@ import {
   type ExitMode,
 } from './exits.js';
 import { telegramTiming, telegramApiLogging } from './control-api.js';
-import {
-  BotAccess,
-  watcherCallbackAllowed,
-  watcherCommandAllowed,
-  watcherKeyboard,
-} from './access.js';
+import { BotAccess } from './access.js';
 import { logger, withLogContext } from '../logging/logger.js';
 import { recentCallMessage } from './call-history.js';
 import {
@@ -176,25 +171,6 @@ export class ControlBot {
       if (role) {
         if (role === 'watcher' && previousWatcher === null)
           log.info('control.watcher_bound', { userId: ctx.from?.id, username: ctx.from?.username });
-        if (role === 'watcher') {
-          const allowed =
-            ctx.callbackQuery?.data !== undefined
-              ? watcherCallbackAllowed(ctx.callbackQuery.data)
-              : watcherCommandAllowed(ctx.message?.text ?? '');
-          if (!allowed) {
-            const reason =
-              'Watcher access is read-only. Trading, fund movements and settings changes are restricted to the owner.';
-            log.warn('control.action_denied', {
-              userId: ctx.from?.id,
-              accessRole: role,
-              action: ctx.callbackQuery?.data ?? 'text_input',
-            });
-            if (ctx.callbackQuery)
-              await ctx.answerCallbackQuery({ text: reason, show_alert: true });
-            else await this.reply(ctx, reason);
-            return;
-          }
-        }
         if (ctx.from)
           this.viewVersions.set(ctx.from.id, (this.viewVersions.get(ctx.from.id) ?? 0) + 1);
         if (ctx.message?.text?.startsWith('/')) this.interaction(ctx).settingsSourceId = null;
@@ -284,8 +260,8 @@ export class ControlBot {
       log.error('control.handler_failed', error.error, { updateId: error.ctx.update.update_id });
     });
   }
-  private isWatcher(ctx: Context): boolean {
-    return this.access.role(ctx.from, ctx.chat?.type) === 'watcher';
+  private canControl(ctx: Context): boolean {
+    return this.access.role(ctx.from, ctx.chat?.type) !== null;
   }
   private settingsSource(ctx: Context) {
     const id = this.interaction(ctx).settingsSourceId;
@@ -321,9 +297,7 @@ export class ControlBot {
         [bold(`${source.title} settings · ${channelStatus(source.enabled)}`), text],
         '\n\n',
       );
-    const rendered = renderMessage(
-      this.isWatcher(ctx) ? joinMessages([bold('Watcher access: read only'), text], '\n\n') : text,
-    );
+    const rendered = renderMessage(text);
     await ctx.reply(rendered.text, {
       entities: rendered.entities,
       link_preview_options: { is_disabled: true },
@@ -342,13 +316,10 @@ export class ControlBot {
       );
       keyboard = settingsKeyboard(keyboard, source.settingsKey!);
     }
-    const watcher = this.isWatcher(ctx);
-    const rendered = renderMessage(
-      watcher ? joinMessages([bold('Watcher access: read only'), text], '\n\n') : text,
-    );
+    const rendered = renderMessage(text);
     const options = {
       entities: rendered.entities,
-      reply_markup: watcher ? watcherKeyboard(keyboard) : keyboard,
+      reply_markup: keyboard,
       link_preview_options: { is_disabled: true },
     };
     if (ctx.callbackQuery?.message) {
@@ -618,20 +589,6 @@ export class ControlBot {
   }
   private async exitDetails(ctx: Context, chain: Chain, target: ExitKind): Promise<void> {
     const exits = this.currentSettings(ctx, chain).exits;
-    if (this.isWatcher(ctx)) {
-      const targets = exitPlanLines(exits, target);
-      await this.display(
-        ctx,
-        joinMessages([
-          bold(exitSummary(exits, target)),
-          chainName(chain),
-          '',
-          ...(targets.length ? targets : ['No targets configured.']),
-        ]),
-        new InlineKeyboard().text('⬅️ Back', `menu:${chain}:exits`),
-      );
-      return;
-    }
     const panel = exitPanel(chain, exits, target);
     await this.display(ctx, panel.text, panel.keyboard);
   }
@@ -1478,8 +1435,7 @@ export class ControlBot {
         return;
       }
       case 'withdraw': {
-        if (ctx.from?.id !== this.config.ownerId)
-          throw new Error('Only the owner can withdraw funds');
+        if (!this.canControl(ctx)) throw new Error('Only authorized accounts can withdraw funds');
         if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks withdrawals');
         const chain = chainValue(value);
         state.pending = { kind: 'withdraw_address', chain };
@@ -1490,8 +1446,7 @@ export class ControlBot {
         return;
       }
       case 'withdrawconfirm': {
-        if (ctx.from?.id !== this.config.ownerId)
-          throw new Error('Only the owner can withdraw funds');
+        if (!this.canControl(ctx)) throw new Error('Only authorized accounts can withdraw funds');
         const withdrawal = state.withdrawal;
         state.withdrawal = null;
         if (!withdrawal || withdrawal.id !== value || withdrawal.expires < Date.now())
@@ -1500,7 +1455,7 @@ export class ControlBot {
           withdrawal.chain,
           withdrawal.recipient,
           withdrawal.amount,
-          ctx.from.id,
+          ctx.from!.id,
         );
         await this.reply(
           ctx,
@@ -1511,7 +1466,7 @@ export class ControlBot {
       case 'wrap': {
         const chain = value === undefined ? 'robinhood' : chainValue(value);
         if (chain === 'solana') throw new Error('Wrapping is only available for EVM chains');
-        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap funds');
+        if (!this.canControl(ctx)) throw new Error('Only authorized accounts can wrap funds');
         if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks wrapping');
         state.pending = { kind: 'wrap_amount', chain, sourceId: this.selectedChannel(ctx)?.id };
         await this.reply(
@@ -1521,7 +1476,7 @@ export class ControlBot {
         return;
       }
       case 'wrapconfirm': {
-        if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap funds');
+        if (!this.canControl(ctx)) throw new Error('Only authorized accounts can wrap funds');
         const wrapping = state.wrapping;
         state.wrapping = undefined;
         if (!wrapping || wrapping.id !== value || wrapping.expires < Date.now())
@@ -1576,7 +1531,7 @@ export class ControlBot {
     }
     if ('sourceId' in pending) state.settingsSourceId = pending.sourceId ?? null;
     if (pending.kind === 'wrap_amount') {
-      if (ctx.from?.id !== this.config.ownerId) throw new Error('Only the owner can wrap funds');
+      if (!this.canControl(ctx)) throw new Error('Only authorized accounts can wrap funds');
       const amount = formatAmount(withdrawalAmount(pending.chain, text), 18);
       state.pending = null;
       state.wrapping = {
@@ -1624,8 +1579,7 @@ export class ControlBot {
       return;
     }
     if (pending.kind === 'withdraw_address' || pending.kind === 'withdraw_amount') {
-      if (ctx.from?.id !== this.config.ownerId)
-        throw new Error('Only the owner can withdraw funds');
+      if (!this.canControl(ctx)) throw new Error('Only authorized accounts can withdraw funds');
       if (this.config.listenOnly) throw new Error('LISTEN_ONLY=true blocks withdrawals');
       if (pending.kind === 'withdraw_address') {
         const recipient = withdrawalAddress(
@@ -1755,11 +1709,7 @@ export class ControlBot {
             if (this.stopping) break;
             log.debug('notification.sending', { notificationId: notification.id, recipientId });
             const content = notificationMessage(notification.text);
-            const rendered = renderMessage(
-              recipientId === this.config.ownerId
-                ? content
-                : joinMessages([bold('Owner activity: read only'), content], '\n\n'),
-            );
+            const rendered = renderMessage(content);
             const keyboard = notification.solanaSignature
               ? new InlineKeyboard().url(
                   '🔗 View on Solscan',

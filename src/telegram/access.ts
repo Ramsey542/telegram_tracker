@@ -1,8 +1,6 @@
-import { InlineKeyboard } from 'grammy';
 import type { User } from 'grammy/types';
 import { z } from 'zod';
 import type { Store } from '../infra/store.js';
-import { unpackSettingsCallback } from './settings-scope.js';
 
 export const watcherUsernameSchema = z
   .string()
@@ -13,59 +11,6 @@ export const watcherUsernameSchema = z
   .default('');
 
 export type AccessRole = 'owner' | 'watcher';
-const watcherActions = new Set([
-  'home',
-  'chain',
-  'menu',
-  'exit',
-  'wallets',
-  'positions',
-  'positionsrefresh',
-  'position',
-  'refresh',
-  'history',
-  'pnl',
-  'pnlquotes',
-  'blocklist',
-  'senderfilter',
-  'recent',
-  'channels',
-  'channelpick',
-  'channelview',
-]);
-const watcherCommands = new Set([
-  'start',
-  'settings',
-  'wallets',
-  'positions',
-  'position',
-  'history',
-  'pnl',
-  'cancel',
-  'help',
-  'channels',
-]);
-
-export function watcherCallbackAllowed(data: string): boolean {
-  return watcherActions.has(unpackSettingsCallback(data).data.split(':')[0] ?? '');
-}
-
-export function watcherCommandAllowed(text: string): boolean {
-  const command = /^\/([a-z]+)(?:@[a-z0-9_]+)?(?:\s|$)/i.exec(text)?.[1]?.toLowerCase();
-  return command !== undefined && watcherCommands.has(command);
-}
-
-export function watcherKeyboard(keyboard: InlineKeyboard): InlineKeyboard {
-  return new InlineKeyboard(
-    keyboard.inline_keyboard
-      .map((row) =>
-        row.filter(
-          (button) => !('callback_data' in button) || watcherCallbackAllowed(button.callback_data),
-        ),
-      )
-      .filter((row) => row.length > 0),
-  );
-}
 
 export class BotAccess {
   private readonly watcherUsername: string;
@@ -81,6 +26,13 @@ export class BotAccess {
     const stored = this.store.metadata(`access:watcher:${this.watcherUsername}`);
     const id = stored && /^\d+$/.test(stored) ? Number(stored) : null;
     return id !== null && Number.isSafeInteger(id) && id > 0 ? id : null;
+  }
+  canControl(userId: number): boolean {
+    return (
+      Number.isSafeInteger(userId) &&
+      userId > 0 &&
+      (userId === this.ownerId || userId === this.watcherId())
+    );
   }
   role(
     user: Pick<User, 'id' | 'username' | 'is_bot'> | undefined,

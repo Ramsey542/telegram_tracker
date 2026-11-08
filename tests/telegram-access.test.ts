@@ -11,13 +11,7 @@ import { Store } from '../src/infra/store.js';
 import type { TradeEngine } from '../src/trading/engine.js';
 import { ControlBot } from '../src/telegram/bot.js';
 import { settingsCallback, unpackSettingsCallback } from '../src/telegram/settings-scope.js';
-import {
-  BotAccess,
-  watcherCallbackAllowed,
-  watcherCommandAllowed,
-  watcherKeyboard,
-  watcherUsernameSchema,
-} from '../src/telegram/access.js';
+import { BotAccess, watcherUsernameSchema } from '../src/telegram/access.js';
 
 function metadataStore() {
   const values = new Map<string, string>();
@@ -63,42 +57,18 @@ test('watcher configuration rejects invalid usernames and corrupted identity bin
   assert.equal(access.role({ id: 123, is_bot: false }, 'private'), 'owner');
 });
 
-test('watcher keyboards retain navigation and explorer links while removing every write action', () => {
-  const original = new InlineKeyboard()
-    .text('View settings', 'chain:solana')
-    .text('Enable entries', 'enable:solana')
-    .row()
-    .text('Sell', 'sell:position:100')
-    .text('Withdraw', 'withdraw:solana')
-    .row()
-    .text('View exits', 'exit:solana:tp')
-    .url('Explorer', 'https://solscan.io/tx/example');
-  const filtered = watcherKeyboard(original);
-  const callbacks = filtered.inline_keyboard
-    .flat()
-    .flatMap((button) => ('callback_data' in button ? [button.callback_data] : []));
-  assert.deepEqual(callbacks, ['chain:solana', 'exit:solana:tp']);
-  assert.equal(original.inline_keyboard.flat().length, 6);
-  assert.equal(
-    filtered.inline_keyboard.flat().some((button) => 'url' in button),
-    true,
-  );
-  for (const data of [
-    'sell:id:100',
-    'confirm:id:100',
-    'withdrawconfirm:id',
-    'unwrapyes',
-    'reconcile:id',
-    'applyyes:id',
-    'exitmode:solana:tp:hard',
-    'edit:solana:buySize',
-    'unknown',
-  ])
-    assert.equal(watcherCallbackAllowed(data), false);
-  assert.equal(watcherCommandAllowed('/settings'), true);
-  assert.equal(watcherCommandAllowed('/pnl@tracker_bot'), true);
-  assert.equal(watcherCommandAllowed('0.1'), false);
-  assert.equal(watcherCommandAllowed('/withdraw'), false);
+test('wallet control requires the owner ID or the persisted watcher ID', () => {
+  const store = metadataStore();
+  const access = new BotAccess(123, 'watcher_name', store);
+  assert.equal(access.canControl(123), true);
+  assert.equal(access.canControl(456), false);
+  access.role({ id: 456, username: 'watcher_name', is_bot: false }, 'private');
+  assert.equal(access.canControl(456), true);
+  assert.equal(new BotAccess(123, 'watcher_name', store).canControl(456), true);
+  assert.equal(new BotAccess(123, 'different_user', store).canControl(456), false);
+  for (const id of [789, 0, -1, NaN, Infinity, 123.5]) assert.equal(access.canControl(id), false);
+  store.setMetadata('access:watcher:watcher_name', 'invalid');
+  assert.equal(access.canControl(456), false);
 });
 
 function botFixture(t: TestContext) {
@@ -149,8 +119,10 @@ function botFixture(t: TestContext) {
     ],
   ]);
   let writes = 0;
+  let confirmationId = 0;
   const store = {
     ...metadata,
+    newId: () => `confirmation-${++confirmationId}`,
     settings: () => structuredClone(settings),
     updateSettings: (change: (settings: Settings) => void) => {
       writes++;
@@ -188,11 +160,20 @@ function botFixture(t: TestContext) {
     writes++;
     throw new Error('Unexpected trade mutation');
   };
+  const tradeCalls: { kind: string; args: unknown[] }[] = [];
   const engine = {
+    adapters: { bnb: { address: '0x2222222222222222222222222222222222222222' } },
     readiness: () => [],
     sell: mutate,
     unwrap: mutate,
-    withdraw: mutate,
+    withdraw: async (...args: unknown[]) => {
+      tradeCalls.push({ kind: 'withdraw', args });
+      return 'withdrawal-operation';
+    },
+    wrap: async (...args: unknown[]) => {
+      tradeCalls.push({ kind: 'wrap', args });
+      return 'wrapping-operation';
+    },
     reconcile: mutate,
   } as unknown as TradeEngine;
   const config = {
@@ -264,6 +245,7 @@ function botFixture(t: TestContext) {
     send,
     store,
     requests,
+    tradeCalls,
     settings: { ...settings, chains: firstRules },
     globals: settings,
     firstRules,
@@ -273,49 +255,65 @@ function botFixture(t: TestContext) {
   };
 }
 
-test('forged watcher callbacks and text never reach trade or settings handlers', async (t) => {
+test('unconfigured accounts cannot invoke callbacks or edit settings while the watcher can', async (t) => {
   const fixture = botFixture(t);
   for (const action of [
     'enable:solana',
-    'toggle:solana:mc',
-    'edit:solana:buySize',
-    'exittoggle:solana:tp',
-    'exitmode:solana:tp:hard',
-    'exitset:solana:tp',
-    'exitdel:solana:tp:stage',
-    'addtp:solana',
-    'deltp:solana:target',
-    'block:add',
-    'sell:id:100',
-    'confirm:id:100',
-    'apply:id',
-    'applyyes:id',
     'withdraw:solana',
     'withdrawconfirm:id',
-    'unwrap',
+    'wrap:bnb',
+    'wrapconfirm:id',
     'unwrapyes',
+    'sell:id:100',
     'reconcile:id',
-    'resume',
-    'channeladd',
-    'channeltoggle:id',
-    'channelchain:id:robinhood',
-    'channelretry:id',
-    'channelremove:id',
-    'channelrmconfirm:id',
-    'channelremovechoose:0',
-    'unknown',
-  ]) {
-    await fixture.send(456, action, true);
-  }
-  await fixture.send(456, '0.5');
-  assert.equal(fixture.writes(), 0);
-  const denials = fixture.requests.filter((request) => request.method === 'answerCallbackQuery');
-  assert.equal(denials.length, 28);
-  assert.ok(denials.every((request) => request.payload.show_alert === true));
-  assert.match(String(fixture.requests.at(-1)?.payload.text), /read.only/i);
-  const requestCount = fixture.requests.length;
+    'channeltoggle:first',
+    settingsCallback('a1b2c3', 'edit:solana:buySize'),
+  ])
+    await fixture.send(789, action, true);
+  await fixture.send(789, '0.5');
   await fixture.send(789, '/settings');
-  assert.equal(fixture.requests.length, requestCount);
+  assert.equal(fixture.writes(), 0);
+  assert.equal(fixture.requests.length, 0);
+  await fixture.send(456, settingsCallback('a1b2c3', 'edit:solana:buySize'), true);
+  await fixture.send(456, '0.1');
+  assert.equal(fixture.firstRules.solana.buySizeNative, '0.1');
+  assert.equal(fixture.writes(), 1);
+});
+
+test('watcher can withdraw and wrap with confirmations isolated from the owner', async (t) => {
+  const fixture = botFixture(t);
+  const confirmation = (prefix: string) => {
+    const buttons = (
+      fixture.requests.at(-1)!.payload.reply_markup as InlineKeyboard
+    ).inline_keyboard.flat();
+    const button = buttons.find(
+      (entry) => 'callback_data' in entry && entry.callback_data.startsWith(prefix),
+    );
+    assert.ok(button && 'callback_data' in button);
+    return button.callback_data;
+  };
+  await fixture.send(456, 'withdraw:bnb', true);
+  assert.match(String(fixture.requests.at(-1)!.payload.text), /Withdraw BNB/);
+  await fixture.send(456, '0x1111111111111111111111111111111111111111');
+  await fixture.send(456, '0.01');
+  const withdrawal = confirmation('withdrawconfirm:');
+  await fixture.send(123, withdrawal, true);
+  await fixture.send(789, withdrawal, true);
+  assert.equal(fixture.tradeCalls.length, 0);
+  await fixture.send(456, withdrawal, true);
+  assert.deepEqual(fixture.tradeCalls, [
+    { kind: 'withdraw', args: ['bnb', '0x1111111111111111111111111111111111111111', '0.01', 456] },
+  ]);
+  await fixture.send(456, withdrawal, true);
+  assert.equal(fixture.tradeCalls.length, 1);
+  await fixture.send(456, 'wrap:bnb', true);
+  assert.match(String(fixture.requests.at(-1)!.payload.text), /Wrap BNB/);
+  await fixture.send(456, '0.02');
+  const wrapping = confirmation('wrapconfirm:');
+  await fixture.send(123, wrapping, true);
+  assert.equal(fixture.tradeCalls.length, 1);
+  await fixture.send(456, wrapping, true);
+  assert.deepEqual(fixture.tradeCalls[1], { kind: 'wrap', args: ['0.02', 'first', 'bnb'] });
 });
 
 test('sender filter prompts, username lists and switches remain scoped to their source', async (t) => {
@@ -341,20 +339,23 @@ test('sender filter prompts, username lists and switches remain scoped to their 
   const writes = fixture.writes();
   await fixture.send(456, settingsCallback('d4e5f6', 'sendertoggle'), true);
   await fixture.send(456, settingsCallback('d4e5f6', 'senderset'), true);
-  assert.equal(fixture.writes(), writes);
+  await fixture.send(456, '@delta');
+  assert.equal(fixture.writes(), writes + 2);
+  assert.deepEqual(fixture.store.callChannel('second')!.senderFilter, {
+    enabled: false,
+    usernames: ['delta'],
+  });
 });
 
-test('watcher views use current owner settings and cannot consume the owner pending input', async (t) => {
+test('both controllers see all controls and retain separate pending inputs', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(456, 'menu:solana:consistency', true);
   const screen = fixture.requests.at(-1)!.payload;
-  assert.match(String(screen.text), /Watcher access: read only/);
+  assert.doesNotMatch(String(screen.text), /read.only/i);
   assert.match(String(screen.text), /42/);
   const buttons = (screen.reply_markup as InlineKeyboard).inline_keyboard.flat();
   assert.ok(
-    buttons.every(
-      (button) => !('callback_data' in button) || watcherCallbackAllowed(button.callback_data),
-    ),
+    buttons.some((button) => 'callback_data' in button && button.callback_data.includes('edit:')),
   );
   await fixture.send(123, settingsCallback('a1b2c3', 'edit:solana:buySize'), true);
   await fixture.send(456, '/settings');
@@ -384,7 +385,7 @@ test('channel settings buttons edit their original source rather than the last o
   assert.equal(fixture.writes(), 2);
 });
 
-test('BNB settings are visible, independent by channel and protected from watcher changes', async (t) => {
+test('both controllers can edit BNB settings independently by channel', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(123, '/start');
   const screen = fixture.requests.at(-1)!.payload;
@@ -400,10 +401,13 @@ test('BNB settings are visible, independent by channel and protected from watche
   await fixture.send(456, settingsCallback('a1b2c3', 'menu:bnb:buy'), true);
   assert.match(String(fixture.requests.at(-1)?.payload.text), /0.02/);
   await fixture.send(456, settingsCallback('a1b2c3', 'edit:bnb:buySize'), true);
-  assert.equal(fixture.writes(), 1);
+  await fixture.send(456, '0.03');
+  assert.equal(fixture.firstRules.bnb.buySizeNative, '0.03');
+  assert.equal(fixture.secondRules.bnb.buySizeNative, null);
+  assert.equal(fixture.writes(), 2);
 });
 
-test('time exit setup prompts for a limit, stays scoped and cannot be changed by watchers', async (t) => {
+test('both controllers can configure scoped time exits', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(123, settingsCallback('a1b2c3', 'toggle:solana:timeExit'), true);
   assert.match(String(fixture.requests.at(-1)?.payload.text), /Enable time exit/);
@@ -414,12 +418,12 @@ test('time exit setup prompts for a limit, stays scoped and cannot be changed by
   await fixture.send(456, settingsCallback('a1b2c3', 'menu:solana:timeExit'), true);
   assert.match(String(fixture.requests.at(-1)?.payload.text), /10/);
   await fixture.send(456, settingsCallback('a1b2c3', 'toggle:solana:timeExit'), true);
-  assert.equal(fixture.firstRules.solana.exits.timeExit.enabled, true);
+  assert.equal(fixture.firstRules.solana.exits.timeExit.enabled, false);
   await fixture.send(123, settingsCallback('a1b2c3', 'toggle:solana:timeExit'), true);
-  assert.deepEqual(fixture.firstRules.solana.exits.timeExit, { enabled: false, minutes: 10 });
+  assert.deepEqual(fixture.firstRules.solana.exits.timeExit, { enabled: true, minutes: 10 });
 });
 
-test('SpyDefi label switches are scoped, hidden from general channels and read only for watchers', async (t) => {
+test('SpyDefi label switches are scoped and editable by both controllers', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(123, settingsCallback('a1b2c3', 'menu:solana:filters'), true);
   assert.match(String(fixture.requests.at(-1)?.payload.text), /Buy Only First Caller/);
@@ -437,11 +441,11 @@ test('SpyDefi label switches are scoped, hidden from general channels and read o
   assert.ok(
     (watcherScreen.reply_markup as InlineKeyboard).inline_keyboard
       .flat()
-      .every((button) => !('callback_data' in button) || !button.callback_data.includes('toggle:')),
+      .some((button) => 'callback_data' in button && button.callback_data.includes('toggle:')),
   );
   await fixture.send(456, settingsCallback('a1b2c3', 'toggle:solana:firstCaller'), true);
-  assert.equal(fixture.firstRules.solana.filters.buyOnlyFirstCaller, true);
-  assert.equal(fixture.writes(), 2);
+  assert.equal(fixture.firstRules.solana.filters.buyOnlyFirstCaller, false);
+  assert.equal(fixture.writes(), 3);
   await fixture.send(123, settingsCallback('d4e5f6', 'menu:solana:filters'), true);
   assert.doesNotMatch(String(fixture.requests.at(-1)?.payload.text), /Buy Only First Caller/);
   assert.doesNotMatch(String(fixture.requests.at(-1)?.payload.text), /Just Launched/);
@@ -451,7 +455,7 @@ test('SpyDefi label switches are scoped, hidden from general channels and read o
   }
   assert.equal(fixture.secondRules.solana.filters.buyOnlyFirstCaller, false);
   assert.equal(fixture.secondRules.solana.filters.justLaunched, false);
-  assert.equal(fixture.writes(), 2);
+  assert.equal(fixture.writes(), 3);
 });
 
 test('main-menu channel selection survives navigation and keeps edits scoped to the named channel', async (t) => {
@@ -481,7 +485,7 @@ test('main-menu channel selection survives navigation and keeps edits scoped to 
   assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: Second channel/);
 });
 
-test('channel toggles and removal target the named channel while watchers can only select views', async (t) => {
+test('channel toggles and removal are available to both controllers with independent selections', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(123, 'channelpick:second', true);
   await fixture.send(456, '/settings');
@@ -492,12 +496,12 @@ test('channel toggles and removal target the named channel while watchers can on
   const callbacks = (screen.reply_markup as InlineKeyboard).inline_keyboard
     .flat()
     .flatMap((button) => ('callback_data' in button ? [button.callback_data] : []));
-  assert.ok(!callbacks.includes('channeltoggle:second'));
+  assert.ok(callbacks.includes('channeltoggle:second'));
   await fixture.send(456, 'channeltoggle:second', true);
   await fixture.send(456, 'channelremovechoose:0', true);
-  assert.equal(fixture.writes(), 0);
+  assert.equal(fixture.writes(), 1);
   await fixture.send(123, 'channeltoggle:first', true);
-  assert.match(String(fixture.requests.at(-1)?.payload.text), /2 total · 0 on · 2 off/);
+  assert.match(String(fixture.requests.at(-1)?.payload.text), /2 total · 1 on · 1 off/);
   assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
   await fixture.send(123, 'channelremovechoose:0', true);
   const removal = fixture.requests.at(-1)!.payload;
@@ -513,19 +517,18 @@ test('channel toggles and removal target the named channel while watchers can on
   assert.match(String(fixture.requests.at(-1)?.payload.text), /Selected channel: First channel/);
 });
 
-test('watchers can view channel rules but cannot use scoped write actions', async (t) => {
+test('watcher edits channel rules without changing another source', async (t) => {
   const fixture = botFixture(t);
   await fixture.send(456, settingsCallback('d4e5f6', 'menu:solana:buy'), true);
   assert.match(String(fixture.requests.at(-1)?.payload.text), /Second channel settings/);
-  for (const action of [
-    'edit:solana:buySize',
-    'enable:solana',
-    'exittoggle:solana:tp',
-    'block:add',
-  ])
-    await fixture.send(456, settingsCallback('d4e5f6', action), true);
-  assert.equal(fixture.writes(), 0);
-  assert.equal(fixture.requests.at(-1)?.payload.show_alert, true);
+  await fixture.send(456, settingsCallback('d4e5f6', 'edit:solana:buySize'), true);
+  await fixture.send(456, '0.2');
+  await fixture.send(456, settingsCallback('d4e5f6', 'enable:solana'), true);
+  assert.equal(fixture.writes(), 2);
+  assert.equal(fixture.secondRules.solana.buySizeNative, '0.2');
+  assert.equal(fixture.secondRules.solana.enabled, true);
+  assert.equal(fixture.firstRules.solana.buySizeNative, null);
+  assert.equal(fixture.firstRules.solana.enabled, false);
 });
 
 test('channel context fits the longest trailing-stage callback in Telegram without losing its source', () => {
@@ -533,7 +536,6 @@ test('channel context fits the longest trailing-stage callback in Telegram witho
   const encoded = settingsCallback('a1b2c3', action);
   assert.equal(Buffer.byteLength(encoded, 'utf8'), 64);
   assert.deepEqual(unpackSettingsCallback(encoded), { key: 'a1b2c3', data: action });
-  assert.equal(watcherCallbackAllowed(encoded), false);
   assert.throws(() => settingsCallback('a1b2c3', `${action}x`), /too long/);
 });
 
