@@ -44,8 +44,8 @@ const state = {
   dexId: 0,
 };
 
-test('direct routes default off and quote floors preserve the configured spend budget', () => {
-  assert.equal(chainSettingsSchema.parse({}).directTradingEnabled, false);
+test('direct routes default on and quote floors preserve the configured spend budget', () => {
+  assert.equal(chainSettingsSchema.parse({}).directTradingEnabled, true);
   assert.equal(directMinimum(1000n, 10), 900n);
   for (const slippage of [-1, 101, NaN, Infinity])
     assert.throws(() => directMinimum(1000n, slippage));

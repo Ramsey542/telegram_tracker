@@ -172,7 +172,7 @@ export const chainSettingsSchema = z
     // Selects UniswapX on Robinhood. Solana protection is managed by its RPC provider.
     mevProtection: z.boolean().default(true),
     wrapMyEth: z.boolean().default(false),
-    directTradingEnabled: z.boolean().default(false),
+    directTradingEnabled: z.boolean().default(true),
     consistency: z
       .object({
         overall: percent.default(30),
