@@ -422,6 +422,7 @@ export const toggles: Record<
   directTrading: {
     label: 'Direct launchpad and DEX routes',
     group: 'execution',
+    chains: ['robinhood', 'bnb'],
     value: (s) => s.directTradingEnabled,
     change: (s) => {
       s.directTradingEnabled = !s.directTradingEnabled;

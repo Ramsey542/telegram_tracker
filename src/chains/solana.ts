@@ -34,6 +34,7 @@ import type { ChainAdapter } from './types.js';
 import { solanaPriorityLamports } from './fees.js';
 import { logger } from '../logging/logger.js';
 import { PumpRoutes, pumpFill, PUMP_PROGRAM_ID, PUMP_AMM_PROGRAM_ID } from './pump.js';
+import { solanaSwapProvider } from './solana-routing.js';
 import { NativePrices } from '../providers/native-prices.js';
 import {
   TOKEN_PROGRAM_ID,
@@ -84,6 +85,7 @@ export async function requestJupiterOrder(
   taker: string,
   settings: Pick<ChainSettings, 'slippagePercent' | 'priorityFee'>,
 ) {
+  if (!apiKey) throw new TradeRejected('JUPITER_API_KEY is missing for this Jupiter route');
   if (settings.slippagePercent === null) throw new TradeRejected('Set slippage before trading');
   const query = new URLSearchParams({
     inputMint,
@@ -174,10 +176,9 @@ export class SolanaAdapter implements ChainAdapter {
     if (!this.connection) throw new Error('QUICKNODE_SOLANA_RPC_URL is missing');
     return this.connection;
   }
-  readiness(settings: ChainSettings): string[] {
+  readiness(_settings: ChainSettings): string[] {
     const missing: string[] = [];
     if (!this.config.solanaRpc) missing.push('QUICKNODE_SOLANA_RPC_URL');
-    if (!settings.directTradingEnabled && !this.config.jupiterKey) missing.push('JUPITER_API_KEY');
     return missing;
   }
   async verifyNetwork(): Promise<void> {
@@ -203,18 +204,15 @@ export class SolanaAdapter implements ChainAdapter {
   }
   async tokenInfo(address: string, settings?: ChainSettings): Promise<TokenInfo> {
     new PublicKey(address);
-    if (settings?.directTradingEnabled) {
-      const inspected = await this.pumpRoutes().inspect(address);
-      if (inspected) {
-        const rate = await this.nativePrices.get('solana');
-        const direct = await this.pumpRoutes().tokenInfo(address, rate.value);
-        if (direct) {
-          if (settings.filters.maxTopHoldersPercent !== null) {
-            const data = await this.market.solana(address);
-            direct.topHoldersPercent = data?.audit?.topHoldersPercentage ?? null;
-          }
-          return direct;
+    if (solanaSwapProvider(address) === 'pump') {
+      const rate = await this.nativePrices.get('solana');
+      const direct = await this.pumpRoutes().tokenInfo(address, rate.value);
+      if (direct) {
+        if (settings?.filters.maxTopHoldersPercent != null) {
+          const data = await this.market.solana(address);
+          direct.topHoldersPercent = data?.audit?.topHoldersPercentage ?? null;
         }
+        return direct;
       }
     }
     const data = await this.market.solana(address);
@@ -232,7 +230,7 @@ export class SolanaAdapter implements ChainAdapter {
   }
   async quoteSell(address: string, amountRaw: string, settings: ChainSettings): Promise<Quote> {
     if (settings.slippagePercent === null) throw new Error('Slippage is not configured');
-    if (settings.directTradingEnabled) {
+    if (solanaSwapProvider(address) === 'pump') {
       const direct = await this.pumpRoutes().quote(
         address,
         BigInt(amountRaw),
@@ -241,7 +239,12 @@ export class SolanaAdapter implements ChainAdapter {
         false,
       );
       if (direct) return direct.quote;
+      throw new TradeRejected(
+        'No supported Pump SDK route is available for this pump-suffix token',
+      );
     }
+    if (!this.config.jupiterKey)
+      throw new TradeRejected('JUPITER_API_KEY is missing for this Jupiter route');
     const query = new URLSearchParams({
       inputMint: address,
       outputMint: SOL_MINT,
@@ -287,11 +290,10 @@ export class SolanaAdapter implements ChainAdapter {
     const legacy = operation.steps.find((step): step is SolanaStep => step.type === 'solana');
     if (legacy) return this.advanceLegacy(operation, legacy, persist);
     if (
-      operation.settings.directTradingEnabled &&
+      solanaSwapProvider(operation.address) === 'pump' &&
       operation.steps.length === 0 &&
       !operation.preparedQuote
     ) {
-      await this.verifyNetwork();
       const route = await this.pumpRoutes().quote(
         operation.address,
         BigInt(operation.amountRaw),
@@ -342,6 +344,9 @@ export class SolanaAdapter implements ChainAdapter {
         }
         throw new PendingTrade('Waiting for Pump transaction confirmation');
       }
+      throw new TradeRejected(
+        'No supported Pump SDK route is available for this pump-suffix token',
+      );
     }
     let step = operation.steps.find(
       (candidate): candidate is JupiterStep => candidate.type === 'jupiter',
@@ -747,6 +752,7 @@ export class SolanaAdapter implements ChainAdapter {
       });
       throw new TradeRejected('Solana swap reverted on chain');
     }
+    operation.swapHash = signature;
     const tokenDelta = solanaTokenDelta(receipt, operation.address, this.address);
     const keys = receipt.transaction.message.getAccountKeys({
       accountKeysFromLookups: meta.loadedAddresses,
@@ -818,7 +824,6 @@ export class SolanaAdapter implements ChainAdapter {
       swapNativeRaw = fill.native.toString();
     }
     const feeNativeRaw = keys.get(0)?.toBase58() === this.address ? meta.fee.toString() : '0';
-    operation.swapHash = signature;
     log.info('transaction.accounted', {
       operationId: operation.id,
       kind: operation.kind,
@@ -959,7 +964,7 @@ export class SolanaAdapter implements ChainAdapter {
     step: SolanaStep,
     persist: () => void,
   ): Promise<SwapResult> {
-    await this.verifyNetwork();
+    if (!step.venue) await this.verifyNetwork();
     let receipt: VersionedTransactionResponse | null;
     try {
       receipt = await this.rpc().getTransaction(step.signature, {

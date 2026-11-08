@@ -2,7 +2,6 @@ import BN from 'bn.js';
 import { createRequire } from 'node:module';
 import type { OnlinePumpSdk as OnlinePumpSdkInstance } from '@pump-fun/pump-sdk';
 import type { OnlinePumpAmmSdk as OnlinePumpAmmSdkInstance } from '@pump-fun/pump-swap-sdk';
-import { BorshCoder, type Idl } from '@coral-xyz/anchor';
 import { ReviewRequired } from '../domain.js';
 import { TradeRejected, type Quote, type TokenInfo } from '../domain.js';
 import { logger } from '../logging/logger.js';
@@ -336,7 +335,13 @@ export function pumpFill(
   buy: boolean,
 ): { native: bigint; tokens: bigint } {
   const program = venue === 'pump' ? PUMP_PROGRAM_ID : PUMP_AMM_PROGRAM_ID;
-  const coder = new BorshCoder((venue === 'pump' ? pumpIdl : pumpAmmJson) as unknown as Idl);
+  const eventName = venue === 'pump' ? 'TradeEvent' : buy ? 'BuyEvent' : 'SellEvent';
+  const idl = (venue === 'pump' ? pumpIdl : pumpAmmJson) as {
+    events: readonly { name: string; discriminator: readonly number[] }[];
+  };
+  const definition = idl.events.find((event) => event.name === eventName);
+  if (!definition) throw new ReviewRequired(`Pump SDK event definition is missing: ${eventName}`);
+  const discriminator = Buffer.from(definition.discriminator);
   const stack: string[] = [];
   let native = 0n;
   let tokens = 0n;
@@ -356,27 +361,29 @@ export function pumpFill(
       continue;
     }
     if (stack.at(-1) !== program.toBase58() || !line.startsWith('Program data: ')) continue;
-    const event = coder.events.decode(line.slice(14));
-    if (!event) continue;
-    const data = event.data as Record<string, unknown>;
+    const encoded = Buffer.from(line.slice(14), 'base64');
+    if (!encoded.subarray(0, discriminator.length).equals(discriminator)) continue;
+    let data: Record<string, unknown>;
+    try {
+      const body = encoded.subarray(discriminator.length);
+      data = (venue === 'pump'
+        ? PUMP_SDK.decodeTradeEventBc(body)
+        : buy
+          ? PUMP_SDK.decodeBuyEventAmm(body)
+          : PUMP_SDK.decodeSellEventAmm(body)) as unknown as Record<string, unknown>;
+    } catch (error) {
+      log.error('receipt.pump_event_decode_failed', error, { mint, venue, eventName });
+      throw new ReviewRequired(`Confirmed ${eventName} could not be decoded by the Pump SDK`);
+    }
     if (String(data.user) !== owner) continue;
     if (venue === 'pump') {
-      if (
-        event.name.toLowerCase() !== 'tradeevent' ||
-        String(data.mint) !== mint ||
-        data.isBuy !== buy
-      )
-        continue;
+      if (String(data.mint) !== mint || data.isBuy !== buy) continue;
       const quote = value(data, 'solAmount');
       const fee = value(data, 'fee') + value(data, 'creatorFee');
       native += buy ? quote + fee : quote - fee;
       tokens += value(data, 'tokenAmount');
     } else {
-      if (
-        event.name.toLowerCase() !== (buy ? 'buyevent' : 'sellevent') ||
-        String(data.pool) !== canonicalPumpPoolPda(new PublicKey(mint)).toBase58()
-      )
-        continue;
+      if (String(data.pool) !== canonicalPumpPoolPda(new PublicKey(mint)).toBase58()) continue;
       native += value(data, buy ? 'userQuoteAmountIn' : 'userQuoteAmountOut');
       tokens += value(data, buy ? 'baseAmountOut' : 'baseAmountIn');
     }

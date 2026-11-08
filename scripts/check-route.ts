@@ -47,6 +47,7 @@ Options:
 
 No transactions or permits are signed. No approvals, wraps or swaps are submitted.
 No Telegram client, bot lock or trade engine is started. The database is opened read-only.
+The explicit diagnostic provider overrides the bot's automatic Solana suffix routing.
 Uniswap uses WETH/WBNB and Classic V2/V3/V4 routes. Flap and Pump use native funds.
 Uniswap builds omit permit signatures. Simulation can fail on missing funds or approvals.
 Direct SDK builds do not prove a transaction will execute successfully on-chain.
@@ -355,10 +356,6 @@ async function main(): Promise<void> {
             disableRetryOnRateLimit: true,
             fetch: globalThis.fetch,
           });
-          if (
-            (await connection.getGenesisHash()) !== '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d'
-          )
-            throw new Error('RPC is not Solana mainnet');
           const route = await new PumpRoutes(connection, new PublicKey(owner)).quote(
             address,
             amount,

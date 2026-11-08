@@ -689,7 +689,7 @@ export class ControlBot {
         '',
         italic(
           chain === 'solana'
-            ? 'Enable direct routes to trade SOL-paired Pump.fun curves and canonical PumpSwap pools using the official SDKs through QuickNode, without PumpPortal fees. Other routes use Jupiter. Direct submissions use your QuickNode settings; Jupiter submissions use Jupiter execution.'
+            ? 'Solana routing is automatic: addresses ending in pump use the official Pump.fun/PumpSwap SDKs; all other addresses use Jupiter. Route selection is local. Pump SDK execution still reads curve and pool state through QuickNode.'
             : `Enable direct routes for native-asset Flap tokens and PancakeSwap V2, V3 and Infinity. Disable Require UniswapX protection to use direct EVM routes. Flap buys spend native ${nativeSymbol[chain]}; PancakeSwap buys spend W${nativeSymbol[chain]}. Wrap my ETH/BNB can top up wrapped funds for direct PancakeSwap buys. Direct routes use QuickNode; other routes use Uniswap.`,
         ),
       );
