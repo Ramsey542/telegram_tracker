@@ -107,9 +107,9 @@ export class DirectEvmRoutes {
     if (state) {
       if (![1, 4].includes(state.status))
         throw new TradeRejected(`Flap token is not tradable (status ${state.status})`);
-      if (state.quoteTokenAddress !== zeroAddress)
+      if (buy && state.quoteTokenAddress !== zeroAddress && !state.nativeToQuoteSwapEnabled)
         throw new TradeRejected(
-          'Direct Flap settlement currently requires a native-asset quote token',
+          'Flap native conversion is disabled for this quote token; native-funded buying is unavailable',
         );
       const inputToken = buy ? zeroAddress : token;
       const outputToken = buy ? token : zeroAddress;
@@ -129,8 +129,18 @@ export class DirectEvmRoutes {
         data: quoted.data,
       });
       const minimum = directMinimum(output, slippage);
+      log.info('route.selected', {
+        chain: this.chain,
+        token,
+        venue: 'flap',
+        quoteToken: state.quoteTokenAddress,
+        nativeConversion: state.quoteTokenAddress !== zeroAddress,
+        inputRaw: amount.toString(),
+        outputRaw: output.toString(),
+      });
       return {
         venue: 'flap',
+        flapQuoteToken: state.quoteTokenAddress,
         to: directNetworks[this.chain].portal,
         spender: buy ? null : directNetworks[this.chain].portal,
         inputToken,

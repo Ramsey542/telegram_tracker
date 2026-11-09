@@ -96,7 +96,7 @@ test('Flap buys and sells use the correct chain portal, wallet-specific quote an
   }
 });
 
-test('Flap inactive states and unsupported settlement assets fail before any transaction is built', async () => {
+test('Flap inactive states and disabled native conversion fail before any transaction is built', async () => {
   for (const changed of [{ status: 5 }, { quoteTokenAddress: token }]) {
     const routes = new DirectEvmRoutes(
       'bnb',
@@ -106,7 +106,10 @@ test('Flap inactive states and unsupported settlement assets fail before any tra
       } as unknown as PublicClient,
       owner,
     );
-    await assert.rejects(routes.quote(token, 100n, true, 10), /not tradable|native-asset quote/);
+    await assert.rejects(
+      routes.quote(token, 100n, true, 10),
+      /not tradable|native conversion is disabled/,
+    );
   }
 });
 

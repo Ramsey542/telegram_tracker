@@ -46,6 +46,7 @@ import { evmNetworks } from './networks.js';
 import type { EvmChain } from '../domain.js';
 import { DirectEvmRoutes, directNetworks } from './direct-evm.js';
 import { NativePrices } from '../providers/native-prices.js';
+import { tracedNativeDelta } from './native-flow.js';
 
 // The router SDK's ESM build uses extensionless imports that native Node cannot resolve.
 const require = createRequire(import.meta.url);
@@ -345,6 +346,7 @@ export class EvmAdapter implements ChainAdapter {
   private readonly metadataCache = new Map<string, { decimals: number; expiresAt: number }>();
   private readonly metadataRequests = new Map<string, Promise<number>>();
   private readonly nativePrices: NativePrices;
+  private nativeTraceSupport: Promise<void> | null = null;
   private directRoutes(): DirectEvmRoutes {
     return new DirectEvmRoutes(this.chain, this.rpc(), this.address);
   }
@@ -1153,6 +1155,8 @@ export class EvmAdapter implements ChainAdapter {
       throw new TradeRejected('Direct transaction destination or value is invalid');
     const buy = operation.kind === 'buy';
     if (!operation.steps.some((step) => step.key === 'swap')) {
+      if (plan.venue === 'flap' && plan.flapQuoteToken && !same(plan.flapQuoteToken, zeroAddress))
+        await this.ensureNativeTraceSupport();
       await beforeSwap();
       operation.token.decimals = await this.tokenDecimals(operation.address as Address);
       if (buy && operation.settings.filters.maxPriceImpactPercent !== null) {
@@ -1323,7 +1327,45 @@ export class EvmAdapter implements ChainAdapter {
       throw new ReviewRequired('Confirmed direct token transfers do not match the position');
     let native: bigint;
     let fundsError: string | undefined;
-    if (plan.venue === 'flap') {
+    if (plan.venue === 'flap' && plan.flapQuoteToken && !same(plan.flapQuoteToken, zeroAddress)) {
+      let trace: unknown;
+      try {
+        trace = await this.rpc().request({
+          method: 'debug_traceTransaction',
+          params: [
+            receipt.transactionHash,
+            { tracer: 'callTracer', tracerConfig: { onlyTopCall: false } },
+          ],
+        } as never);
+      } catch (error) {
+        this.log.error('transaction.flap_native_trace_failed', error, {
+          operationId: operation.id,
+          hash: receipt.transactionHash,
+          quoteToken: plan.flapQuoteToken,
+        });
+        throw new ReviewRequired(
+          'Confirmed Flap swap needs its native transfer trace; restore QuickNode tracing and reconcile this operation',
+        );
+      }
+      const delta = tracedNativeDelta(trace, this.address, plan.to, plan.value);
+      native = buy ? -delta : delta;
+      if (
+        native <= 0n ||
+        (buy && native > BigInt(operation.amountRaw)) ||
+        (!buy && native < BigInt(plan.minimumRaw))
+      )
+        throw new ReviewRequired(
+          'Confirmed Flap native transfers disagree with the buy budget or minimum sale proceeds',
+        );
+      this.log.info('transaction.flap_native_accounted', {
+        operationId: operation.id,
+        hash: receipt.transactionHash,
+        quoteToken: plan.flapQuoteToken,
+        nativeRaw: native.toString(),
+        tokenRaw: tokens.toString(),
+        source: 'quicknode_call_trace',
+      });
+    } else if (plan.venue === 'flap') {
       const abi = parseAbi([
         'event TokenBought(uint256 ts,address token,address buyer,uint256 amount,uint256 eth,uint256 fee,uint256 postPrice)',
         'event TokenSold(uint256 ts,address token,address seller,uint256 amount,uint256 eth,uint256 fee,uint256 postPrice)',
@@ -1392,6 +1434,33 @@ export class EvmAdapter implements ChainAdapter {
       (sum, step) => sum + (step.type === 'evm' ? BigInt(step.gasPaidRaw ?? '0') : 0n),
       0n,
     );
+  }
+  private async ensureNativeTraceSupport(): Promise<void> {
+    this.nativeTraceSupport ??= (async () => {
+      try {
+        const result: unknown = await this.rpc().request({
+          method: 'debug_traceCall',
+          params: [
+            { from: this.address, to: this.address, value: '0x0', data: '0x' },
+            'latest',
+            { tracer: 'callTracer', tracerConfig: { onlyTopCall: false } },
+          ],
+        } as never);
+        const frame = z
+          .object({ type: z.literal('CALL'), error: z.string().optional() })
+          .parse(result);
+        if (frame.error) throw new Error(frame.error);
+      } catch (error) {
+        this.nativeTraceSupport = null;
+        this.log.error('transaction.flap_tracing_unavailable', error, {
+          service: `QuickNode ${this.network.name} RPC`,
+        });
+        throw new TradeRejected(
+          'ERC20-quoted Flap swaps require QuickNode debug tracing for native-cost accounting; no swap was submitted',
+        );
+      }
+    })();
+    await this.nativeTraceSupport;
   }
   private async signPermit(
     response: ApiQuote,

@@ -480,6 +480,7 @@ async function main(): Promise<void> {
               venue: plan.venue,
               outputRaw: plan.outputRaw,
               minimumRaw: plan.minimumRaw,
+              flapQuoteToken: plan.flapQuoteToken,
               inputToken: plan.inputToken,
               outputToken: plan.outputToken,
             });

@@ -362,6 +362,7 @@ export interface DirectEvmPlan {
   minimumRaw: string;
   permit2?: string;
   permitSigned?: boolean;
+  flapQuoteToken?: string;
   receivedAt: number;
 }
 export interface TrailState {
