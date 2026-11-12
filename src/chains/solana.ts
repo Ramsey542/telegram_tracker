@@ -28,7 +28,7 @@ import {
   type TokenInfo,
   type Position,
 } from '../domain.js';
-import { ApiError, HttpClient, safeError } from '../infra/http.js';
+import { ApiError, HttpClient } from '../infra/http.js';
 import { MarketData } from '../providers/market.js';
 import type { ChainAdapter } from './types.js';
 import { solanaPriorityLamports } from './fees.js';
@@ -292,6 +292,7 @@ export class SolanaAdapter implements ChainAdapter {
     if (
       solanaSwapProvider(operation.address) === 'pump' &&
       operation.steps.length === 0 &&
+      !operation.pumpPreflightRejected &&
       !operation.preparedQuote
     ) {
       const route = await this.pumpRoutes().quote(
@@ -323,6 +324,7 @@ export class SolanaAdapter implements ChainAdapter {
         beforeSpend();
         step.submittedAt = Date.now();
         persist();
+        let preflightRejected = false;
         try {
           const signature = await this.rpc().sendRawTransaction(
             Buffer.from(step.serialized, 'base64'),
@@ -332,21 +334,60 @@ export class SolanaAdapter implements ChainAdapter {
             throw new ReviewRequired('QuickNode returned an unexpected Pump transaction signature');
         } catch (error) {
           if (error instanceof ReviewRequired) throw error;
-          if (error instanceof SendTransactionError)
-            throw new TradeRejected(`Pump transaction simulation rejected: ${safeError(error)}`);
-          log.error('transaction.pump_submission_uncertain', error, {
-            operationId: operation.id,
-            signature: step.signature,
-          });
-          throw new PendingTrade(
-            'Pump submission outcome is uncertain; the saved transaction will be reconciled',
-          );
+          if (
+            error instanceof SendTransactionError &&
+            /^Transaction simulation failed\b/i.test(error.transactionError.message)
+          ) {
+            const simulation = error.transactionError;
+            const instructionMatch = /Instruction\s+(\d+)/i.exec(simulation.message);
+            const instructionIndex = instructionMatch ? Number(instructionMatch[1]) : null;
+            const instructionPrograms = [
+              ComputeBudgetProgram.programId.toBase58(),
+              ComputeBudgetProgram.programId.toBase58(),
+              ...route.instructions.map((instruction) => instruction.programId.toBase58()),
+            ];
+            const failedPrograms = (simulation.logs ?? []).flatMap((line) => {
+              const match = /^Program (\S+) failed: (.+)$/.exec(line);
+              return match ? [{ programId: match[1], reason: match[2] }] : [];
+            });
+            log.error('transaction.pump_simulation_failed', error, {
+              operationId: operation.id,
+              signature: step.signature,
+              venue: route.venue,
+              simulationMessage: simulation.message,
+              simulationLogs: simulation.logs ?? null,
+              instructionIndex,
+              instructionProgramId:
+                instructionIndex === null ? null : (instructionPrograms[instructionIndex] ?? null),
+              instructionPrograms,
+              failedPrograms,
+            });
+            operation.steps = operation.steps.filter((candidate) => candidate !== step);
+            operation.pumpPreflightRejected = true;
+            operation.quote = null;
+            persist();
+            log.info('transaction.pump_fallback_to_jupiter', {
+              operationId: operation.id,
+              signature: step.signature,
+              reason: simulation.message,
+            });
+            preflightRejected = true;
+          } else {
+            log.error('transaction.pump_submission_uncertain', error, {
+              operationId: operation.id,
+              signature: step.signature,
+            });
+            throw new PendingTrade(
+              'Pump submission outcome is uncertain; the saved transaction will be reconciled',
+            );
+          }
         }
-        throw new PendingTrade('Waiting for Pump transaction confirmation');
+        if (!preflightRejected) throw new PendingTrade('Waiting for Pump transaction confirmation');
+      } else {
+        throw new TradeRejected(
+          'No supported Pump SDK route is available for this pump-suffix token',
+        );
       }
-      throw new TradeRejected(
-        'No supported Pump SDK route is available for this pump-suffix token',
-      );
     }
     let step = operation.steps.find(
       (candidate): candidate is JupiterStep => candidate.type === 'jupiter',

@@ -483,6 +483,7 @@ export interface Operation {
   steps: TradeStep[];
   quote: Quote | null;
   preparedQuote?: PreparedQuote;
+  pumpPreflightRejected?: boolean;
   directEvmPlan?: DirectEvmPlan;
   wrapAmountRaw?: string;
   wrapWarningSent?: boolean;
